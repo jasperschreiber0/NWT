@@ -1,0 +1,6 @@
+anthropic>=0.40
+alpaca-py>=0.28
+psycopg2-binary>=2.9
+python-dotenv>=1.0
+requests>=2.31
+numpy>=1.26

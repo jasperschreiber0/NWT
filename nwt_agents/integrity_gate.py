@@ -1,0 +1,184 @@
+"""
+nwt_agents/integrity_gate.py
+Startup Integrity Gate — called by all major scripts before doing anything.
+If ANY check fails: log to nwt_system_log, print to stderr, sys.exit(1).
+
+Checks (in order):
+  1. No duplicate runners (ps aux)
+  2. DB connectivity
+  3. Alpaca connectivity (GET /v2/account)
+  4. Options chains accessible (GET /v2/options/contracts?underlying_symbols=SPY&limit=1)
+  5. Ledger writable (test INSERT + ROLLBACK)
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import psycopg2
+import requests
+
+
+def _alpaca_headers() -> dict:
+    return {
+        "APCA-API-KEY-ID": os.environ["NWT_ALPACA_KEY_ID"],
+        "APCA-API-SECRET-KEY": os.environ["NWT_ALPACA_SECRET_KEY"],
+    }
+
+
+def _alpaca_base() -> str:
+    return os.environ["NWT_ALPACA_BASE_URL"].rstrip("/")
+
+
+def _log_critical(message: str, payload: dict = None) -> None:
+    """Attempt to log a CRITICAL event to nwt_system_log. Never raises."""
+    try:
+        conn = psycopg2.connect(os.environ["NWT_DB_DSN"])
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO nwt_system_log (level, component, message, payload) VALUES (%s, %s, %s, %s)",
+                (
+                    "CRITICAL",
+                    "integrity_gate",
+                    message,
+                    json.dumps(payload) if payload else None,
+                ),
+            )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # DB might be down — we already have the stderr output
+
+
+def _fail(message: str, payload: dict = None) -> None:
+    print(f"[INTEGRITY GATE FAIL] {message}", file=sys.stderr)
+    _log_critical(message, payload)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Individual checks
+# ---------------------------------------------------------------------------
+
+def _check_no_duplicate_runners(script_name: str) -> None:
+    """
+    Use ps aux to count processes matching the script name.
+    If count > 1, another instance is already running.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "aux"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        lines = [
+            line for line in result.stdout.splitlines()
+            if script_name in line and "grep" not in line
+        ]
+        if len(lines) > 1:
+            _fail(
+                f"Duplicate runner detected for {script_name} — {len(lines)} processes found",
+                {"script_name": script_name, "count": len(lines)},
+            )
+    except Exception as exc:
+        _fail(f"Duplicate runner check failed: {exc}")
+
+
+def _check_db_connectivity() -> None:
+    try:
+        conn = psycopg2.connect(os.environ["NWT_DB_DSN"])
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        conn.close()
+    except Exception as exc:
+        _fail(f"DB connectivity check failed: {exc}", {"dsn_set": "NWT_DB_DSN" in os.environ})
+
+
+def _check_alpaca_connectivity() -> None:
+    try:
+        url = f"{_alpaca_base()}/v2/account"
+        resp = requests.get(url, headers=_alpaca_headers(), timeout=15)
+        if resp.status_code != 200:
+            _fail(
+                f"Alpaca account check failed: HTTP {resp.status_code}",
+                {"url": url, "body": resp.text[:500]},
+            )
+    except requests.RequestException as exc:
+        _fail(f"Alpaca connectivity check failed: {exc}")
+
+
+def _check_options_chains() -> None:
+    try:
+        url = f"{_alpaca_base()}/v2/options/contracts"
+        params = {"underlying_symbols": "SPY", "limit": 1}
+        resp = requests.get(url, headers=_alpaca_headers(), params=params, timeout=15)
+        if resp.status_code != 200:
+            _fail(
+                f"Options chain check failed: HTTP {resp.status_code}",
+                {"url": url, "body": resp.text[:500]},
+            )
+        data = resp.json()
+        # Accept either a list or dict with 'option_contracts' key
+        if isinstance(data, dict):
+            contracts = data.get("option_contracts", [])
+        else:
+            contracts = data
+        if not contracts:
+            _fail("Options chain check returned empty — no contracts found for SPY")
+    except requests.RequestException as exc:
+        _fail(f"Options chain check failed: {exc}")
+
+
+def _check_ledger_writable() -> None:
+    try:
+        conn = psycopg2.connect(os.environ["NWT_DB_DSN"])
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_portfolio_ledger
+                    (bot_source, asset, asset_type, status)
+                VALUES ('INTEGRITY_GATE_TEST', 'TEST', 'test', 'open')
+                """
+            )
+            conn.rollback()  # Always rollback — this is only a writability test
+        conn.close()
+    except Exception as exc:
+        _fail(f"Ledger writability check failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def run_integrity_gate(skip_duplicate_check: bool = False) -> None:
+    """
+    Run all 5 startup checks.
+    Raises SystemExit(1) on the first failure.
+    """
+    script_name = Path(sys.argv[0]).name if sys.argv else "unknown"
+
+    if not skip_duplicate_check:
+        _check_no_duplicate_runners(script_name)
+
+    _check_db_connectivity()
+    _check_alpaca_connectivity()
+    _check_options_chains()
+    _check_ledger_writable()
+
+    # Log successful gate pass to DB
+    try:
+        conn = psycopg2.connect(os.environ["NWT_DB_DSN"])
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO nwt_system_log (level, component, message) VALUES (%s, %s, %s)",
+                ("INFO", "integrity_gate", f"Startup integrity gate passed for {script_name}"),
+            )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # Non-fatal if logging fails after all checks pass
+
+    print(f"[INTEGRITY GATE] All checks passed for {script_name}", flush=True)
