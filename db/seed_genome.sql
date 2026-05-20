@@ -106,3 +106,31 @@ VALUES
   -- E12: Tail hedge — geopolitical_stress + recession_fear, SPY puts + VIX calls
   ('E12', 'E', ARRAY['SPY', 'VIX'], 7, 30, 0.80, 0.60, 0.50, 0.75, 'geopolitical_stress', 1, TRUE, FALSE, 100)
 ON CONFLICT (strategy_id) DO NOTHING;
+
+-- ============================================================
+-- TRACK A — Signal Bots (equity only, no options)
+-- These rows are queried at startup by each bot's strategist.
+-- stop_loss_pct / profit_target_pct are expressed as fractions (0.006 = 0.6%).
+-- dte_min / dte_max: NULL for equity-only strategies.
+-- iv_filter_max: NULL for equity-only strategies.
+-- ============================================================
+
+INSERT INTO nwt_strategy_genome
+  (strategy_id, track, asset_universe, dte_min, dte_max, iv_filter_max, entry_threshold, stop_loss_pct, profit_target_pct, regime, version, active, shadow_mode, trade_count_to_promote)
+VALUES
+  -- US-ORB-001: Opening Range Breakout — US Flow Bot (intraday to 5d holds)
+  ('US-ORB-001', 'A', ARRAY['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA'], NULL, NULL, NULL, 0.60, 0.006, 0.012, 'any', 1, TRUE, FALSE, 100),
+
+  -- EU-MR-001: Mean Reversion — EU Bot (2-20d holds)
+  ('EU-MR-001', 'A', ARRAY['VGK', 'EWU', 'FEZ'], NULL, NULL, NULL, 0.50, 0.015, 0.030, 'any', 1, TRUE, FALSE, 100),
+
+  -- AUS-DIV-001: Dividend Capture — AUS Bot (1-8wk holds)
+  ('AUS-DIV-001', 'A', ARRAY['EWA', 'BHP', 'RIO'], NULL, NULL, NULL, 0.60, 0.020, 0.040, 'any', 1, TRUE, FALSE, 100),
+
+  -- AUS-MOM-001: Momentum — AUS Bot fallback (1-8wk holds)
+  ('AUS-MOM-001', 'A', ARRAY['EWA', 'BHP', 'RIO'], NULL, NULL, NULL, 0.55, 0.020, 0.040, 'any', 1, TRUE, FALSE, 100),
+
+  -- CHINA-POL-001: Policy/Event — China Bot (1d to 3wk holds)
+  ('CHINA-POL-001', 'A', ARRAY['FXI', 'KWEB', 'MCHI', 'BABA', 'TCEHY'], NULL, NULL, NULL, 0.50, 0.025, 0.050, 'any', 1, TRUE, FALSE, 100)
+
+ON CONFLICT (strategy_id) DO NOTHING;
