@@ -1,0 +1,21 @@
+{
+  "date": null,
+  "regime": {
+    "primary_regime": "neutral",
+    "confidence": 0.5,
+    "secondary_regime": null,
+    "transition_risk": 0.0
+  },
+  "vix": null,
+  "global_kill_switch": true,
+  "net_delta_estimate": 0.0,
+  "net_vega_estimate": 0.0,
+  "bot_permissions": {
+    "us": {"status": "paused", "capital_weight": 0.0, "size_cap": 0.0},
+    "eu": {"status": "paused", "capital_weight": 0.0, "size_cap": 0.0},
+    "aus": {"status": "paused", "capital_weight": 0.0, "size_cap": 0.0},
+    "china": {"status": "paused", "capital_weight": 0.0, "size_cap": 0.0}
+  },
+  "conflict_notes": "Default safe state — Portfolio Brain has not run yet.",
+  "reasoning": "System cold start. No directives generated yet."
+}
