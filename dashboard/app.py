@@ -153,6 +153,6 @@ async def dashboard(request: Request):
             "kill_switch": kill_switch,
             "bot_permissions": bot_permissions,
             "now": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-            "today": date.today().isoformat(),
+            "today": datetime.now(timezone.utc).date().isoformat(),
         },
     )
