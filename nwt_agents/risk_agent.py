@@ -49,8 +49,10 @@ CONSECUTIVE_LOSS_LIMIT = 4
 NET_DELTA_CAP = 0.70
 REGIME_CONFIDENCE_REDUCE = 0.40
 REGIME_TRANSITION_PAUSE = 0.60
-HARD_CLOSE_UTC_HOUR = 21
+HARD_CLOSE_UTC_HOUR = 19       # 15:45 EDT (UTC-4 in summer) = 19:45 UTC
 HARD_CLOSE_UTC_MINUTE = 45
+NEW_ENTRY_CUTOFF_UTC_HOUR = 19  # No new entries after 19:30 UTC (15:30 EDT)
+NEW_ENTRY_CUTOFF_UTC_MINUTE = 30
 EXECUTION_STALE_MINUTES = 30
 SPREAD_WIDENING_FACTOR = 3.0
 
@@ -353,6 +355,15 @@ def evaluate_proposal(
     from_track = (payload.get("from_track") or "").upper()
     direction = (payload.get("direction") or "").lower()
     symbol = payload.get("symbol", "")
+
+    # RULE 0: After 19:30 UTC (15:30 EDT) no new entries — hard close approaching
+    now_utc = datetime.now(timezone.utc)
+    past_cutoff = (
+        now_utc.hour > NEW_ENTRY_CUTOFF_UTC_HOUR or
+        (now_utc.hour == NEW_ENTRY_CUTOFF_UTC_HOUR and now_utc.minute >= NEW_ENTRY_CUTOFF_UTC_MINUTE)
+    )
+    if past_cutoff:
+        return "VETOED", f"Rule 0: Past new-entry cutoff {NEW_ENTRY_CUTOFF_UTC_HOUR}:{NEW_ENTRY_CUTOFF_UTC_MINUTE:02d} UTC — no new positions before market close"
 
     # RULE 1: VIX > 40 → global kill switch
     if vix > VIX_KILL_THRESHOLD:

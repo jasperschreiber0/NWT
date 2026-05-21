@@ -13,15 +13,15 @@ NWT_DIR=/home/northworld/trading/nwt_agents
 0 14 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 track_d.py >> /var/log/nwt/track_d.log 2>&1
 30 14 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 track_e.py >> /var/log/nwt/track_e.log 2>&1
 
-# Risk agent (every 5 min, 13:00-21:00 UTC)
-*/5 13-21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 risk_agent.py >> /var/log/nwt/risk.log 2>&1
+# Risk agent (every 5 min, 13:00-20:00 UTC — stops after US close)
+*/5 13-20 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 risk_agent.py >> /var/log/nwt/risk.log 2>&1
 
-# Execution agent (every 5 min, 13:00-21:00 UTC)
-*/5 13-21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 execution_agent.py >> /var/log/nwt/execution.log 2>&1
+# Execution agent (every 5 min, 13:00-19:00 UTC — stops before 19:30 hard-close cutoff)
+*/5 13-19 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 execution_agent.py >> /var/log/nwt/execution.log 2>&1
 
-# Snapshot writer (every 15 min, 13:00-21:00 UTC)
-*/15 13-21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 snapshot_writer.py >> /var/log/nwt/snapshot.log 2>&1
+# Snapshot writer (every 15 min, 13:00-20:00 UTC)
+*/15 13-20 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 snapshot_writer.py >> /var/log/nwt/snapshot.log 2>&1
 
-# Learning agent + cost agent (21:00 UTC daily)
+# Learning agent + cost agent (21:00 UTC daily — after US close + settlement)
 0 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 learning_agent.py >> /var/log/nwt/learning.log 2>&1
 0 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 cost_agent.py >> /var/log/nwt/cost.log 2>&1
