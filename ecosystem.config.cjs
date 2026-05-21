@@ -64,6 +64,14 @@ module.exports = {
       cron_restart: '0 0 * * 1-5',
       autorestart: false,
       watch: false
+    },
+    {
+      name: 'nwt-dashboard',
+      script: 'python3',
+      args: '-m uvicorn app:app --host 0.0.0.0 --port 8080 --workers 1',
+      cwd: '/home/northworld/trading/dashboard',
+      autorestart: true,
+      watch: false
     }
   ]
 }
