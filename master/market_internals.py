@@ -8,7 +8,7 @@ Never raises on missing data — caller handles gracefully.
 import os
 import logging
 import statistics
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import requests
@@ -40,10 +40,11 @@ def _get_bars(
     Returns {} on any error so callers can handle gracefully.
     """
     url = f"{data_url}/v2/stocks/bars"
+    start = (datetime.now(timezone.utc) - timedelta(days=limit * 2)).strftime("%Y-%m-%d")
     params = {
         "symbols": ",".join(symbols),
         "timeframe": "1Day",
-        "limit": limit,
+        "start": start,
         "adjustment": "raw",
     }
     headers = _alpaca_headers(api_key, secret_key)
