@@ -140,9 +140,9 @@ async def dashboard(request: Request):
     bot_permissions = directives.get("bot_permissions", {})
 
     return templates.TemplateResponse(
-        "dashboard.html",
-        {
-            "request": request,
+        request=request,
+        name="dashboard.html",
+        context={
             "summary": summary,
             "decisions": decisions,
             "open_positions": open_positions,
