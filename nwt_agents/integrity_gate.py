@@ -182,3 +182,7 @@ def run_integrity_gate(skip_duplicate_check: bool = False) -> None:
         pass  # Non-fatal if logging fails after all checks pass
 
     print(f"[INTEGRITY GATE] All checks passed for {script_name}", flush=True)
+
+
+if __name__ == "__main__":
+    run_integrity_gate(skip_duplicate_check=True)
