@@ -1,4 +1,5 @@
 SHELL=/bin/bash
+CRON_TZ=UTC
 PATH=/usr/local/bin:/usr/bin:/bin
 NWT_DIR=/home/northworld/trading/nwt_agents
 
