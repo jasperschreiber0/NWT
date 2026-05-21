@@ -45,7 +45,6 @@ def _get_bars(
         "timeframe": "1Day",
         "limit": limit,
         "adjustment": "raw",
-        "feed": "iex",  # IEX available on paper accounts; falls back silently
     }
     headers = _alpaca_headers(api_key, secret_key)
     try:
@@ -73,10 +72,11 @@ def _get_options_snapshot(
     Fetch options snapshot for a symbol.
     Returns raw snapshot dict or None on failure.
     """
-    url = f"{base_url}/v2/options/snapshots/{symbol}"
+    url = f"{base_url}/v2/options/snapshots"
     headers = _alpaca_headers(api_key, secret_key)
+    params = {"symbols": symbol}
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
