@@ -39,6 +39,7 @@ logging.basicConfig(
 logger = logging.getLogger("execution_agent")
 
 ALPACA_BASE_URL = os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+ALPACA_DATA_URL = os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID": os.environ.get("NWT_ALPACA_KEY_ID", ""),
     "APCA-API-SECRET-KEY": os.environ.get("NWT_ALPACA_SECRET_KEY", ""),
@@ -129,7 +130,7 @@ def resolve_option_contract(
             return None
 
         # Get current stock price to find ATM/OTM strike
-        stock_url = f"{ALPACA_BASE_URL}/v2/stocks/{symbol}/trades/latest"
+        stock_url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/trades/latest"
         try:
             price_resp = requests.get(stock_url, headers=ALPACA_HEADERS, timeout=15)
             price_resp.raise_for_status()
