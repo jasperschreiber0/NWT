@@ -73,8 +73,9 @@ async def dashboard(request: Request):
                 COUNT(*) FILTER (WHERE d.decision = 'FAILED')                      AS failed
             FROM nwt_tickets t
             LEFT JOIN nwt_ticket_decisions d ON d.ticket_id = t.ticket_id
-            WHERE t.created_at::date = CURRENT_DATE
+            WHERE (t.created_at AT TIME ZONE 'UTC')::date = %s
             """,
+            (datetime.now(timezone.utc).date(),),
         )
 
         decisions = _q(
@@ -125,10 +126,11 @@ async def dashboard(request: Request):
             """
             SELECT type, COUNT(*) AS cnt
             FROM nwt_tickets
-            WHERE created_at::date = CURRENT_DATE
+            WHERE (created_at AT TIME ZONE 'UTC')::date = %s
             GROUP BY type
             ORDER BY cnt DESC
             """,
+            (datetime.now(timezone.utc).date(),),
         )
 
     finally:

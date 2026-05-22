@@ -20,6 +20,9 @@ NWT_DIR=/home/northworld/trading/nwt_agents
 # Execution agent (every 5 min, 13:00-19:00 UTC — stops before 19:30 hard-close cutoff)
 */5 13-19 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 execution_agent.py >> /var/log/nwt/execution.log 2>&1
 
+# Execution engine (every 5 min, 13:00-20:00 UTC — processes TRADE_REQUEST tickets, places Alpaca orders)
+*/5 13-20 * * 1-5 cd /home/northworld/trading/execution && set -a && source .env && set +a && python3 engine.py >> /var/log/nwt/execution_engine.log 2>&1
+
 # Snapshot writer (every 15 min, 13:00-20:00 UTC)
 */15 13-20 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 snapshot_writer.py >> /var/log/nwt/snapshot.log 2>&1
 
