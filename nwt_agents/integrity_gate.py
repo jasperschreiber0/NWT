@@ -76,7 +76,9 @@ def _check_no_duplicate_runners(script_name: str) -> None:
         )
         lines = [
             line for line in result.stdout.splitlines()
-            if script_name in line and "grep" not in line
+            if script_name in line
+            and "grep" not in line
+            and " >> " not in line  # exclude cron bash wrapper (contains shell redirect)
         ]
         if len(lines) > 1:
             _fail(
