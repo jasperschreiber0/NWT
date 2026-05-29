@@ -61,11 +61,11 @@ async def dashboard(request: Request):
             conn,
             """
             SELECT
-                COUNT(*) FILTER (WHERE t.type IN (
+                COUNT(DISTINCT t.ticket_id) FILTER (WHERE t.type IN (
                     'CONVICTION_TICKET','PRESCREENED_TICKET','CONVICTION_RESULT'
                 ))                                                                   AS conviction_count,
-                COUNT(*) FILTER (WHERE t.type = 'TRADE_PROPOSAL')                  AS proposal_count,
-                COUNT(*) FILTER (WHERE t.type = 'TRADE_REQUEST')                   AS trade_request_count,
+                COUNT(DISTINCT t.ticket_id) FILTER (WHERE t.type = 'TRADE_PROPOSAL') AS proposal_count,
+                COUNT(DISTINCT t.ticket_id) FILTER (WHERE t.type = 'TRADE_REQUEST')  AS trade_request_count,
                 COUNT(*) FILTER (WHERE d.decision = 'APPROVED'
                     AND d.decided_by = 'RISK_AGENT')                                AS risk_approved,
                 COUNT(*) FILTER (WHERE d.decision = 'VETOED')                      AS vetoed,
