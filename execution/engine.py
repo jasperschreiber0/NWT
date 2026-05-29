@@ -95,6 +95,8 @@ def alpaca_get(path: str) -> dict:
 def alpaca_post(path: str, body: dict) -> dict:
     url = f"{ALPACA_BASE_URL}/v2{path}"
     resp = requests.post(url, headers=ALPACA_HEADERS, json=body, timeout=15)
+    if not resp.ok:
+        logger.error("Alpaca POST %s → %d: %s", path, resp.status_code, resp.text[:500])
     resp.raise_for_status()
     return resp.json()
 
@@ -214,7 +216,6 @@ def place_options_order(payload: dict) -> dict:
         "side": side,
         "type": "market",
         "time_in_force": time_in_force,
-        "order_class": "simple",
     }
     logger.info("Placing options order: %s %s x%d", side, option_symbol, qty)
     return alpaca_post("/orders", order_body)
