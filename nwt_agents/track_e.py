@@ -71,6 +71,16 @@ def compute_quantitative_edge(layer0: dict, symbol: str, conviction_ticket: dict
     vix = layer0.get("vix", 0.0)
     strategy_type = conviction_ticket.get("strategy_type", "")
 
+    # IV=0 means Alpaca has no data for this symbol (only SPY/QQQ have IV).
+    # Proceeding would amplify SPY skew by 100x via max(iv, 0.01) — reject early.
+    if iv <= 0:
+        return {
+            "edge_type": "insufficient_data",
+            "edge_magnitude": 0.0,
+            "edge_description": f"IV data unavailable for {symbol} — cannot compute edge",
+            "statistical_confidence": 0.0,
+        }
+
     # Edge type 1: IV skew arb (put skew vs call skew)
     if abs(spy_iv_skew) > 0.02:
         skew_pct = abs(spy_iv_skew) / max(iv, 0.01)
