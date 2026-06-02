@@ -3,29 +3,37 @@ TZ=UTC
 PATH=/usr/local/bin:/usr/bin:/bin
 NWT_DIR=/home/northworld/trading/nwt_agents
 
-# Conviction stack (layer0 -> prescreener -> engine -> summary)
-0 13 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 layer0_builder.py >> /var/log/nwt/layer0.log 2>&1
-15 13 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 prescreener.py >> /var/log/nwt/prescreener.log 2>&1
-30 13 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 conviction_engine.py >> /var/log/nwt/conviction.log 2>&1
-45 13 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 conviction_summary_writer.py >> /var/log/nwt/summary.log 2>&1
+# NOTE: Ubuntu's cron daemon ignores TZ=UTC above.
+# All times below are in AEST (UTC+10). UTC equivalents shown in comments.
+# Jobs crossing AEST midnight use day-of-week 2-6 (Tue-Sat AEST = Mon-Fri UTC).
 
-# Track decisions
-0 14 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 track_c.py >> /var/log/nwt/track_c.log 2>&1
-0 14 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 track_d.py >> /var/log/nwt/track_d.log 2>&1
-30 14 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 track_e.py >> /var/log/nwt/track_e.log 2>&1
+# Conviction stack — 13:00-13:45 UTC = 23:00-23:45 AEST Mon-Fri
+0 23 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 layer0_builder.py >> /var/log/nwt/layer0.log 2>&1
+15 23 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 prescreener.py >> /var/log/nwt/prescreener.log 2>&1
+30 23 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 conviction_engine.py >> /var/log/nwt/conviction.log 2>&1
+45 23 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 conviction_summary_writer.py >> /var/log/nwt/summary.log 2>&1
 
-# Risk agent (every 5 min, 13:00-20:00 UTC — stops after US close)
-*/5 13-20 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 risk_agent.py >> /var/log/nwt/risk.log 2>&1
+# Track decisions — 14:00-14:30 UTC = 00:00-00:30 AEST Tue-Sat
+0 0 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 track_c.py >> /var/log/nwt/track_c.log 2>&1
+0 0 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 track_d.py >> /var/log/nwt/track_d.log 2>&1
+30 0 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 track_e.py >> /var/log/nwt/track_e.log 2>&1
 
-# Execution agent (every 5 min, 13:00-19:00 UTC — stops before 19:30 hard-close cutoff)
-*/5 13-19 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 execution_agent.py >> /var/log/nwt/execution.log 2>&1
+# Risk agent every 5 min, 13:00-20:00 UTC = 23:xx AEST Mon-Fri + 00:xx-06:xx AEST Tue-Sat
+*/5 23 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 risk_agent.py >> /var/log/nwt/risk.log 2>&1
+*/5 0-6 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 risk_agent.py >> /var/log/nwt/risk.log 2>&1
 
-# Execution engine (every 5 min, 13:00-20:00 UTC — processes TRADE_REQUEST tickets, places Alpaca orders)
-*/5 13-20 * * 1-5 cd /home/northworld/trading/execution && set -a && source .env && set +a && python3 engine.py >> /var/log/nwt/execution_engine.log 2>&1
+# Execution agent every 5 min, 13:00-19:00 UTC = 23:xx AEST Mon-Fri + 00:xx-05:xx AEST Tue-Sat
+*/5 23 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 execution_agent.py >> /var/log/nwt/execution.log 2>&1
+*/5 0-5 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 execution_agent.py >> /var/log/nwt/execution.log 2>&1
 
-# Snapshot writer (every 15 min, 13:00-20:00 UTC)
-*/15 13-20 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 snapshot_writer.py >> /var/log/nwt/snapshot.log 2>&1
+# Execution engine every 5 min, 13:00-20:00 UTC = 23:xx AEST Mon-Fri + 00:xx-06:xx AEST Tue-Sat
+*/5 23 * * 1-5 cd /home/northworld/trading/execution && set -a && source .env && set +a && python3 engine.py >> /var/log/nwt/execution_engine.log 2>&1
+*/5 0-6 * * 2-6 cd /home/northworld/trading/execution && set -a && source .env && set +a && python3 engine.py >> /var/log/nwt/execution_engine.log 2>&1
 
-# Learning agent + cost agent (21:00 UTC daily — after US close + settlement)
-0 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 learning_agent.py >> /var/log/nwt/learning.log 2>&1
-0 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 cost_agent.py >> /var/log/nwt/cost.log 2>&1
+# Snapshot writer every 15 min, 13:00-20:00 UTC = 23:xx AEST Mon-Fri + 00:xx-06:xx AEST Tue-Sat
+*/15 23 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 snapshot_writer.py >> /var/log/nwt/snapshot.log 2>&1
+*/15 0-6 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 snapshot_writer.py >> /var/log/nwt/snapshot.log 2>&1
+
+# Learning agent + cost agent — 21:00 UTC = 07:00 AEST Tue-Sat
+0 7 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 learning_agent.py >> /var/log/nwt/learning.log 2>&1
+0 7 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 cost_agent.py >> /var/log/nwt/cost.log 2>&1
