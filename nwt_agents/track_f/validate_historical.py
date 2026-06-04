@@ -62,7 +62,7 @@ TICKER_CONFIG = {
         "forms": ["10-Q", "10-K", "8-K"],
     },
     "CCJ": {
-        "entity": "Cameco",
+        "entity": "CAMECO CORP",   # legal entity name in EDGAR (partial match "Cameco" misses most 6-K filings)
         "forms": ["40-F", "6-K", "40-F/A"],   # Canadian company, not 10-Q/10-K
     },
 }
@@ -136,6 +136,8 @@ CONSTRAINT_SIGNALS = {
             "record backlog", "backlog increased", "order backlog",
             "backlog of $", "growing backlog", "strong backlog",
             "backlog grew", "total backlog",
+            # nuclear/uranium equivalents
+            "contract portfolio", "committed pounds", "long-term supply agreement",
         ],
         "weight": 25,
     },
@@ -144,6 +146,8 @@ CONSTRAINT_SIGNALS = {
             "capacity constrained", "adding capacity", "capacity expansion",
             "at capacity", "expand capacity", "exceeds capacity",
             "additional capacity", "increasing capacity",
+            # nuclear/uranium equivalents
+            "production curtailment", "mine restart",
         ],
         "weight": 30,
     },
@@ -151,6 +155,8 @@ CONSTRAINT_SIGNALS = {
         "terms": [
             "lead times extended", "lead time increased", "delivery delays",
             "longer lead times", "extended lead times", "lead time",
+            # nuclear/uranium equivalents
+            "procurement lead time", "fuel delivery schedule",
         ],
         "weight": 20,
     },
@@ -159,6 +165,8 @@ CONSTRAINT_SIGNALS = {
             "supply shortage", "component shortage", "material shortage",
             "allocation basis", "constrained supply", "supply constraints",
             "supply chain constraints",
+            # nuclear/uranium equivalents
+            "uranium deficit", "supply deficit", "tight supply",
         ],
         "weight": 15,
     },
@@ -167,6 +175,8 @@ CONSTRAINT_SIGNALS = {
             "raised prices", "pricing power", "price discipline",
             "price increases", "favorable pricing", "pricing environment",
             "increased pricing",
+            # nuclear/uranium equivalents
+            "uranium price", "price escalation", "price realization",
         ],
         "weight": 10,
     },
@@ -343,10 +353,14 @@ def compute_constraint_severity(
 # ---------------------------------------------------------------------------
 
 HISTORICAL_APPROXIMATIONS = {
-    "NVDA": {"revenue_leverage": 85, "attention_gap": 15, "smart_money_score": 0, "crowding_penalty": 5},
-    "VRT":  {"revenue_leverage": 90, "attention_gap": 15, "smart_money_score": 0, "crowding_penalty": 5},
-    "PWR":  {"revenue_leverage": 60, "attention_gap": 15, "smart_money_score": 0, "crowding_penalty": 5},
-    "CCJ":  {"revenue_leverage": 95, "attention_gap": 15, "smart_money_score": 0, "crowding_penalty": 5},
+    # smart_money_score reflects institutional positioning at signal window open:
+    #   NVDA Q4 2022: post-ChatGPT launch accumulation, funds repositioning (~15)
+    #   PWR Q1 2024: AI power thesis widely known to institutional money (~30)
+    #   CCJ Q3 2021: Sprott uranium fund launched Aug 2021, nuclear renaissance broadly covered (~30)
+    "NVDA": {"revenue_leverage": 85, "attention_gap": 15, "smart_money_score": 15, "crowding_penalty": 5},
+    "VRT":  {"revenue_leverage": 90, "attention_gap": 15, "smart_money_score": 0,  "crowding_penalty": 5},
+    "PWR":  {"revenue_leverage": 60, "attention_gap": 15, "smart_money_score": 30, "crowding_penalty": 5},
+    "CCJ":  {"revenue_leverage": 95, "attention_gap": 15, "smart_money_score": 30, "crowding_penalty": 5},
 }
 
 
