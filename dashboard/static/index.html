@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NWT Command Centre</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0f1117;color:#e2e8f0;font-family:'Inter',sans-serif;font-size:14px;min-height:100vh}
+:root{--bg:#0f1117;--card:#1a1d27;--border:#2d3148;--accent:#3b82f6;--green:#22c55e;--red:#ef4444;--yellow:#f59e0b;--grey:#64748b;--text:#e2e8f0;--muted:#94a3b8}
+
+/* Auth modal */
+#auth-modal{position:fixed;inset:0;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;z-index:1000}
+#auth-modal.hidden{display:none}
+.auth-box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:40px;width:360px;text-align:center}
+.auth-box h2{font-size:20px;font-weight:700;margin-bottom:8px}
+.auth-box p{color:var(--muted);margin-bottom:24px;font-size:13px}
+.auth-box input{width:100%;padding:10px 14px;background:#0f1117;border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;outline:none;margin-bottom:14px}
+.auth-box input:focus{border-color:var(--accent)}
+.auth-box button{width:100%;padding:10px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer}
+.auth-box button:hover{background:#2563eb}
+
+/* Toast */
+#toast{position:fixed;bottom:24px;right:24px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px 18px;font-size:13px;z-index:999;opacity:0;transition:opacity .3s;pointer-events:none;max-width:300px}
+#toast.show{opacity:1}
+#toast.success{border-left:3px solid var(--green)}
+#toast.error{border-left:3px solid var(--red)}
+
+/* Top bar */
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;background:var(--card);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
+.topbar-left{display:flex;align-items:center;gap:12px}
+.topbar h1{font-size:16px;font-weight:700;letter-spacing:.3px}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--grey)}
+.status-dot.connected{background:var(--green);box-shadow:0 0 6px var(--green)}
+.status-dot.error{background:var(--red)}
+.status-label{font-size:12px;color:var(--muted)}
+.last-refresh{font-size:12px;color:var(--muted)}
+
+/* Tabs */
+.tabs{display:flex;gap:4px;padding:12px 24px;border-bottom:1px solid var(--border);background:var(--card)}
+.tab{padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;color:var(--muted);border:none;background:none;transition:all .15s}
+.tab:hover{color:var(--text);background:rgba(255,255,255,.05)}
+.tab.active{background:var(--accent);color:#fff}
+
+/* Main */
+.main{padding:24px;max-width:1400px;margin:0 auto}
+
+/* Cards */
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:20px;margin-bottom:16px}
+.card-title{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:16px}
+.card-row{display:grid;gap:16px;margin-bottom:16px}
+.card-row.cols-2{grid-template-columns:1fr 1fr}
+.card-row.cols-4{grid-template-columns:repeat(4,1fr)}
+@media(max-width:900px){.card-row.cols-4{grid-template-columns:repeat(2,1fr)}.card-row.cols-2{grid-template-columns:1fr}}
+
+/* Badges */
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
+.badge-green{background:rgba(34,197,94,.15);color:var(--green)}
+.badge-red{background:rgba(239,68,68,.15);color:var(--red)}
+.badge-yellow{background:rgba(245,158,11,.15);color:var(--yellow)}
+.badge-grey{background:rgba(100,116,139,.15);color:var(--grey)}
+.badge-blue{background:rgba(59,130,246,.15);color:var(--accent)}
+.badge-orange{background:rgba(249,115,22,.15);color:#f97316}
+
+/* Tables */
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:8px 12px;color:var(--muted);font-weight:500;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:8px 12px;border-bottom:1px solid rgba(45,49,72,.5);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.02)}
+.empty-state{text-align:center;padding:32px;color:var(--muted);font-size:13px}
+
+/* Regime banner */
+.regime-banner{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.regime-main{font-size:20px;font-weight:700;text-transform:uppercase;letter-spacing:1px}
+.kill-switch-banner{width:100%;background:rgba(239,68,68,.1);border:1px solid var(--red);border-radius:8px;padding:10px 16px;color:var(--red);font-weight:600;font-size:13px;margin-top:8px;display:flex;align-items:center;gap:8px}
+
+/* Bot cards */
+.bot-card{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;padding:16px}
+.bot-card-name{font-weight:600;margin-bottom:8px;text-transform:uppercase;font-size:12px;letter-spacing:.5px;color:var(--muted)}
+.bot-card-status{font-size:22px;font-weight:700;margin-bottom:4px}
+.bot-card-meta{font-size:12px;color:var(--muted)}
+
+/* Gauges */
+.gauge-wrap{text-align:center;padding:8px}
+.gauge-circle{position:relative;width:100px;height:100px;margin:0 auto 12px}
+.gauge-circle svg{transform:rotate(-90deg)}
+.gauge-bg{fill:none;stroke:rgba(255,255,255,.06);stroke-width:8}
+.gauge-fill{fill:none;stroke-width:8;stroke-linecap:round;transition:stroke-dashoffset .5s}
+.gauge-text{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:16px;font-weight:700}
+.gauge-label{font-size:13px;font-weight:600;color:var(--text);margin-bottom:4px}
+.gauge-target{font-size:11px;color:var(--muted)}
+
+/* Bar */
+.bar-wrap{margin-bottom:10px}
+.bar-label{display:flex;justify-content:space-between;margin-bottom:4px;font-size:12px}
+.bar-track{background:rgba(255,255,255,.06);border-radius:3px;height:6px;overflow:hidden}
+.bar-fill{height:100%;border-radius:3px;transition:width .4s}
+
+/* Pagination */
+.pagination{display:flex;align-items:center;gap:8px;margin-top:12px;justify-content:flex-end}
+.page-btn{padding:5px 12px;background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:5px;color:var(--text);cursor:pointer;font-size:12px}
+.page-btn:disabled{opacity:.35;cursor:default}
+.page-info{font-size:12px;color:var(--muted)}
+
+.pnl-pos{color:var(--green);font-weight:600}
+.pnl-neg{color:var(--red);font-weight:600}
+.truncate{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+.ticket-no-decision td:first-child{border-left:3px solid var(--yellow)}
+</style>
+</head>
+<body>
+
+<!-- Auth modal -->
+<div id="auth-modal">
+  <div class="auth-box">
+    <h2>NWT Command Centre</h2>
+    <p>Enter your dashboard token to continue</p>
+    <input type="password" id="token-input" placeholder="Bearer token" autofocus>
+    <button onclick="submitToken()">Connect</button>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<!-- Top bar -->
+<div class="topbar">
+  <div class="topbar-left">
+    <h1>NWT Command Centre</h1>
+    <span class="status-dot" id="status-dot"></span>
+    <span class="status-label" id="status-label">Connecting...</span>
+  </div>
+  <span class="last-refresh" id="last-refresh"></span>
+</div>
+
+<!-- Tabs -->
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('portfolio')">Portfolio</button>
+  <button class="tab" onclick="switchTab('performance')">Performance</button>
+  <button class="tab" onclick="switchTab('trackf')">Track F</button>
+  <button class="tab" onclick="switchTab('tickets')">Tickets</button>
+  <button class="tab" onclick="switchTab('system')">System</button>
+</div>
+
+<!-- Tab content -->
+<div class="main">
+
+  <!-- PORTFOLIO TAB -->
+  <div id="tab-portfolio">
+    <div class="card" id="regime-card">
+      <div class="card-title">Market Regime</div>
+      <div id="regime-content"><span style="color:var(--muted)">Loading...</span></div>
+    </div>
+    <div class="card-row cols-4" id="bot-cards"></div>
+    <div class="card">
+      <div class="card-title">Open Positions</div>
+      <div class="table-wrap" id="positions-table"><div class="empty-state">Loading...</div></div>
+    </div>
+    <div class="card-row cols-2">
+      <div class="card"><div class="card-title">Net Delta</div><div id="net-delta" style="font-size:28px;font-weight:700">—</div></div>
+      <div class="card"><div class="card-title">Net Vega</div><div id="net-vega" style="font-size:28px;font-weight:700">—</div></div>
+    </div>
+  </div>
+
+  <!-- PERFORMANCE TAB -->
+  <div id="tab-performance" style="display:none">
+    <div class="card">
+      <div class="card-title">Go-Live Thresholds</div>
+      <div class="card-row cols-4" id="gauges-row"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Equity Curve</div>
+      <div style="height:260px;position:relative"><canvas id="equity-chart"></canvas></div>
+      <div class="empty-state" id="equity-empty" style="display:none">No closed trades yet.</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Strategy Performance</div>
+      <div class="table-wrap" id="strategy-table"><div class="empty-state">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- TRACK F TAB -->
+  <div id="tab-trackf" style="display:none">
+    <div class="card">
+      <div class="card-title">Emerging Themes — Awaiting Approval</div>
+      <div id="pending-themes"><div class="empty-state">Loading...</div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Bottleneck Scores</div>
+      <div class="table-wrap" id="bottleneck-table"><div class="empty-state">Track F not yet deployed.</div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Track F Candidates</div>
+      <div class="table-wrap" id="candidates-table"><div class="empty-state">Loading...</div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Theme Exposure vs 15% Cap</div>
+      <div id="theme-exposure-bars"><div class="empty-state">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- TICKETS TAB -->
+  <div id="tab-tickets" style="display:none">
+    <div class="card">
+      <div class="card-title">Claude API Budget</div>
+      <div class="card-row cols-4" id="budget-cards"><div class="empty-state">Loading...</div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Recent Tickets</div>
+      <div class="table-wrap" id="tickets-table"><div class="empty-state">Loading...</div></div>
+      <div class="pagination" id="ticket-pagination"></div>
+    </div>
+  </div>
+
+  <!-- SYSTEM TAB -->
+  <div id="tab-system" style="display:none">
+    <div class="card">
+      <div class="card-title">PM2 Processes</div>
+      <div class="table-wrap" id="pm2-table"><div class="empty-state">Loading...</div></div>
+    </div>
+    <div class="card-row cols-2">
+      <div class="card">
+        <div class="card-title">Agent Last Fired</div>
+        <div id="agent-fired"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Shared File Freshness</div>
+        <div id="file-freshness"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Server Resources</div>
+      <div id="server-resources"></div>
+    </div>
+  </div>
+
+</div>
+<script>
+// ── Auth ────────────────────────────────────────────────────────────────────
+let TOKEN = localStorage.getItem('nwt_token') || '';
+const modal = document.getElementById('auth-modal');
+
+function checkAuth() {
+  if (!TOKEN) { modal.classList.remove('hidden'); return false; }
+  modal.classList.add('hidden');
+  return true;
+}
+function submitToken() {
+  const v = document.getElementById('token-input').value.trim();
+  if (!v) return;
+  TOKEN = v;
+  localStorage.setItem('nwt_token', v);
+  modal.classList.add('hidden');
+  loadAll();
+}
+document.getElementById('token-input').addEventListener('keydown', e => { if (e.key === 'Enter') submitToken(); });
+
+function api(path, opts = {}) {
+  return fetch('/api' + path, {
+    headers: { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json', ...opts.headers },
+    ...opts,
+  }).then(r => {
+    if (r.status === 401) { TOKEN = ''; localStorage.removeItem('nwt_token'); modal.classList.remove('hidden'); throw new Error('401'); }
+    return r.json();
+  });
+}
+
+// ── Toast ───────────────────────────────────────────────────────────────────
+function toast(msg, type = 'success') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show ' + type;
+  setTimeout(() => { el.className = ''; }, 3000);
+}
+
+// ── Tabs ────────────────────────────────────────────────────────────────────
+let activeTab = 'portfolio';
+function switchTab(name) {
+  ['portfolio','performance','trackf','tickets','system'].forEach(t => {
+    document.getElementById('tab-' + t).style.display = t === name ? '' : 'none';
+    document.querySelectorAll('.tab').forEach((el, i) => {
+      const names = ['portfolio','performance','trackf','tickets','system'];
+      el.classList.toggle('active', names[i] === name);
+    });
+  });
+  activeTab = name;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function badge(text, cls) { return `<span class="badge badge-${cls}">${text}</span>`; }
+
+function regimeBadge(r) {
+  const map = { risk_on:'green', risk_off:'red', neutral:'grey', geopolitical_stress:'orange', recession_fear:'red', inflation_concern:'yellow', fragile_liquidity:'yellow' };
+  return badge(r, map[r] || 'grey');
+}
+
+function pct(v) { return v != null ? (v * 100).toFixed(1) + '%' : '—'; }
+
+function timeAgo(iso) {
+  if (!iso) return badge('never', 'red');
+  const diff = (Date.now() - new Date(iso)) / 3600000;
+  const label = diff < 1 ? Math.round(diff * 60) + 'm ago' : diff < 48 ? Math.round(diff) + 'h ago' : Math.round(diff / 24) + 'd ago';
+  const cls   = diff < 25 ? 'green' : diff < 49 ? 'yellow' : 'red';
+  return `<span style="color:var(--${cls})">${label}</span>`;
+}
+
+function fmtDate(iso) {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleString('en-AU', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+}
+
+function scoreColor(s) {
+  if (s >= 70) return 'var(--green)';
+  if (s >= 50) return 'var(--yellow)';
+  return 'var(--red)';
+}
+
+// ── Portfolio ────────────────────────────────────────────────────────────────
+function renderPortfolio(data) {
+  const d = data.directives || {};
+  const regime = d.regime || {};
+
+  // Regime banner
+  let html = `<div class="regime-banner">`;
+  html += `<div class="regime-main">${regimeBadge(regime.primary_regime || 'unknown')}</div>`;
+  if (regime.secondary_regime) html += regimeBadge(regime.secondary_regime);
+  html += `<span style="color:var(--muted);font-size:13px">Confidence: <b>${pct(regime.confidence)}</b></span>`;
+  html += `<span style="color:var(--muted);font-size:13px">Transition risk: <b>${pct(regime.transition_risk)}</b></span>`;
+  if (d.vix) html += `<span style="color:var(--muted);font-size:13px">VIX: <b>${d.vix}</b></span>`;
+  if (d.date) html += `<span style="color:var(--muted);font-size:12px">${d.date}</span>`;
+  html += `</div>`;
+  if (d.global_kill_switch) html += `<div class="kill-switch-banner">⚠ GLOBAL KILL SWITCH ACTIVE — no new positions</div>`;
+  document.getElementById('regime-content').innerHTML = html;
+
+  // Bot cards
+  const bots = [['US','us'],['EU','eu'],['AUS','aus'],['China','china']];
+  const bp   = d.bot_permissions || {};
+  const bcEl = document.getElementById('bot-cards');
+  bcEl.innerHTML = bots.map(([label, key]) => {
+    const b = bp[key] || {};
+    const st = b.status || 'unknown';
+    const cls = st === 'active' ? 'green' : st === 'reduced' ? 'yellow' : 'grey';
+    return `<div class="card bot-card">
+      <div class="bot-card-name">${label} Bot</div>
+      <div class="bot-card-status">${badge(st, cls)}</div>
+      <div class="bot-card-meta" style="margin-top:8px">Capital: <b>${b.capital_weight != null ? pct(b.capital_weight) : '—'}</b><br>Size cap: <b>${b.size_cap != null ? b.size_cap : '—'}</b></div>
+    </div>`;
+  }).join('');
+
+  // Positions table
+  const pos = data.open_positions || [];
+  const ptEl = document.getElementById('positions-table');
+  if (!pos.length) { ptEl.innerHTML = '<div class="empty-state">No open positions</div>'; }
+  else {
+    ptEl.innerHTML = `<table><thead><tr>
+      <th>Bot</th><th>Symbol</th><th>Type</th><th>Direction</th><th>Entry Price</th><th>Entry Time</th><th>Notional</th>
+    </tr></thead><tbody>` +
+    pos.map(p => `<tr>
+      <td>${p.bot_source || '—'}</td>
+      <td><b>${p.asset}</b></td>
+      <td>${p.asset_type || '—'}</td>
+      <td>${p.direction ? badge(p.direction, p.direction === 'long' ? 'green' : 'red') : '—'}</td>
+      <td>${p.entry_price != null ? '$' + Number(p.entry_price).toFixed(2) : '—'}</td>
+      <td>${fmtDate(p.entry_time)}</td>
+      <td>${p.notional_risk != null ? '$' + Number(p.notional_risk).toLocaleString() : '—'}</td>
+    </tr>`).join('') + `</tbody></table>`;
+  }
+
+  // Net exposure
+  const s = data.summary || {};
+  document.getElementById('net-delta').textContent = s.net_delta != null ? Number(s.net_delta).toFixed(3) : '—';
+  document.getElementById('net-vega').textContent  = s.net_vega  != null ? Number(s.net_vega).toFixed(3)  : '—';
+}
+
+// ── Performance ──────────────────────────────────────────────────────────────
+let equityChartInstance = null;
+
+function renderPerformance(data) {
+  const thr = data.thresholds || {};
+
+  // Gauges
+  const gauges = [
+    { key:'win_rate',      label:'Win Rate',      fmt: v => (v*100).toFixed(1)+'%' },
+    { key:'profit_factor', label:'Profit Factor', fmt: v => v.toFixed(2)           },
+    { key:'max_drawdown',  label:'Max Drawdown',  fmt: v => (v*100).toFixed(1)+'%' },
+    { key:'trade_count',   label:'Trade Count',   fmt: v => v                      },
+  ];
+  const r = document.getElementById('gauges-row');
+  r.innerHTML = gauges.map(g => {
+    const t    = thr[g.key] || {};
+    const val  = t.value ?? 0;
+    const tgt  = t.target ?? 1;
+    const pass = t.pass;
+    const frac = g.key === 'max_drawdown' ? (val <= tgt ? 1 : tgt / val) : Math.min(val / tgt, 1);
+    const circ = 2 * Math.PI * 42;
+    const off  = circ * (1 - frac);
+    const color = pass ? 'var(--green)' : 'var(--red)';
+    return `<div class="card gauge-wrap">
+      <div class="gauge-circle">
+        <svg width="100" height="100" viewBox="0 0 100 100">
+          <circle class="gauge-bg" cx="50" cy="50" r="42"/>
+          <circle class="gauge-fill" cx="50" cy="50" r="42"
+            stroke="${color}" stroke-dasharray="${circ}" stroke-dashoffset="${off}"/>
+        </svg>
+        <div class="gauge-text" style="color:${color}">${g.fmt(val)}</div>
+      </div>
+      <div class="gauge-label">${g.label}</div>
+      <div class="gauge-target">Target: ${g.fmt(tgt)} &nbsp; ${pass ? badge('PASS','green') : badge('FAIL','red')}</div>
+    </div>`;
+  }).join('');
+
+  // Equity curve
+  const curve = data.equity_curve || [];
+  const eEmpty = document.getElementById('equity-empty');
+  const canvas  = document.getElementById('equity-chart');
+  if (!curve.length) {
+    canvas.style.display = 'none'; eEmpty.style.display = '';
+  } else {
+    canvas.style.display = ''; eEmpty.style.display = 'none';
+    if (equityChartInstance) equityChartInstance.destroy();
+    equityChartInstance = new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels: curve.map(c => c.date),
+        datasets: [{ label:'Cumulative PnL', data: curve.map(c => c.cumulative_pnl),
+          borderColor:'#3b82f6', backgroundColor:'rgba(59,130,246,.08)',
+          borderWidth:2, fill:true, tension:.3, pointRadius:0 }]
+      },
+      options: {
+        responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{ display:false } },
+        scales: {
+          x:{ ticks:{ color:'#64748b', maxTicksLimit:10 }, grid:{ color:'rgba(255,255,255,.04)' } },
+          y:{ ticks:{ color:'#64748b', callback: v => '$'+v.toLocaleString() }, grid:{ color:'rgba(255,255,255,.04)' } }
+        }
+      }
+    });
+  }
+
+  // Strategy table
+  const st = data.trade_outcomes || [];
+  const stEl = document.getElementById('strategy-table');
+  if (!st.length) { stEl.innerHTML = '<div class="empty-state">No strategy data yet.</div>'; return; }
+  stEl.innerHTML = `<table><thead><tr>
+    <th>Strategy ID</th><th>Win Rate</th><th>Trades</th><th>Total PnL</th>
+  </tr></thead><tbody>` +
+  [...st].sort((a,b) => (b.win_rate||0)-(a.win_rate||0)).map(s => {
+    const wr = Number(s.win_rate || 0);
+    const wrc = wr > 0.55 ? 'green' : wr >= 0.45 ? 'yellow' : 'red';
+    return `<tr>
+      <td><b>${s.strategy_id}</b></td>
+      <td>${badge((wr*100).toFixed(1)+'%', wrc)}</td>
+      <td>${s.trades}</td>
+      <td class="${Number(s.total_pnl||0)>=0?'pnl-pos':'pnl-neg'}">$${Number(s.total_pnl||0).toFixed(2)}</td>
+    </tr>`;
+  }).join('') + `</tbody></table>`;
+}
+
+// ── Track F ──────────────────────────────────────────────────────────────────
+function renderTrackF(pending, scores, candidates, exposure) {
+  // Pending approval queue
+  const pEl = document.getElementById('pending-themes');
+  if (!pending.length) { pEl.innerHTML = '<div class="empty-state">No pending themes this week. ✓</div>'; }
+  else {
+    pEl.innerHTML = `<table><thead><tr><th>Theme</th><th>Momentum</th><th>Top Phrases</th><th>Detected</th><th>Actions</th></tr></thead><tbody>` +
+    pending.map(t => `<tr>
+      <td><b>${t.candidate_theme}</b></td>
+      <td><div class="bar-track" style="width:100px"><div class="bar-fill" style="width:${t.momentum||0}%;background:var(--accent)"></div></div></td>
+      <td style="color:var(--muted)">${(t.top_phrases||[]).slice(0,3).join(', ')}</td>
+      <td>${fmtDate(t.created_at)}</td>
+      <td>
+        <button onclick="approveTheme('${t.candidate_theme}')" style="padding:4px 10px;background:rgba(34,197,94,.15);color:var(--green);border:1px solid var(--green);border-radius:5px;cursor:pointer;font-size:12px;margin-right:6px">Approve</button>
+        <button onclick="rejectTheme('${t.candidate_theme}')"  style="padding:4px 10px;background:rgba(239,68,68,.15);color:var(--red);border:1px solid var(--red);border-radius:5px;cursor:pointer;font-size:12px">Reject</button>
+      </td>
+    </tr>`).join('') + `</tbody></table>`;
+  }
+
+  // Bottleneck scores
+  const bEl = document.getElementById('bottleneck-table');
+  if (!scores.length) { bEl.innerHTML = '<div class="empty-state">Track F not yet deployed.</div>'; }
+  else {
+    bEl.innerHTML = `<table><thead><tr><th>Ticker</th><th>Theme</th><th>Score</th><th>Constraint</th><th>Rev Lever</th><th>Attention</th><th>Smart $</th><th>Crowding</th><th>Last Scored</th></tr></thead><tbody>` +
+    scores.map(s => {
+      const sc = Number(s.bottleneck_score||0);
+      return `<tr>
+        <td><b>${s.ticker}</b></td><td>${s.theme||'—'}</td>
+        <td><span style="color:${scoreColor(sc)};font-weight:700">${sc.toFixed(1)}</span></td>
+        <td>${s.constraint_severity!=null?Number(s.constraint_severity).toFixed(1):'—'}</td>
+        <td>${s.revenue_leverage!=null?s.revenue_leverage:'—'}</td>
+        <td>${s.attention_gap!=null?s.attention_gap:'—'}</td>
+        <td>${s.smart_money_score!=null?s.smart_money_score:'—'}</td>
+        <td>${s.crowding_penalty!=null?s.crowding_penalty:'—'}</td>
+        <td>${fmtDate(s.scored_at)}</td>
+      </tr>`;
+    }).join('') + `</tbody></table>`;
+  }
+
+  // Candidates
+  const cEl = document.getElementById('candidates-table');
+  if (!candidates.length) { cEl.innerHTML = '<div class="empty-state">No candidates.</div>'; }
+  else {
+    cEl.innerHTML = `<table><thead><tr><th>Strategy</th><th>Ticker</th><th>Theme</th><th>Score</th><th>Conviction</th><th>Vehicle</th><th>Horizon</th><th>Status</th><th>Thesis</th></tr></thead><tbody>` +
+    candidates.map(c => `<tr>
+      <td>${c.strategy_id||'—'}</td><td><b>${c.ticker||'—'}</b></td><td>${c.theme||'—'}</td>
+      <td>${c.score!=null?Number(c.score).toFixed(1):'—'}</td>
+      <td>${c.conviction!=null?Number(c.conviction).toFixed(2):'—'}</td>
+      <td>${c.vehicle||'—'}</td><td>${c.horizon||'—'}</td>
+      <td>${badge(c.status||'—', c.status==='approved'?'green':'grey')}</td>
+      <td><div class="truncate" title="${(c.thesis||'').replace(/"/g,"'")}"> ${c.thesis||'—'}</div></td>
+    </tr>`).join('') + `</tbody></table>`;
+  }
+
+  // Theme exposure bars
+  const exp = exposure.exposures || {};
+  const cap = exposure.cap || 0.15;
+  const eEl = document.getElementById('theme-exposure-bars');
+  eEl.innerHTML = Object.entries(exp).map(([theme, e]) => {
+    const p = e.pct || 0;
+    const color = p < 0.10 ? 'var(--green)' : p < cap ? 'var(--yellow)' : 'var(--red)';
+    const pctStr = (p * 100).toFixed(1) + '%';
+    const barW = Math.min(p / cap, 1) * 100;
+    return `<div class="bar-wrap">
+      <div class="bar-label"><span>${theme} <span style="color:var(--muted);font-size:11px">${e.tickers.join(', ')||'none'}</span></span><span style="color:${color};font-weight:600">${pctStr}</span></div>
+      <div class="bar-track" style="position:relative">
+        <div class="bar-fill" style="width:${barW}%;background:${color}"></div>
+        <div style="position:absolute;top:0;bottom:0;left:100%;width:1px;background:rgba(255,255,255,.3)"></div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function approveTheme(theme) {
+  try {
+    await api('/track-f/approve', { method:'POST', body: JSON.stringify({ candidate_theme: theme }) });
+    toast('Approved: ' + theme, 'success');
+    loadTrackF();
+  } catch(e) { toast('Failed to approve', 'error'); }
+}
+async function rejectTheme(theme) {
+  try {
+    await api('/track-f/reject', { method:'POST', body: JSON.stringify({ candidate_theme: theme }) });
+    toast('Rejected: ' + theme, 'success');
+    loadTrackF();
+  } catch(e) { toast('Failed to reject', 'error'); }
+}
+
+// ── Tickets ──────────────────────────────────────────────────────────────────
+let allTickets = [];
+let ticketPage = 0;
+const PAGE_SIZE = 20;
+
+function renderTickets(data) {
+  allTickets = data;
+  ticketPage = 0;
+  renderTicketPage();
+}
+
+function renderBudget(budget) {
+  const el = document.getElementById('budget-cards');
+  if (!budget.length) { el.innerHTML = '<div class="empty-state">No budget data.</div>'; return; }
+  let total = 0;
+  budget.forEach(b => total += Number(b.cost_usd||0));
+  el.innerHTML = budget.map(b => `<div class="card" style="margin:0">
+    <div class="card-title">${b.agent||b.agent_name||'Agent'}</div>
+    <div style="font-size:22px;font-weight:700">$${Number(b.cost_usd||0).toFixed(4)}</div>
+    <div style="color:var(--muted);font-size:12px">${b.tokens_used!=null?Number(b.tokens_used).toLocaleString()+' tokens':''}</div>
+  </div>`).join('') +
+  `<div class="card" style="margin:0;border-color:var(--accent)">
+    <div class="card-title">Total</div>
+    <div style="font-size:22px;font-weight:700;color:var(--accent)">$${total.toFixed(4)}</div>
+  </div>`;
+}
+
+function renderTicketPage() {
+  const start = ticketPage * PAGE_SIZE;
+  const page  = allTickets.slice(start, start + PAGE_SIZE);
+  const el    = document.getElementById('tickets-table');
+  if (!allTickets.length) { el.innerHTML = '<div class="empty-state">No tickets yet.</div>'; document.getElementById('ticket-pagination').innerHTML=''; return; }
+  el.innerHTML = `<table><thead><tr><th>Time</th><th>From</th><th>To</th><th>Type</th><th>Decision</th><th>Reasoning</th></tr></thead><tbody>` +
+  page.map(t => `<tr class="${!t.has_decision?'ticket-no-decision':''}">
+    <td style="white-space:nowrap">${fmtDate(t.created_at)}</td>
+    <td>${t.from_agent||'—'}</td>
+    <td>${t.to_agent||'—'}</td>
+    <td><code style="font-size:11px;background:rgba(255,255,255,.05);padding:2px 5px;border-radius:3px">${t.type||'—'}</code></td>
+    <td>${t.decision ? badge(t.decision, t.decision==='APPROVED'?'green':t.decision==='VETOED'?'red':'grey') : badge('pending','yellow')}</td>
+    <td><div class="truncate" title="${(t.reasoning||'').replace(/"/g,"'")}">${t.reasoning||'—'}</div></td>
+  </tr>`).join('') + `</tbody></table>`;
+
+  const total = allTickets.length;
+  const pages = Math.ceil(total / PAGE_SIZE);
+  const pg = document.getElementById('ticket-pagination');
+  pg.innerHTML = `<button class="page-btn" onclick="ticketPage--;renderTicketPage()" ${ticketPage===0?'disabled':''}>← Prev</button>
+    <span class="page-info">Page ${ticketPage+1} of ${pages}</span>
+    <button class="page-btn" onclick="ticketPage++;renderTicketPage()" ${ticketPage>=pages-1?'disabled':''}>Next →</button>`;
+}
+
+// ── System ───────────────────────────────────────────────────────────────────
+function renderSystem(pm2, agents) {
+  // PM2
+  const pm2El = document.getElementById('pm2-table');
+  if (pm2.error || !Array.isArray(pm2)) {
+    pm2El.innerHTML = `<div class="empty-state">${pm2.error || 'PM2 unavailable'}</div>`;
+  } else {
+    const uptimeFmt = ms => {
+      if (!ms) return '—';
+      const h = Math.floor(ms/3600000), m = Math.floor((ms%3600000)/60000);
+      return h > 0 ? `${h}h ${m}m` : `${m}m`;
+    };
+    pm2El.innerHTML = `<table><thead><tr><th>Name</th><th>Status</th><th>Restarts</th><th>Uptime</th><th>Memory</th><th>CPU</th></tr></thead><tbody>` +
+    pm2.map(p => {
+      const st  = p.status || 'unknown';
+      const cls = st === 'online' ? 'green' : st === 'stopped' ? 'red' : 'yellow';
+      return `<tr>
+        <td><b>${p.name}</b></td>
+        <td>${badge(st, cls)}</td>
+        <td>${p.restarts}</td>
+        <td>${uptimeFmt(p.uptime_ms)}</td>
+        <td>${p.memory_mb} MB</td>
+        <td>${p.cpu_pct}%</td>
+      </tr>`;
+    }).join('') + `</tbody></table>`;
+  }
+
+  // Agent fired
+  const af = agents.agent_last_fired || {};
+  const afEl = document.getElementById('agent-fired');
+  afEl.innerHTML = Object.keys(af).length
+    ? Object.entries(af).map(([a,t]) => `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(45,49,72,.5)"><span style="color:var(--muted)">${a}</span><span>${timeAgo(t)}</span></div>`).join('')
+    : '<div class="empty-state">No agent data.</div>';
+
+  // File freshness
+  const ff = agents.file_last_modified || {};
+  const ffEl = document.getElementById('file-freshness');
+  ffEl.innerHTML = Object.keys(ff).length
+    ? Object.entries(ff).map(([f,t]) => `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(45,49,72,.5)"><span style="color:var(--muted)">${f}</span><span>${timeAgo(t)}</span></div>`).join('')
+    : '<div class="empty-state">No file data.</div>';
+
+  // Resources
+  const sys = agents.system || {};
+  const rEl = document.getElementById('server-resources');
+  rEl.innerHTML = ['memory','disk'].map(key => {
+    const v = sys[key+'_pct'] || 0;
+    const color = v < 70 ? 'var(--green)' : v < 85 ? 'var(--yellow)' : 'var(--red)';
+    return `<div class="bar-wrap">
+      <div class="bar-label"><span>${key.charAt(0).toUpperCase()+key.slice(1)}</span><span style="color:${color};font-weight:600">${v}%</span></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${v}%;background:${color}"></div></div>
+    </div>`;
+  }).join('');
+}
+
+// ── Loaders ──────────────────────────────────────────────────────────────────
+async function loadPortfolio() {
+  try { renderPortfolio(await api('/portfolio')); } catch(e) { if (e.message !== '401') console.error(e); }
+}
+async function loadPerformance() {
+  try { renderPerformance(await api('/performance')); } catch(e) { if (e.message !== '401') console.error(e); }
+}
+async function loadTrackF() {
+  try {
+    const [pending, scores, candidates, exposure] = await Promise.all([
+      api('/track-f/pending'), api('/track-f/scores'), api('/track-f/candidates'), api('/track-f/theme-exposure')
+    ]);
+    renderTrackF(pending, scores, candidates, exposure);
+  } catch(e) { if (e.message !== '401') console.error(e); }
+}
+async function loadTickets() {
+  try {
+    const [tickets, budget] = await Promise.all([api('/tickets'), api('/budget')]);
+    renderTickets(tickets);
+    renderBudget(budget);
+  } catch(e) { if (e.message !== '401') console.error(e); }
+}
+async function loadSystem() {
+  try {
+    const [pm2, agents] = await Promise.all([api('/health/pm2'), api('/health/agents')]);
+    renderSystem(pm2, agents);
+  } catch(e) { if (e.message !== '401') console.error(e); }
+}
+
+async function loadAll() {
+  if (!checkAuth()) return;
+  try {
+    const h = await api('/health');
+    const dot = document.getElementById('status-dot');
+    const lbl = document.getElementById('status-label');
+    dot.className = 'status-dot ' + (h.status === 'ok' ? 'connected' : 'error');
+    lbl.textContent = h.status === 'ok' ? 'Connected' : 'DB error';
+  } catch(e) { document.getElementById('status-dot').className = 'status-dot error'; return; }
+
+  document.getElementById('last-refresh').textContent = 'Refreshed ' + new Date().toLocaleTimeString();
+  await Promise.all([loadPortfolio(), loadPerformance(), loadTrackF(), loadTickets(), loadSystem()]);
+}
+
+// Init
+if (TOKEN) { modal.classList.add('hidden'); loadAll(); } else { modal.classList.remove('hidden'); }
+setInterval(loadAll, 60000);
+</script>
+</body>
+</html>
