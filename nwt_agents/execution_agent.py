@@ -29,6 +29,7 @@ from shared_context import (
     insert_ticket,
     load_master_directives,
     log_system_event,
+    pre_trade_veto,
 )
 
 logging.basicConfig(
@@ -232,6 +233,17 @@ def main() -> None:
             bot_source_map = {"C": "NWT_TRACK_C", "D": "NWT_TRACK_D", "E": "NWT_TRACK_E"}
             bot_source = bot_source_map.get(from_track, f"NWT_TRACK_{from_track}")
 
+            # Synchronous risk gate — the risk agent's APPROVED decision may be
+            # minutes old; re-check kill switch / cooling-off / entry cutoff NOW,
+            # before this proposal becomes an order.
+            vetoed, veto_reason = pre_trade_veto(conn, from_track)
+            if vetoed:
+                logger.warning("Ticket %s vetoed at submission: %s", ticket_id, veto_reason)
+                insert_decision(conn, ticket_id, "VETOED", veto_reason, "NWT_EXECUTION_AGENT")
+                log_system_event(conn, "WARNING", "execution_agent", veto_reason, {"ticket_id": ticket_id})
+                failed_count += 1
+                continue
+
             # Resolve specific option contract
             contract = resolve_option_contract(
                 symbol=symbol,
@@ -262,6 +274,7 @@ def main() -> None:
                 "option_symbol": option_symbol,
                 "direction": direction,
                 "strategy_id": strategy_id,
+                "archetype": payload.get("archetype", ""),
                 "sized_notional": sized_notional,
                 "qty": qty,
                 "asset_type": "option",

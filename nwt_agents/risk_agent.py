@@ -22,10 +22,14 @@ from psycopg2.extras import RealDictCursor
 load_dotenv(Path(__file__).parent / ".env")
 
 from shared_context import (
+    NEW_ENTRY_CUTOFF_UTC_HOUR,
+    NEW_ENTRY_CUTOFF_UTC_MINUTE,
     get_db,
+    get_disabled_tracks,
     insert_decision,
     load_master_directives,
     log_system_event,
+    past_new_entry_cutoff,
 )
 
 logging.basicConfig(
@@ -51,8 +55,8 @@ REGIME_CONFIDENCE_REDUCE = 0.40
 REGIME_TRANSITION_PAUSE = 0.60
 HARD_CLOSE_UTC_HOUR = 19       # 15:45 EDT (UTC-4 in summer) = 19:45 UTC
 HARD_CLOSE_UTC_MINUTE = 45
-NEW_ENTRY_CUTOFF_UTC_HOUR = 19  # No new entries after 19:30 UTC (15:30 EDT)
-NEW_ENTRY_CUTOFF_UTC_MINUTE = 30
+# New-entry cutoff constants live in shared_context — also enforced
+# synchronously in the execution path (pre_trade_veto).
 EXECUTION_STALE_MINUTES = 30
 SPREAD_WIDENING_FACTOR = 3.0
 
@@ -135,39 +139,6 @@ def get_consecutive_losses_by_track(conn) -> dict:
         losses = sum(1 for r in rows if r[0] is not None and float(r[0]) < 0)
         result[track] = losses
     return result
-
-
-def get_disabled_tracks(conn) -> set:
-    """
-    Return set of tracks currently disabled by the risk agent (cooling-off).
-    Look for system log entries of TRACK_DISABLED level from last 24h.
-    """
-    disabled = set()
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT payload FROM nwt_system_log
-            WHERE component = 'risk_agent'
-              AND message LIKE 'TRACK_DISABLED%'
-              AND created_at > NOW() - INTERVAL '24 hours'
-            """
-        )
-        rows = cur.fetchall()
-    for row in rows:
-        payload = row[0]
-        if isinstance(payload, dict):
-            track = payload.get("track")
-            if track:
-                disabled.add(track)
-        elif isinstance(payload, str):
-            try:
-                p = json.loads(payload)
-                track = p.get("track")
-                if track:
-                    disabled.add(track)
-            except Exception:
-                pass
-    return disabled
 
 
 def get_average_slippage(conn) -> float:
@@ -357,12 +328,7 @@ def evaluate_proposal(
     symbol = payload.get("symbol", "")
 
     # RULE 0: After 19:30 UTC (15:30 EDT) no new entries — hard close approaching
-    now_utc = datetime.now(timezone.utc)
-    past_cutoff = (
-        now_utc.hour > NEW_ENTRY_CUTOFF_UTC_HOUR or
-        (now_utc.hour == NEW_ENTRY_CUTOFF_UTC_HOUR and now_utc.minute >= NEW_ENTRY_CUTOFF_UTC_MINUTE)
-    )
-    if past_cutoff:
+    if past_new_entry_cutoff():
         return "VETOED", f"Rule 0: Past new-entry cutoff {NEW_ENTRY_CUTOFF_UTC_HOUR}:{NEW_ENTRY_CUTOFF_UTC_MINUTE:02d} UTC — no new positions before market close"
 
     # RULE 1: VIX > 40 → global kill switch

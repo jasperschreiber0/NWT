@@ -25,6 +25,7 @@ CREATE OR REPLACE RULE no_delete_tickets AS ON DELETE TO nwt_tickets DO INSTEAD 
 CREATE TABLE IF NOT EXISTS nwt_portfolio_ledger (
   position_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   bot_source TEXT NOT NULL,
+  strategy_id TEXT,
   asset TEXT NOT NULL,
   asset_type TEXT NOT NULL,
   direction TEXT,
@@ -32,8 +33,12 @@ CREATE TABLE IF NOT EXISTS nwt_portfolio_ledger (
   notional_risk NUMERIC,
   entry_price NUMERIC,
   entry_time TIMESTAMPTZ,
+  entry_bid NUMERIC,            -- NBBO at entry — feeds pnl_adjusted haircut
+  entry_ask NUMERIC,
   exit_price NUMERIC,
   exit_time TIMESTAMPTZ,
+  exit_bid NUMERIC,             -- NBBO at exit
+  exit_ask NUMERIC,
   realized_slippage NUMERIC,
   status TEXT DEFAULT 'open',
   alpaca_order_id TEXT,
@@ -44,6 +49,7 @@ CREATE TABLE IF NOT EXISTS nwt_portfolio_ledger (
 CREATE TABLE IF NOT EXISTS nwt_trade_outcomes (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   strategy_id TEXT NOT NULL,
+  archetype TEXT,               -- attribution pools at archetype × regime level
   symbol TEXT,
   direction TEXT,
   entry_price NUMERIC,
@@ -52,6 +58,10 @@ CREATE TABLE IF NOT EXISTS nwt_trade_outcomes (
   exit_time TIMESTAMPTZ,
   pnl NUMERIC,
   pnl_pct NUMERIC,
+  pnl_adjusted NUMERIC,         -- spread-haircut PnL — the number that matters
+  pnl_adjusted_pct NUMERIC,
+  entry_spread_pct NUMERIC,
+  exit_spread_pct NUMERIC,
   iv_at_entry NUMERIC,
   iv_at_exit NUMERIC,
   regime_at_entry JSONB,
@@ -86,6 +96,7 @@ CREATE TABLE IF NOT EXISTS nwt_strategy_decay (
 CREATE TABLE IF NOT EXISTS nwt_strategy_genome (
   strategy_id TEXT PRIMARY KEY,
   track TEXT NOT NULL,
+  archetype TEXT,               -- strategy bucket — tracks fire max 1 proposal per archetype/day
   asset_universe TEXT[],
   dte_min INTEGER,
   dte_max INTEGER,
@@ -110,6 +121,24 @@ CREATE TABLE IF NOT EXISTS nwt_system_log (
   message TEXT NOT NULL,
   payload JSONB,
   created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Green/red session scorecard (one row per trading session)
+CREATE TABLE IF NOT EXISTS nwt_session_scorecard (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_date DATE NOT NULL UNIQUE,
+  integrity_gate_passed BOOLEAN,
+  directives_fresh BOOLEAN,
+  conviction_ran BOOLEAN,
+  tracks_ran BOOLEAN,
+  activity_logged BOOLEAN,      -- proposals OR inactivity rows (do-nothing is valid)
+  risk_agent_clear BOOLEAN,     -- ran AND no stale unprocessed proposals
+  execution_clear BOOLEAN,      -- no stale unprocessed TRADE_REQUESTs
+  learning_agent_ran BOOLEAN,
+  manual_interventions INTEGER DEFAULT 0,
+  green BOOLEAN,
+  details JSONB,
+  computed_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Inactivity log (do-nothing is a first-class logged state)

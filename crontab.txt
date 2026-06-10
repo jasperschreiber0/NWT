@@ -37,3 +37,6 @@ NWT_DIR=/home/northworld/trading/nwt_agents
 # Learning agent + cost agent — 21:00 UTC = 07:00 AEST Tue-Sat
 0 7 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 learning_agent.py >> /var/log/nwt/learning.log 2>&1
 0 7 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 cost_agent.py >> /var/log/nwt/cost.log 2>&1
+
+# Session scorecard (green/red) — 21:15 UTC = 07:15 AEST Tue-Sat, after learning agent
+15 7 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 session_scorecard.py >> /var/log/nwt/scorecard.log 2>&1

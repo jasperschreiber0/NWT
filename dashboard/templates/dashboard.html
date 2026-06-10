@@ -395,6 +395,44 @@
 
   </div>
 
+  <!-- ── Session scorecard (green/red) ─────────────────────── -->
+  <div class="card section-gap">
+    <div class="card-header">
+      <div class="card-title">Session Scorecard — last 14 sessions</div>
+      <div class="badge {% if consecutive_green > 0 %}badge-green{% else %}badge-muted{% endif %}">
+        {{ consecutive_green }} consecutive green
+      </div>
+    </div>
+    <div class="card-body" style="display:flex;gap:8px;flex-wrap:wrap">
+      {% if scorecard %}
+        {% for s in scorecard %}
+          {% set failed = [] %}
+          {% if not s.integrity_gate_passed %}{% set _ = failed.append('gate') %}{% endif %}
+          {% if not s.directives_fresh %}{% set _ = failed.append('directives') %}{% endif %}
+          {% if not s.conviction_ran %}{% set _ = failed.append('conviction') %}{% endif %}
+          {% if not s.tracks_ran %}{% set _ = failed.append('tracks') %}{% endif %}
+          {% if not s.activity_logged %}{% set _ = failed.append('activity') %}{% endif %}
+          {% if not s.risk_agent_clear %}{% set _ = failed.append('risk') %}{% endif %}
+          {% if not s.execution_clear %}{% set _ = failed.append('execution') %}{% endif %}
+          {% if not s.learning_agent_ran %}{% set _ = failed.append('learning') %}{% endif %}
+          <div style="text-align:center"
+               title="{{ s.session_date }}{% if failed %} — failed: {{ failed | join(', ') }}{% endif %}">
+            <div style="width:34px;height:34px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-weight:700;
+                        {% if s.green %}background:var(--green-dim);color:var(--green);border:1px solid var(--green)
+                        {% else %}background:var(--red-dim);color:var(--red);border:1px solid var(--red){% endif %}">
+              {% if s.green %}✓{% else %}✗{% endif %}
+            </div>
+            <div style="font-size:9px;color:var(--muted);margin-top:2px">{{ s.session_date.strftime('%m-%d') }}</div>
+          </div>
+        {% endfor %}
+      {% else %}
+        <div class="empty" style="padding:16px;width:100%">
+          No sessions scored yet — scorecard fires 21:15 UTC after the learning agent
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
   <!-- ── Pipeline today ────────────────────────────────────── -->
   <div class="section-gap">
     <div class="pipeline">

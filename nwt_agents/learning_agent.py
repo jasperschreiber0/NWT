@@ -43,6 +43,17 @@ logger = logging.getLogger("learning_agent")
 
 AGENTS_DIR = Path(os.environ.get("NWT_AGENTS_DIR", Path(__file__).parent))
 
+# pnl_adjusted haircut — paper fills land at mid, which is optimistic for
+# options spreads. We assume a real marketable order gives up this fraction
+# of the half-spread on EACH side (1.0 = fill at bid/ask, 0.0 = fill at mid).
+SPREAD_HAIRCUT_FRACTION = float(os.environ.get("NWT_SPREAD_HAIRCUT_FRACTION", "0.75"))
+# Conservative default total spread (as fraction of price) when NBBO was not
+# captured — missing data must not silently produce un-haircut numbers.
+DEFAULT_SPREAD_PCT = {
+    "option": float(os.environ.get("NWT_DEFAULT_OPTION_SPREAD_PCT", "0.05")),
+    "equity": float(os.environ.get("NWT_DEFAULT_EQUITY_SPREAD_PCT", "0.0005")),
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -98,6 +109,60 @@ def find_original_ticket(conn, alpaca_order_id: str, asset: str) -> Optional[dic
         )
         row = cur.fetchone()
     return dict(row) if row else None
+
+
+def _half_spread(price: float, bid, ask, asset_type: str) -> tuple:
+    """
+    (half_spread, spread_pct) from captured NBBO, falling back to the
+    conservative default when quotes are missing or crossed.
+    """
+    bid = float(bid) if bid is not None else 0.0
+    ask = float(ask) if ask is not None else 0.0
+    if ask > bid > 0:
+        mid = (ask + bid) / 2.0
+        spread_pct = (ask - bid) / mid if mid > 0 else 0.0
+        return (ask - bid) / 2.0, spread_pct
+    spread_pct = DEFAULT_SPREAD_PCT.get(asset_type, DEFAULT_SPREAD_PCT["option"])
+    return price * spread_pct / 2.0, spread_pct
+
+
+def compute_pnl_adjusted(
+    entry_price: float,
+    exit_price: float,
+    direction: str,
+    notional: float,
+    entry_bid, entry_ask, exit_bid, exit_ask,
+    asset_type: str,
+) -> tuple:
+    """
+    Spread-haircut PnL: shift entry and exit against the trade by
+    SPREAD_HAIRCUT_FRACTION × half-spread on each side.
+    Returns (pnl_adjusted_dollars, pnl_adjusted_pct, entry_spread_pct, exit_spread_pct).
+    """
+    hs_entry, entry_spread_pct = _half_spread(entry_price, entry_bid, entry_ask, asset_type)
+    hs_exit, exit_spread_pct = _half_spread(exit_price, exit_bid, exit_ask, asset_type)
+
+    if direction == "long":
+        adj_entry = entry_price + SPREAD_HAIRCUT_FRACTION * hs_entry  # buy worse (higher)
+        adj_exit = exit_price - SPREAD_HAIRCUT_FRACTION * hs_exit     # sell worse (lower)
+        adj_pct = (adj_exit - adj_entry) / entry_price if entry_price > 0 else 0.0
+    else:
+        adj_entry = entry_price - SPREAD_HAIRCUT_FRACTION * hs_entry  # sell worse (lower)
+        adj_exit = exit_price + SPREAD_HAIRCUT_FRACTION * hs_exit     # buy back worse (higher)
+        adj_pct = (adj_entry - adj_exit) / entry_price if entry_price > 0 else 0.0
+
+    return adj_pct * notional, adj_pct, entry_spread_pct, exit_spread_pct
+
+
+def get_archetype(conn, strategy_id: str) -> Optional[str]:
+    """Archetype for a strategy_id from the genome (active or not)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT archetype FROM nwt_strategy_genome WHERE strategy_id = %s",
+            (strategy_id,),
+        )
+        row = cur.fetchone()
+    return row[0] if row and row[0] else None
 
 
 def compute_exit_timing_score(
@@ -163,12 +228,20 @@ def compute_realized_move_capture(
 # Strategy decay computation
 # ---------------------------------------------------------------------------
 
-def compute_strategy_decay(conn, strategy_id: str) -> None:
-    """Compute and INSERT/UPDATE nwt_strategy_decay for a given strategy_id."""
+def compute_strategy_decay(conn, key: str, key_column: str = "strategy_id") -> None:
+    """
+    Compute and INSERT nwt_strategy_decay for a strategy_id or, when
+    key_column='archetype', pooled across the archetype bucket — the only
+    granularity with enough samples to mean anything in the first window.
+    Uses pnl_adjusted (spread-haircut) when available; raw pnl as fallback.
+    """
+    if key_column not in ("strategy_id", "archetype"):
+        raise ValueError(f"Invalid decay key column: {key_column}")
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT pnl, closed_at FROM nwt_trade_outcomes WHERE strategy_id = %s ORDER BY closed_at ASC",
-            (strategy_id,),
+            f"SELECT COALESCE(pnl_adjusted, pnl), closed_at FROM nwt_trade_outcomes "
+            f"WHERE {key_column} = %s ORDER BY closed_at ASC",
+            (key,),
         )
         rows = cur.fetchall()
 
@@ -225,7 +298,7 @@ def compute_strategy_decay(conn, strategy_id: str) -> None:
             VALUES (%s, %s, %s, %s, %s, %s)
             """,
             (
-                strategy_id,
+                key,
                 round(rolling_expectancy_20, 4),
                 round(baseline_expectancy, 4),
                 round(expectancy_delta, 4),
@@ -237,8 +310,8 @@ def compute_strategy_decay(conn, strategy_id: str) -> None:
 
     if decay_flag:
         logger.warning(
-            "Strategy %s DECAY FLAG SET: expectancy_delta=%.4f, wl_trend=%s",
-            strategy_id, expectancy_delta, wl_trend,
+            "%s %s DECAY FLAG SET: expectancy_delta=%.4f, wl_trend=%s",
+            key_column, key, expectancy_delta, wl_trend,
         )
 
 
@@ -303,8 +376,32 @@ def main() -> None:
             original_ticket = find_original_ticket(conn, alpaca_order_id, asset)
             original_payload = (original_ticket.get("payload") or {}) if original_ticket else {}
 
-            # Strategy ID from original ticket or bot_source
-            strategy_id = original_payload.get("strategy_id") or bot_source or "UNKNOWN"
+            # Strategy ID — ledger column is authoritative (written at fill);
+            # ticket fishing is the legacy fallback
+            strategy_id = (
+                pos.get("strategy_id")
+                or original_payload.get("strategy_id")
+                or bot_source
+                or "UNKNOWN"
+            )
+
+            # Archetype — attribution pools here; genome is the source of truth
+            archetype = get_archetype(conn, strategy_id) or original_payload.get("archetype") or strategy_id
+
+            # pnl_adjusted — spread-haircut PnL from captured NBBO (or default
+            # spread when quotes are missing). This is the number that matters.
+            asset_type = pos.get("asset_type", "option")
+            pnl_adjusted, pnl_adjusted_pct, entry_spread_pct, exit_spread_pct = compute_pnl_adjusted(
+                entry_price,
+                exit_price,
+                direction,
+                notional,
+                pos.get("entry_bid"),
+                pos.get("entry_ask"),
+                pos.get("exit_bid"),
+                pos.get("exit_ask"),
+                asset_type,
+            )
 
             # Signal quality — logged SEPARATELY from PnL quality
             sq = original_payload.get("signal_quality", {})
@@ -341,9 +438,11 @@ def main() -> None:
                     cur.execute(
                         """
                         INSERT INTO nwt_trade_outcomes
-                            (strategy_id, symbol, direction,
+                            (strategy_id, archetype, symbol, direction,
                              entry_price, entry_time, exit_price, exit_time,
                              pnl, pnl_pct,
+                             pnl_adjusted, pnl_adjusted_pct,
+                             entry_spread_pct, exit_spread_pct,
                              iv_at_entry, iv_at_exit,
                              regime_at_entry, regime_at_exit,
                              dte_at_entry,
@@ -353,8 +452,10 @@ def main() -> None:
                              expected_move_capture, realized_move_capture,
                              closed_at)
                         VALUES
-                            (%s, %s, %s,
+                            (%s, %s, %s, %s,
                              %s, %s, %s, %s,
+                             %s, %s,
+                             %s, %s,
                              %s, %s,
                              %s, %s,
                              %s, %s,
@@ -367,6 +468,7 @@ def main() -> None:
                         """,
                         (
                             strategy_id,
+                            archetype,
                             asset,
                             direction,
                             entry_price,
@@ -375,6 +477,10 @@ def main() -> None:
                             exit_time,
                             round(pnl_dollars, 4),
                             round(pnl_pct, 6),
+                            round(pnl_adjusted, 4),
+                            round(pnl_adjusted_pct, 6),
+                            round(entry_spread_pct, 6),
+                            round(exit_spread_pct, 6),
                             iv_current,   # iv_at_entry (approximated)
                             iv_current,   # iv_at_exit (same approximation until historical available)
                             json.dumps(regime_at_entry),
@@ -394,8 +500,8 @@ def main() -> None:
                 outcomes_inserted += 1
                 strategies_seen.add(strategy_id)
                 logger.info(
-                    "Logged outcome for %s (%s): pnl=%.4f pnl_pct=%.4f exit_timing=%.2f entry_timing=%.2f",
-                    asset, strategy_id, pnl_dollars, pnl_pct, exit_timing_score, entry_timing_score,
+                    "Logged outcome for %s (%s/%s): pnl=%.4f pnl_adjusted=%.4f exit_timing=%.2f entry_timing=%.2f",
+                    asset, strategy_id, archetype, pnl_dollars, pnl_adjusted, exit_timing_score, entry_timing_score,
                 )
             except Exception as exc:
                 logger.error("Failed to insert outcome for position %s: %s", position_id, exc)
@@ -413,6 +519,19 @@ def main() -> None:
                 compute_strategy_decay(conn, sid)
             except Exception as exc:
                 logger.error("Strategy decay computation failed for %s: %s", sid, exc)
+
+        # Pooled decay per archetype — the granularity with real sample sizes
+        archetypes_with_data = set()
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT archetype FROM nwt_trade_outcomes WHERE archetype IS NOT NULL")
+            for row in cur.fetchall():
+                archetypes_with_data.add(row[0])
+
+        for arch in archetypes_with_data:
+            try:
+                compute_strategy_decay(conn, arch, key_column="archetype")
+            except Exception as exc:
+                logger.error("Archetype decay computation failed for %s: %s", arch, exc)
 
         log_system_event(
             conn,

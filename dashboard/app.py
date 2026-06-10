@@ -133,6 +133,30 @@ async def dashboard(request: Request):
             (datetime.now(timezone.utc).date(),),
         )
 
+        try:
+            scorecard = _q(
+                conn,
+                """
+                SELECT session_date, integrity_gate_passed, directives_fresh,
+                       conviction_ran, tracks_ran, activity_logged,
+                       risk_agent_clear, execution_clear, learning_agent_ran, green
+                FROM nwt_session_scorecard
+                ORDER BY session_date DESC
+                LIMIT 14
+                """,
+            )
+        except Exception:
+            conn.rollback()
+            scorecard = []  # table not migrated yet — render empty strip
+
+        scorecard = list(reversed(scorecard))  # oldest → newest, left to right
+        consecutive_green = 0
+        for row in reversed(scorecard):
+            if row.get("green"):
+                consecutive_green += 1
+            else:
+                break
+
     finally:
         conn.close()
 
@@ -150,6 +174,8 @@ async def dashboard(request: Request):
             "open_positions": open_positions,
             "system_log": system_log,
             "ticket_types_today": ticket_types_today,
+            "scorecard": scorecard,
+            "consecutive_green": consecutive_green,
             "directives": directives,
             "regime": regime,
             "kill_switch": kill_switch,

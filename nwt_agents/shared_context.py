@@ -6,10 +6,16 @@ All agents must import from here — never duplicate these lookups.
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+# Shared timing constants — single definition for risk agent AND execution path
+NEW_ENTRY_CUTOFF_UTC_HOUR = 19    # No new entries after 19:30 UTC (15:30 EDT)
+NEW_ENTRY_CUTOFF_UTC_MINUTE = 30
+TRACK_COOLOFF_HOURS = 24
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +108,74 @@ def compute_final_sizing(directives: dict, base_notional: float, bot_key: str) -
         multiplier *= 0.5
 
     return base_notional * capital_weight * size_cap * multiplier
+
+
+# ---------------------------------------------------------------------------
+# Synchronous risk vetoes — checked IN the order path, not just by the
+# risk agent's 5-minute sweep. Risk enforcement must fire before orders
+# reach Alpaca; these are the authoritative state flags re-checked at
+# submission time.
+# ---------------------------------------------------------------------------
+
+def get_disabled_tracks(conn) -> set:
+    """Tracks disabled by the risk agent (cooling-off) in the last 24h."""
+    disabled = set()
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT payload FROM nwt_system_log
+            WHERE component = 'risk_agent'
+              AND message LIKE 'TRACK_DISABLED%'
+              AND created_at > NOW() - INTERVAL '{TRACK_COOLOFF_HOURS} hours'
+            """
+        )
+        rows = cur.fetchall()
+    for row in rows:
+        payload = row[0]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                continue
+        if isinstance(payload, dict) and payload.get("track"):
+            disabled.add(payload["track"])
+    return disabled
+
+
+def past_new_entry_cutoff(now_utc: datetime = None) -> bool:
+    now_utc = now_utc or datetime.now(timezone.utc)
+    return (
+        now_utc.hour > NEW_ENTRY_CUTOFF_UTC_HOUR
+        or (now_utc.hour == NEW_ENTRY_CUTOFF_UTC_HOUR and now_utc.minute >= NEW_ENTRY_CUTOFF_UTC_MINUTE)
+    )
+
+
+def pre_trade_veto(conn, track: str) -> tuple:
+    """
+    Final synchronous gate before submitting an order for a NEW position.
+    Re-reads master-directives.json fresh (kill switch may have been activated
+    since this process started) and re-checks track cooling-off and the
+    new-entry cutoff. Returns (vetoed: bool, reason: str).
+    Closes/liquidations must NOT go through this gate.
+    """
+    try:
+        directives = load_master_directives()
+    except FileNotFoundError:
+        return True, "pre_trade_veto: master-directives.json missing — NO-TRADE MODE"
+
+    if directives.get("global_kill_switch", False):
+        return True, "pre_trade_veto: global kill switch active"
+
+    if track and track in get_disabled_tracks(conn):
+        return True, f"pre_trade_veto: track {track} in cooling-off period"
+
+    if past_new_entry_cutoff():
+        return True, (
+            f"pre_trade_veto: past new-entry cutoff "
+            f"{NEW_ENTRY_CUTOFF_UTC_HOUR}:{NEW_ENTRY_CUTOFF_UTC_MINUTE:02d} UTC"
+        )
+
+    return False, ""
 
 
 # ---------------------------------------------------------------------------
