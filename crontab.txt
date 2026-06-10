@@ -38,9 +38,12 @@ NWT_DIR=/home/northworld/trading/nwt_agents
 0 7 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 learning_agent.py >> /var/log/nwt/learning.log 2>&1
 0 7 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 cost_agent.py >> /var/log/nwt/cost.log 2>&1
 
+# Session scorecard (green/red) — 21:15 UTC = 07:15 AEST Tue-Sat, after learning agent
+15 7 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 session_scorecard.py >> /var/log/nwt/scorecard.log 2>&1
+
 # Recon nightly — 23:00 UTC = 09:00 AEST Tue-Sat (after learning agent, before next session)
 0 9 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 recon_agent.py --nightly >> /var/log/nwt/recon.log 2>&1
 
 # DB backup — nightly 22:30 UTC, local dump + 7-day rotation
-# NOTE: offsite upload requires AWS CLI or rclone configured separately (see CLAUDE.md)
+# NOTE: offsite upload requires AWS CLI or rclone configured separately
 30 22 * * * mkdir -p /var/backups/nwt && set -a && source /home/northworld/trading/nwt_agents/.env && set +a && pg_dump "$NWT_DB_DSN" | gzip > /var/backups/nwt/nwt_$(date +\%Y\%m\%d_\%H\%M).sql.gz && find /var/backups/nwt/ -name "*.sql.gz" -mtime +7 -delete >> /var/log/nwt/backup.log 2>&1

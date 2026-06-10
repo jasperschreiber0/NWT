@@ -4,14 +4,14 @@ THE MOST AUTHORITARIAN COMPONENT. No LLM. Pure deterministic code.
 Fires every 5 minutes 13:00-21:00 UTC via cron.
 
 Rules 0-13: veto individual trade proposals.
-Rules 14-16: system-level enforcement (heartbeat, drawdown, VIX) — sets no_trade_mode.
+Rules 14-17: system-level enforcement (heartbeat, drawdown, VIX, intraday PnL) — sets no_trade_mode.
 """
 
 import json
 import logging
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -23,12 +23,16 @@ from psycopg2.extras import RealDictCursor
 load_dotenv(Path(__file__).parent / ".env")
 
 from shared_context import (
+    NEW_ENTRY_CUTOFF_UTC_HOUR,
+    NEW_ENTRY_CUTOFF_UTC_MINUTE,
     check_no_trade_mode,
     get_db,
+    get_disabled_tracks,
     insert_decision,
     insert_ticket,
     load_master_directives,
     log_system_event,
+    past_new_entry_cutoff,
     set_no_trade_mode,
 )
 
@@ -55,11 +59,13 @@ CONSECUTIVE_LOSS_LIMIT = 4
 NET_DELTA_CAP = 0.70
 REGIME_CONFIDENCE_REDUCE = 0.40
 REGIME_TRANSITION_PAUSE = 0.60
-SPREAD_WIDENING_FACTOR = 3.0
+HARD_CLOSE_UTC_HOUR = 19
+HARD_CLOSE_UTC_MINUTE = 45
 EXECUTION_STALE_MINUTES = 30
+SPREAD_WIDENING_FACTOR = 3.0
 HEARTBEAT_STALE_MINUTES = 5
 ACCOUNT_SIZE = 97_000.0
-INTRADAY_LOSS_LIMIT = -0.015 * ACCOUNT_SIZE  # -1.5% of account equity
+INTRADAY_LOSS_LIMIT = -0.015 * ACCOUNT_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +91,6 @@ def _entry_cutoff_utc() -> datetime:
 
 
 def _is_market_hours() -> bool:
-    """True if current ET time is between 09:30 and 16:00."""
     et_now = _et_now()
     return datetime(1, 1, 1, 9, 30).time() <= et_now.time() <= datetime(1, 1, 1, 16, 0).time()
 
@@ -121,23 +126,19 @@ def get_current_drawdown(conn) -> float:
     """
     with conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT equity FROM nwt_equity_curve
-            ORDER BY date DESC LIMIT 30
-            """
+            "SELECT equity FROM nwt_equity_curve ORDER BY date DESC LIMIT 30"
         )
         rows = cur.fetchall()
 
     if rows:
         equities = [float(r[0]) for r in rows]
-        equities.reverse()  # oldest first
+        equities.reverse()
         peak = max(equities)
         current = equities[-1]
         if peak > 0:
             return max(0.0, (peak - current) / peak)
         return 0.0
 
-    # Fallback: compute from trade PnL if equity curve not populated yet
     with conn.cursor() as cur:
         cur.execute("SELECT pnl FROM nwt_trade_outcomes ORDER BY closed_at ASC")
         rows = cur.fetchall()
@@ -149,9 +150,7 @@ def get_current_drawdown(conn) -> float:
     if not pnls:
         return 0.0
 
-    cumulative = 0.0
-    peak = 0.0
-    max_dd = 0.0
+    cumulative = peak = max_dd = 0.0
     for p in pnls:
         cumulative += p
         if cumulative > peak:
@@ -177,32 +176,6 @@ def get_consecutive_losses_by_track(conn) -> dict:
         losses = sum(1 for r in rows if r[0] is not None and float(r[0]) < 0)
         result[track] = losses
     return result
-
-
-def get_disabled_tracks(conn) -> set:
-    disabled = set()
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT payload FROM nwt_system_log
-            WHERE component = 'risk_agent'
-              AND message LIKE 'TRACK_DISABLED%'
-              AND created_at > NOW() - INTERVAL '24 hours'
-            """
-        )
-        rows = cur.fetchall()
-    for row in rows:
-        payload = row[0]
-        if isinstance(payload, dict):
-            track = payload.get("track")
-        else:
-            try:
-                track = json.loads(payload).get("track")
-            except Exception:
-                track = None
-        if track:
-            disabled.add(track)
-    return disabled
 
 
 def get_average_slippage(conn) -> float:
@@ -240,7 +213,7 @@ def get_net_delta(conn) -> float:
         return 0.0
 
 
-def fetch_vix_with_fallback(conn) -> tuple[float | None, str]:
+def fetch_vix_with_fallback(conn) -> tuple:
     """
     Returns (vix_value, source) or (None, 'unavailable').
     VIX=0 is treated as missing — never as a signal.
@@ -254,11 +227,8 @@ def fetch_vix_with_fallback(conn) -> tuple[float | None, str]:
     except Exception:
         pass
 
-    # Fallback: compute from ATM SPY 30-day IV
     try:
-        from datetime import date, timedelta
         today = date.today()
-        exp_target = (today + timedelta(days=30)).isoformat()
         url = f"{ALPACA_BASE_URL}/v2/options/contracts"
         params = {
             "underlying_symbols": "SPY",
@@ -271,18 +241,14 @@ def fetch_vix_with_fallback(conn) -> tuple[float | None, str]:
         resp.raise_for_status()
         contracts = resp.json().get("option_contracts", [])
         if contracts:
-            # Get SPY price
             price_url = f"{ALPACA_DATA_URL}/v2/stocks/SPY/trades/latest"
             pr = requests.get(price_url, headers=ALPACA_HEADERS, timeout=10)
             pr.raise_for_status()
             spy_price = float(pr.json()["trade"]["p"])
-            # Find ATM contract
             atm = min(contracts, key=lambda c: abs(float(c.get("strike_price", 0)) - spy_price))
             iv = float(atm.get("implied_volatility") or 0)
             if iv > 0:
-                # Annualise to VIX-like scale (already annualised, multiply by 100)
-                vix_proxy = iv * 100
-                return vix_proxy, "spy_iv_proxy"
+                return iv * 100, "spy_iv_proxy"
     except Exception as exc:
         logger.warning("VIX fallback computation failed: %s", exc)
 
@@ -290,8 +256,6 @@ def fetch_vix_with_fallback(conn) -> tuple[float | None, str]:
 
 
 def execution_engine_is_stale(conn) -> bool:
-    """Check heartbeat table first (new), fall back to ticket-based check."""
-    # Primary: heartbeat table
     if _is_market_hours():
         with conn.cursor() as cur:
             cur.execute(
@@ -300,12 +264,7 @@ def execution_engine_is_stale(conn) -> bool:
             row = cur.fetchone()
         if row:
             age = (datetime.now(timezone.utc) - row[0].replace(tzinfo=timezone.utc)).total_seconds()
-            if age > HEARTBEAT_STALE_MINUTES * 60:
-                return True
-            return False
-        # No heartbeat row → engine hasn't run yet
-
-    # Fallback: ticket-based check
+            return age > HEARTBEAT_STALE_MINUTES * 60
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=EXECUTION_STALE_MINUTES)
     with conn.cursor() as cur:
         cur.execute(
@@ -322,24 +281,20 @@ def execution_engine_is_stale(conn) -> bool:
             (cutoff,),
         )
         pending_old = cur.fetchone()[0]
-
     if pending_old == 0:
         return False
-
     with conn.cursor() as cur:
         cur.execute(
             "SELECT COUNT(*) FROM nwt_ticket_decisions WHERE decided_by='EXECUTION_ENGINE' AND created_at > %s",
             (cutoff,),
         )
         recent = cur.fetchone()[0]
-
     return recent == 0 and pending_old > 0
 
 
 def get_positions_past_hard_close(conn) -> list:
     hard_close = _hard_close_utc()
-    now_utc = datetime.now(timezone.utc)
-    if now_utc < hard_close:
+    if datetime.now(timezone.utc) < hard_close:
         return []
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
@@ -368,7 +323,6 @@ def get_api_anomaly(conn) -> bool:
 # ---------------------------------------------------------------------------
 
 def get_intraday_pnl(conn) -> float:
-    """Sum realized PnL (pnl_adjusted preferred) from positions closed today UTC."""
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     with conn.cursor() as cur:
         cur.execute(
@@ -384,7 +338,6 @@ def get_intraday_pnl(conn) -> float:
 
 
 def activate_global_kill_switch(conn, reason: str) -> None:
-    """Sets no_trade_mode flag AND updates master-directives.json."""
     set_no_trade_mode(conn, f"KILL_SWITCH: {reason}", "risk_agent")
     log_system_event(conn, "CRITICAL", "risk_agent",
                      f"GLOBAL_KILL_SWITCH_ACTIVATED: {reason}", {"reason": reason})
@@ -423,12 +376,9 @@ def disable_track(conn, track: str, reason: str) -> None:
 
 def run_system_rules(conn) -> None:
     """
-    Rules 14-16: heartbeat, drawdown, VIX.
-    These set no_trade_mode if triggered — they don't veto individual proposals,
-    they halt the whole system.
+    Rules 14-17: heartbeat, drawdown, VIX, intraday PnL.
+    Sets no_trade_mode if triggered.
     """
-    # Rule 14: Heartbeat check (handled inline in execution_engine_is_stale)
-    # If stale during market hours → set no_trade_mode
     if _is_market_hours() and execution_engine_is_stale(conn):
         reason = f"Rule 14: Execution engine heartbeat stale (>{HEARTBEAT_STALE_MINUTES} min)"
         set_no_trade_mode(conn, reason, "risk_agent")
@@ -442,14 +392,12 @@ def run_system_rules(conn) -> None:
             pass
         return
 
-    # Rule 15: Drawdown > 8% from 30-day equity peak
     drawdown = get_current_drawdown(conn)
     if drawdown > DRAWDOWN_KILL_THRESHOLD:
         reason = f"Rule 15: Drawdown={drawdown:.1%} > {DRAWDOWN_KILL_THRESHOLD:.0%} from 30-day peak"
         activate_global_kill_switch(conn, reason)
         return
 
-    # Rule 16: VIX > 40 (with fallback and degraded handling)
     vix, vix_source = fetch_vix_with_fallback(conn)
     if vix is None:
         insert_ticket(conn, "RISK_AGENT", "SYSTEM", "vix_degraded",
@@ -460,7 +408,6 @@ def run_system_rules(conn) -> None:
         activate_global_kill_switch(conn, reason)
         return
 
-    # Rule 17: Intraday loss > 1.5% of account equity
     intraday_pnl = get_intraday_pnl(conn)
     if intraday_pnl < INTRADAY_LOSS_LIMIT:
         reason = (
@@ -486,24 +433,23 @@ def evaluate_proposal(
     net_delta: float,
     execution_stale: bool,
     api_anomaly: bool,
-) -> tuple[str, str]:
+) -> tuple:
     payload = ticket.get("payload") or {}
     regime = directives.get("regime", {})
     from_track = (payload.get("from_track") or "").upper()
     direction = (payload.get("direction") or "").lower()
     symbol = payload.get("symbol", "")
 
+    # Rule 0: Past 15:30 ET entry cutoff (DST-aware)
     now_utc = datetime.now(timezone.utc)
     entry_cutoff = _entry_cutoff_utc()
-
-    # Rule 0: Past 15:30 ET entry cutoff
     if now_utc >= entry_cutoff:
         return "VETOED", (
             f"Rule 0: Past new-entry cutoff {entry_cutoff.strftime('%H:%M')} UTC "
             f"(15:30 ET) — no new positions"
         )
 
-    # Rule 1: VIX > 40 (checked via system rules; proposal-level veto mirrors it)
+    # Rule 1: VIX > 40
     vix = directives.get("vix") or 0.0
     if vix > VIX_KILL_THRESHOLD:
         activate_global_kill_switch(conn, f"VIX={vix:.1f} > {VIX_KILL_THRESHOLD}")
@@ -556,9 +502,9 @@ def evaluate_proposal(
             f"> {SPREAD_WIDENING_FACTOR}x baseline={baseline_slippage:.4f}"
         )
 
-    # Rule 11: Execution engine unresponsive (heartbeat / ticket-based)
+    # Rule 11: Execution engine unresponsive
     if execution_stale:
-        return "VETOED", "Rule 11: Execution engine unresponsive (no fills in last 30 min) — NO-TRADE MODE"
+        return "VETOED", "Rule 11: Execution engine unresponsive — NO-TRADE MODE"
 
     # Rule 13: Track in cooling-off
     if from_track in disabled_tracks:
@@ -612,9 +558,6 @@ def force_close_past_hard_close(conn, positions: list) -> None:
 def main() -> None:
     conn = get_db()
     try:
-        # no_trade_mode check — risk agent is allowed to run even when halted
-        # (it may be what CLEARS a halt condition, and system rules must still fire)
-        # But it will not approve new proposals if halted.
         halted, halt_reason = check_no_trade_mode(conn)
         if halted:
             logger.warning("no_trade_mode is SET: %s — system rules will still run", halt_reason)
@@ -625,15 +568,12 @@ def main() -> None:
             logger.error("master-directives.json not found — exiting")
             sys.exit(1)
 
-        # Run system-level rules every cycle (drawdown, VIX, heartbeat)
         run_system_rules(conn)
 
-        # Hard close check (independent of proposals)
         past_close_positions = get_positions_past_hard_close(conn)
         if past_close_positions:
             force_close_past_hard_close(conn, past_close_positions)
 
-        # Gather per-proposal state
         drawdown = get_current_drawdown(conn)
         consecutive_losses = get_consecutive_losses_by_track(conn)
         disabled_tracks = get_disabled_tracks(conn)
@@ -649,8 +589,7 @@ def main() -> None:
             len(pending), drawdown * 100, consecutive_losses, execution_stale, halted,
         )
 
-        approved_count = 0
-        vetoed_count = 0
+        approved_count = vetoed_count = 0
 
         for ticket in pending:
             ticket_id = str(ticket["ticket_id"])

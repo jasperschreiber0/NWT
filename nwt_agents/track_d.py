@@ -116,6 +116,8 @@ def main() -> None:
 
         proposals_submitted = 0
 
+        # Pass 1 — each strategy finds its best conviction match
+        candidates = []  # (strategy_id, genome, best_ticket)
         for i in range(1, 13):
             strategy_id = f"D{i}"
 
@@ -149,6 +151,26 @@ def main() -> None:
                 log_inactivity(conn, strategy_id, "D", reason, regime)
                 continue
 
+            candidates.append((strategy_id, genome, best_ticket))
+
+        # Pass 2 — consolidate: at most ONE proposal per archetype per day
+        # (same rationale as Track C — pool thin samples, drop correlated dupes)
+        winners = {}  # archetype -> (strategy_id, genome, ticket)
+        for strategy_id, genome, ticket in candidates:
+            arch = genome.get("archetype") or strategy_id
+            incumbent = winners.get(arch)
+            if incumbent is None or float(ticket.get("conviction_score", 0)) > float(
+                incumbent[2].get("conviction_score", 0)
+            ):
+                winners[arch] = (strategy_id, genome, ticket)
+
+        for strategy_id, genome, _ in candidates:
+            arch = genome.get("archetype") or strategy_id
+            if winners[arch][0] != strategy_id:
+                logger.info("%s: consolidated into archetype %s (lower conviction)", strategy_id, arch)
+                log_inactivity(conn, strategy_id, "D", "ARCHETYPE_CONSOLIDATED", regime)
+
+        for archetype, (strategy_id, genome, best_ticket) in winners.items():
             base_notional = ACCOUNT_SIZE * TRADE_PCT
             sized_notional = compute_final_sizing(directives, base_notional, "us")
 
@@ -168,6 +190,7 @@ def main() -> None:
             proposal = {
                 "from_track": "D",
                 "strategy_id": strategy_id,
+                "archetype": archetype,
                 "symbol": symbol,
                 "strategy_type": best_ticket.get("strategy_type", "long_call"),
                 "direction": best_ticket.get("direction", "long"),

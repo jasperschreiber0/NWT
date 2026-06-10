@@ -7,8 +7,8 @@ Each run (every 5 min via cron):
   1. Check no_trade_mode flag — exit if set.
   2. Upsert heartbeat.
   3. Run position monitor — close equity positions at stop/target/max-hold.
-  4. Process pending TRADE_REQUEST tickets (place new orders).
-  5. Process FORCE_CLOSE tickets (options hard close from Risk Agent).
+  4. Process pending FORCE_CLOSE / CLOSE_REQUEST tickets.
+  5. Process pending TRADE_REQUEST tickets (place new orders).
 """
 
 import json
@@ -58,7 +58,15 @@ REQUIRED_FIELDS = {
 POLL_INTERVAL = 3
 POLL_MAX = 10
 ET_TZ = ZoneInfo("America/New_York")
-DIRECTIONAL_CAP_PCT = 0.60   # 60% of account equity per direction
+DIRECTIONAL_CAP_PCT = 0.60
+
+# Synchronous risk backstop — mirrors risk_agent rules. The risk agent's
+# 5-minute sweep is authoritative, but its APPROVED decision can be minutes
+# stale by the time an order is placed; these flags are re-checked here, in
+# the order path, so no order reaches Alpaca after the state has turned.
+NEW_ENTRY_CUTOFF_UTC_HOUR = 19
+NEW_ENTRY_CUTOFF_UTC_MINUTE = 30
+TRACK_COOLOFF_HOURS = 24
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +98,15 @@ def alpaca_post(path: str, body: dict) -> dict:
     return resp.json()
 
 
+def alpaca_delete(path: str) -> dict:
+    url = f"{ALPACA_BASE_URL}/v2{path}"
+    resp = requests.delete(url, headers=ALPACA_HEADERS, timeout=15)
+    if not resp.ok:
+        logger.error("Alpaca DELETE %s → %d: %s", path, resp.status_code, resp.text[:500])
+    resp.raise_for_status()
+    return resp.json()
+
+
 def get_current_price(symbol: str) -> float:
     url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/trades/latest"
     resp = requests.get(url, headers=ALPACA_HEADERS, timeout=15)
@@ -100,6 +117,89 @@ def get_current_price(symbol: str) -> float:
 def get_alpaca_account_equity() -> float:
     account = alpaca_get("/account")
     return float(account.get("equity", 97_000))
+
+
+def get_latest_quote(symbol: str, asset_type: str) -> tuple:
+    """
+    Latest NBBO (bid, ask) for an option or stock symbol.
+    Returns (None, None) on failure — quote capture must never block execution;
+    the learning agent falls back to a conservative default spread.
+    """
+    try:
+        if asset_type == "option":
+            url = f"{ALPACA_DATA_URL}/v1beta1/options/quotes/latest"
+            resp = requests.get(url, headers=ALPACA_HEADERS, params={"symbols": symbol}, timeout=15)
+            resp.raise_for_status()
+            q = (resp.json().get("quotes") or {}).get(symbol) or {}
+        else:
+            url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/quotes/latest"
+            resp = requests.get(url, headers=ALPACA_HEADERS, timeout=15)
+            resp.raise_for_status()
+            q = resp.json().get("quote") or {}
+        bid = float(q.get("bp") or 0)
+        ask = float(q.get("ap") or 0)
+        return (bid if bid > 0 else None, ask if ask > 0 else None)
+    except Exception as exc:
+        logger.warning("Quote fetch failed for %s (%s): %s", symbol, asset_type, exc)
+        return None, None
+
+
+def get_disabled_tracks(conn) -> set:
+    """Tracks placed in cooling-off by the risk agent within the last 24h."""
+    disabled = set()
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT payload FROM nwt_system_log
+            WHERE component = 'risk_agent'
+              AND message LIKE 'TRACK_DISABLED%'
+              AND created_at > NOW() - INTERVAL '{TRACK_COOLOFF_HOURS} hours'
+            """
+        )
+        rows = cur.fetchall()
+    for (payload,) in rows:
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                continue
+        if isinstance(payload, dict) and payload.get("track"):
+            disabled.add(payload["track"])
+    return disabled
+
+
+def synchronous_risk_veto(conn, payload: dict) -> tuple:
+    """
+    Final gate before an order for a NEW position reaches Alpaca.
+    Re-reads master-directives.json fresh and re-checks cooling-off and the
+    new-entry cutoff. Returns (vetoed: bool, reason: str).
+    Closes (FORCE_CLOSE) bypass this — liquidation is always allowed.
+    """
+    try:
+        directives = load_master_directives()
+    except Exception:
+        return True, "Synchronous veto: master-directives.json unreadable — NO-TRADE MODE"
+
+    if directives.get("global_kill_switch", False):
+        return True, "Synchronous veto: global kill switch active"
+
+    bot_source = payload.get("bot_source", "")
+    if bot_source.startswith("NWT_TRACK_"):
+        track = bot_source.replace("NWT_TRACK_", "")
+        if track in get_disabled_tracks(conn):
+            return True, f"Synchronous veto: track {track} in cooling-off period"
+
+    now_utc = datetime.now(timezone.utc)
+    if payload.get("asset_type") == "option" and (
+        now_utc.hour > NEW_ENTRY_CUTOFF_UTC_HOUR
+        or (now_utc.hour == NEW_ENTRY_CUTOFF_UTC_HOUR and now_utc.minute >= NEW_ENTRY_CUTOFF_UTC_MINUTE)
+    ):
+        return True, (
+            f"Synchronous veto: past new-entry cutoff "
+            f"{NEW_ENTRY_CUTOFF_UTC_HOUR}:{NEW_ENTRY_CUTOFF_UTC_MINUTE:02d} UTC"
+        )
+
+    return False, ""
 
 
 def poll_order_until_filled(order_id: str) -> dict:
@@ -129,6 +229,7 @@ def insert_decision(conn, ticket_id: str, decision: str, reasoning: str) -> None
 
 
 def fetch_pending_tickets(conn) -> list:
+    """Return approved TRADE_REQUEST tickets with no EXECUTION_ENGINE decision yet."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
@@ -137,7 +238,7 @@ def fetch_pending_tickets(conn) -> list:
             WHERE t.to_agent = 'EXECUTION_ENGINE'
               AND t.type = 'TRADE_REQUEST'
               AND t.from_agent IN (
-                  'EU_EXECUTOR', 'AUS_EXECUTOR', 'CHINA_EXECUTOR', 'NWT_EXECUTION_AGENT'
+                  'EU_EXECUTOR', 'ASX_EXECUTOR', 'CHINA_EXECUTOR', 'NWT_EXECUTION_AGENT'
               )
               AND NOT EXISTS (
                   SELECT 1 FROM nwt_ticket_decisions d
@@ -152,6 +253,7 @@ def fetch_pending_tickets(conn) -> list:
 
 
 def fetch_force_close_tickets(conn) -> list:
+    """Return FORCE_CLOSE and CLOSE_REQUEST tickets with no EXECUTION_ENGINE decision yet."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
@@ -171,11 +273,21 @@ def fetch_force_close_tickets(conn) -> list:
     return [dict(r) for r in rows]
 
 
+def get_ledger_position(conn, position_id: str):
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM nwt_portfolio_ledger WHERE position_id = %s",
+            (position_id,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
 # ---------------------------------------------------------------------------
 # no_trade_mode check
 # ---------------------------------------------------------------------------
 
-def check_no_trade_mode(conn) -> tuple[bool, str]:
+def check_no_trade_mode(conn) -> tuple:
     with conn.cursor() as cur:
         cur.execute("SELECT value, reason FROM nwt_system_flags WHERE flag = 'no_trade_mode'")
         row = cur.fetchone()
@@ -204,10 +316,7 @@ def upsert_heartbeat(conn) -> None:
 # Directional cap
 # ---------------------------------------------------------------------------
 
-def check_directional_cap(conn, direction: str, incoming_notional: float) -> tuple[bool, float, float]:
-    """
-    Returns (exceeded, total_exposure, cap).
-    """
+def check_directional_cap(conn, direction: str, incoming_notional: float) -> tuple:
     try:
         equity = get_alpaca_account_equity()
     except Exception:
@@ -280,7 +389,6 @@ def place_options_order(payload: dict) -> dict:
 
 
 def place_close_order(symbol: str, qty: int, asset_type: str) -> dict:
-    """Place a market sell/close order."""
     order_body = {
         "symbol": symbol,
         "qty": str(qty),
@@ -300,7 +408,7 @@ def place_close_order(symbol: str, qty: int, asset_type: str) -> dict:
 
 def compute_pnl_adjusted(asset_type: str, pnl: float, entry_price: float,
                           exit_price: float, qty: int = 1,
-                          bid_ask_spread: float = 0.0) -> tuple[float, str]:
+                          bid_ask_spread: float = 0.0) -> tuple:
     """
     Returns (pnl_adjusted, slippage_model).
     Options: haircut 0.5 × spread × 100 × qty per side (entry + exit).
@@ -308,11 +416,11 @@ def compute_pnl_adjusted(asset_type: str, pnl: float, entry_price: float,
     """
     if asset_type == "option":
         spread = bid_ask_spread if bid_ask_spread > 0 else max(entry_price * 0.02, 0.05)
-        haircut = 0.5 * spread * 100 * qty * 2  # entry + exit
+        haircut = 0.5 * spread * 100 * qty * 2
         return pnl - haircut, "half_spread_v1"
     else:
         notional = entry_price * qty
-        haircut = notional * 0.0001 * 2  # 1bp per side × 2 sides
+        haircut = notional * 0.0001 * 2
         return pnl - haircut, "equity_1bp_v1"
 
 
@@ -365,11 +473,6 @@ def write_trade_outcome(conn, position: dict, fill_price: float,
 # ---------------------------------------------------------------------------
 
 def run_equity_position_monitor(conn) -> None:
-    """
-    For each open equity position: fetch price, check stop/target/max_hold.
-    Closes via market order if hit. Writes exit to ledger.
-    Options are handled by execution_agent.py.
-    """
     positions = get_open_positions(conn)
     equity_positions = [p for p in positions if p.get("asset_type") == "equity"
                         and p.get("bot_source") != "UNATTRIBUTED"]
@@ -398,9 +501,8 @@ def run_equity_position_monitor(conn) -> None:
         if direction == "short":
             pnl_pct = -pnl_pct
 
-        # Load genome for stop/target/max_hold — skip if genome unavailable
-        stop_pct = -0.015   # default 1.5% stop
-        target_pct = 0.025  # default 2.5% target
+        stop_pct = -0.015
+        target_pct = 0.025
         max_hold_days = 20
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -415,7 +517,6 @@ def run_equity_position_monitor(conn) -> None:
         except Exception:
             pass
 
-        # Check max hold
         entry_time = pos.get("entry_time")
         if entry_time:
             age_days = (datetime.now(timezone.utc) - entry_time.replace(tzinfo=timezone.utc)).days
@@ -424,7 +525,6 @@ def run_equity_position_monitor(conn) -> None:
                                        notional, entry_price, "max_hold")
                 continue
 
-        # Check stop/target
         exit_reason = None
         if pnl_pct <= stop_pct:
             exit_reason = "stop"
@@ -462,6 +562,7 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
 # ---------------------------------------------------------------------------
 
 def process_close_ticket(conn, ticket: dict) -> None:
+    """Handle CLOSE_REQUEST tickets via market sell."""
     ticket_id = str(ticket["ticket_id"])
     payload = ticket.get("payload") or {}
     symbol = payload.get("option_symbol") or payload.get("symbol", "")
@@ -483,7 +584,6 @@ def process_close_ticket(conn, ticket: dict) -> None:
 
         slippage = 0.0
         if position_id:
-            # Fetch position for pnl computation
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT * FROM nwt_portfolio_ledger WHERE position_id = %s",
                             (position_id,))
@@ -498,14 +598,91 @@ def process_close_ticket(conn, ticket: dict) -> None:
         insert_decision(conn, ticket_id, "EXECUTED",
                         f"Closed {symbol} at {fill_price:.4f} reason={exit_reason}")
         log_system_event(conn, "INFO", "execution_engine",
-                         f"Force close executed: {symbol} at {fill_price:.4f}",
+                         f"Close executed: {symbol} at {fill_price:.4f}",
                          {"ticket_id": ticket_id, "exit_reason": exit_reason,
                           "position_id": position_id})
     except Exception as exc:
-        reason = f"Force close failed: {exc}"
+        reason = f"Close failed: {exc}"
         logger.error("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "FAILED", reason)
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+
+
+def process_force_close(conn, ticket: dict) -> None:
+    """
+    Liquidate a ledger position on RISK_AGENT FORCE_CLOSE instruction.
+    Uses Alpaca's close-position endpoint (whole position), polls the fill,
+    and closes the ledger row with exit price + exit NBBO.
+    """
+    ticket_id = str(ticket["ticket_id"])
+    payload = ticket.get("payload") or {}
+    position_id = payload.get("position_id", "")
+    asset = payload.get("symbol") or payload.get("option_symbol", "")
+
+    position = get_ledger_position(conn, position_id) if position_id else None
+    if position is None:
+        reason = f"FORCE_CLOSE: ledger position {position_id} not found"
+        logger.error("Ticket %s: %s", ticket_id, reason)
+        insert_decision(conn, ticket_id, "FAILED", reason)
+        log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+        return
+
+    if position.get("status") == "closed":
+        reason = f"FORCE_CLOSE: position {position_id} already closed"
+        logger.info("Ticket %s: %s", ticket_id, reason)
+        insert_decision(conn, ticket_id, "SKIPPED", reason)
+        return
+
+    asset = position.get("asset") or asset
+    asset_type = position.get("asset_type", "option")
+
+    exit_bid, exit_ask = get_latest_quote(asset, asset_type)
+    expected_price = (exit_bid + exit_ask) / 2.0 if (exit_bid and exit_ask) else None
+
+    try:
+        order = alpaca_delete(f"/positions/{asset}")
+    except Exception as exc:
+        reason = f"FORCE_CLOSE: liquidation order failed for {asset}: {exc}"
+        logger.error("Ticket %s: %s", ticket_id, reason)
+        insert_decision(conn, ticket_id, "FAILED", reason)
+        log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+        return
+
+    alpaca_order_id = order.get("id", "")
+    try:
+        filled_order = poll_order_until_filled(alpaca_order_id) if alpaca_order_id else order
+    except Exception as exc:
+        reason = f"FORCE_CLOSE: order poll failed: {exc}"
+        logger.error("Ticket %s: %s", ticket_id, reason)
+        insert_decision(conn, ticket_id, "FAILED", reason)
+        log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+        return
+
+    fill_price_str = filled_order.get("filled_avg_price")
+    fill_price = float(fill_price_str) if fill_price_str else None
+    if fill_price is None:
+        reason = f"FORCE_CLOSE: no fill price — status={filled_order.get('status')}"
+        logger.warning("Ticket %s: %s", ticket_id, reason)
+        insert_decision(conn, ticket_id, "FAILED", reason)
+        log_system_event(conn, "WARNING", "execution_engine", reason, {
+            "ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id,
+        })
+        return
+
+    slippage = abs(fill_price - expected_price) / expected_price if expected_price and expected_price > 0 else 0.0
+    close_position(conn, position_id, fill_price, slippage, "hard_close",
+                   exit_bid=exit_bid, exit_ask=exit_ask)
+    reasoning = (
+        f"FORCE_CLOSE filled at {fill_price:.4f}, slippage={slippage:.4f}, "
+        f"position_id={position_id}, alpaca_order_id={alpaca_order_id}"
+    )
+    insert_decision(conn, ticket_id, "EXECUTED", reasoning)
+    log_system_event(conn, "INFO", "execution_engine",
+                     f"Force-closed {asset} ({asset_type})",
+                     {"ticket_id": ticket_id, "position_id": position_id,
+                      "alpaca_order_id": alpaca_order_id, "fill_price": fill_price,
+                      "slippage": slippage})
+    logger.info("Ticket %s FORCE_CLOSE EXECUTED: position=%s fill=%.4f", ticket_id, position_id, fill_price)
 
 
 # ---------------------------------------------------------------------------
@@ -529,10 +706,12 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         insert_decision(conn, ticket_id, "REJECTED", reason)
         return
 
-    if directives.get("global_kill_switch", False):
-        reason = "Global kill switch active — no new positions"
-        insert_decision(conn, ticket_id, "REJECTED", reason)
-        log_system_event(conn, "WARNING", "execution_engine", reason, {"ticket_id": ticket_id})
+    # Synchronous risk gate — re-reads directives fresh at order time
+    vetoed, veto_reason = synchronous_risk_veto(conn, payload)
+    if vetoed:
+        logger.warning("Ticket %s rejected: %s", ticket_id, veto_reason)
+        insert_decision(conn, ticket_id, "REJECTED", veto_reason)
+        log_system_event(conn, "WARNING", "execution_engine", veto_reason, {"ticket_id": ticket_id})
         return
 
     # Directional cap check
@@ -552,12 +731,18 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     asset_type = payload["asset_type"]
     symbol = payload["symbol"]
     expected_price = None
+    entry_bid = entry_ask = None
 
     try:
         if asset_type == "equity":
+            entry_bid, entry_ask = get_latest_quote(symbol, "equity")
             order = place_equity_order(payload)
             expected_price = get_current_price(symbol)
         elif asset_type == "option":
+            option_symbol = payload.get("option_symbol", symbol)
+            entry_bid, entry_ask = get_latest_quote(option_symbol, "option")
+            if entry_bid and entry_ask:
+                expected_price = (entry_bid + entry_ask) / 2.0
             order = place_options_order(payload)
         else:
             reason = f"Unknown asset_type: {asset_type}"
@@ -600,6 +785,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
 
     ledger_data = {
         "bot_source": payload["bot_source"],
+        "strategy_id": payload.get("strategy_id"),
         "asset": payload.get("option_symbol", symbol) if asset_type == "option" else symbol,
         "asset_type": asset_type,
         "direction": direction,
@@ -607,6 +793,8 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         "notional_risk": sized_notional,
         "entry_price": fill_price,
         "entry_time": datetime.now(timezone.utc),
+        "entry_bid": entry_bid,
+        "entry_ask": entry_ask,
         "alpaca_order_id": alpaca_order_id,
     }
 
@@ -639,10 +827,8 @@ def main() -> None:
 
     conn = get_db()
     try:
-        # 1. Heartbeat — always upsert, even if halted
         upsert_heartbeat(conn)
 
-        # 2. no_trade_mode check
         halted, halt_reason = check_no_trade_mode(conn)
         if halted:
             logger.warning("no_trade_mode is SET: %s — engine exiting without trading", halt_reason)
@@ -656,7 +842,6 @@ def main() -> None:
             logger.error("Cannot load master-directives.json: %s", exc)
             sys.exit(1)
 
-        # 3. Position monitor (equity multi-day exits)
         try:
             run_equity_position_monitor(conn)
         except Exception as exc:
@@ -664,18 +849,19 @@ def main() -> None:
             log_system_event(conn, "ERROR", "execution_engine",
                              f"Position monitor failed: {exc}")
 
-        # 4. Process FORCE_CLOSE / CLOSE_REQUEST tickets
         close_tickets = fetch_force_close_tickets(conn)
         if close_tickets:
             logger.info("Found %d force-close tickets", len(close_tickets))
             for ticket in close_tickets:
                 try:
-                    process_close_ticket(conn, ticket)
+                    if ticket.get("type") == "FORCE_CLOSE":
+                        process_force_close(conn, ticket)
+                    else:
+                        process_close_ticket(conn, ticket)
                 except Exception as exc:
                     logger.error("Unhandled error in close ticket %s: %s",
                                  ticket.get("ticket_id"), exc)
 
-        # 5. Process new TRADE_REQUEST tickets
         pending = fetch_pending_tickets(conn)
         logger.info("Found %d pending TRADE_REQUEST tickets", len(pending))
 

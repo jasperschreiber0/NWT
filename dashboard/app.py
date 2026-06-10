@@ -51,13 +51,13 @@ def db_conn():
     return psycopg2.connect(DB_DSN, cursor_factory=psycopg2.extras.RealDictCursor)
 
 
-def q(conn, sql: str, params=None) -> list[dict]:
+def q(conn, sql: str, params=None) -> list:
     with conn.cursor() as cur:
         cur.execute(sql, params or ())
         return [dict(r) for r in cur.fetchall()]
 
 
-def q_grace(conn, sql: str, params=None) -> list[dict]:
+def q_grace(conn, sql: str, params=None) -> list:
     try:
         return q(conn, sql, params)
     except psycopg2.errors.UndefinedTable:
@@ -72,7 +72,7 @@ def read_json(path: Path) -> Any:
         return {}
 
 
-def file_mtime_iso(path: Path) -> str | None:
+def file_mtime_iso(path: Path):
     try:
         ts = path.stat().st_mtime
         return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
@@ -87,8 +87,8 @@ def health(_: None = Depends(require_auth)):
         db_ok = True
     except Exception:
         db_ok = False
-    status = "ok" if db_ok else "db_error"
-    return {"status": status, "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok" if db_ok else "db_error",
+            "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/api/portfolio")
@@ -97,7 +97,7 @@ def portfolio(_: None = Depends(require_auth)):
     try:
         positions  = q(conn, "SELECT * FROM nwt_portfolio_ledger WHERE status='open' ORDER BY entry_time DESC")
         directives = read_json(SHARED / "master-directives.json")
-        by_bot: dict[str, int] = {}
+        by_bot: dict = {}
         for p in positions:
             bot = p.get("bot_source", "unknown")
             by_bot[bot] = by_bot.get(bot, 0) + 1
@@ -168,6 +168,30 @@ def performance(_: None = Depends(require_auth)):
                 "trade_count":   {"value": tc,                      "target": 60,   "pass": tc >= 60},
             },
         }
+    finally:
+        conn.close()
+
+
+@app.get("/api/scorecard")
+def scorecard(_: None = Depends(require_auth)):
+    conn = db_conn()
+    try:
+        rows = q_grace(conn, """
+            SELECT session_date, integrity_gate_passed, directives_fresh,
+                   conviction_ran, tracks_ran, activity_logged,
+                   risk_agent_clear, execution_clear, learning_agent_ran, green,
+                   manual_interventions, details
+            FROM nwt_session_scorecard
+            ORDER BY session_date DESC LIMIT 30
+        """)
+        rows = list(reversed(rows))
+        consecutive_green = 0
+        for row in reversed(rows):
+            if row.get("green"):
+                consecutive_green += 1
+            else:
+                break
+        return {"scorecard": rows, "consecutive_green": consecutive_green}
     finally:
         conn.close()
 
@@ -248,11 +272,11 @@ def track_f_theme_exposure(_: None = Depends(require_auth)):
         conn.close()
 
     total = sum(float(p.get("notional_risk") or 0) for p in positions)
-    ticker_notional: dict[str, float] = {}
+    ticker_notional: dict = {}
     for p in positions:
         ticker_notional[p["asset"]] = ticker_notional.get(p["asset"], 0) + float(p.get("notional_risk") or 0)
 
-    exposures: dict[str, Any] = {}
+    exposures: dict = {}
     for theme, tickers in THEME_TICKERS.items():
         notional = sum(ticker_notional.get(t, 0) for t in tickers)
         exposures[theme] = {

@@ -6,10 +6,16 @@ All agents must import from here — never duplicate these lookups.
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+# Shared timing constants — single definition for risk agent AND execution path
+NEW_ENTRY_CUTOFF_UTC_HOUR = 19    # No new entries after 19:30 UTC (15:30 EDT)
+NEW_ENTRY_CUTOFF_UTC_MINUTE = 30
+TRACK_COOLOFF_HOURS = 24
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +73,7 @@ def load_layer0_data() -> dict:
 
 def get_strategy_genome(conn, strategy_id: str) -> dict:
     """
-    Query nwt_strategy_genome for the active row for the given strategy_id.
+    Query nwt_strategy_genome for the given strategy_id.
     Raises RuntimeError if not found or inactive — caller must NOT proceed.
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -82,10 +88,33 @@ def get_strategy_genome(conn, strategy_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Sizing
+# ---------------------------------------------------------------------------
+
+def compute_final_sizing(directives: dict, base_notional: float, bot_key: str) -> float:
+    """
+    Apply capital_weight and size_cap from master-directives bot_permissions,
+    then apply regime confidence and transition_risk multipliers.
+    """
+    perms = directives.get("bot_permissions", {}).get(bot_key, {})
+    capital_weight = perms.get("capital_weight", 0.0)
+    size_cap = perms.get("size_cap", 0.0)
+
+    regime = directives.get("regime", {})
+    multiplier = 1.0
+    if regime.get("confidence", 1.0) < 0.5:
+        multiplier *= 0.7
+    if regime.get("transition_risk", 0.0) > 0.5:
+        multiplier *= 0.5
+
+    return base_notional * capital_weight * size_cap * multiplier
+
+
+# ---------------------------------------------------------------------------
 # no_trade_mode — checked by every trading agent before doing anything
 # ---------------------------------------------------------------------------
 
-def check_no_trade_mode(conn) -> tuple[bool, str]:
+def check_no_trade_mode(conn) -> tuple:
     """
     Returns (is_halted, reason).
     If is_halted is True the caller must log and exit immediately.
@@ -134,26 +163,71 @@ def clear_no_trade_mode(conn, cleared_by: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sizing
+# Synchronous risk vetoes — checked IN the order path, not just by the
+# risk agent's 5-minute sweep. Risk enforcement must fire before orders
+# reach Alpaca; these are the authoritative state flags re-checked at
+# submission time.
 # ---------------------------------------------------------------------------
 
-def compute_final_sizing(directives: dict, base_notional: float, bot_key: str) -> float:
-    """
-    Apply capital_weight and size_cap from master-directives bot_permissions,
-    then apply regime confidence and transition_risk multipliers.
-    """
-    perms = directives.get("bot_permissions", {}).get(bot_key, {})
-    capital_weight = perms.get("capital_weight", 0.0)
-    size_cap = perms.get("size_cap", 0.0)
+def get_disabled_tracks(conn) -> set:
+    """Tracks disabled by the risk agent (cooling-off) in the last 24h."""
+    disabled = set()
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT payload FROM nwt_system_log
+            WHERE component = 'risk_agent'
+              AND message LIKE 'TRACK_DISABLED%'
+              AND created_at > NOW() - INTERVAL '{TRACK_COOLOFF_HOURS} hours'
+            """
+        )
+        rows = cur.fetchall()
+    for row in rows:
+        payload = row[0]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                continue
+        if isinstance(payload, dict) and payload.get("track"):
+            disabled.add(payload["track"])
+    return disabled
 
-    regime = directives.get("regime", {})
-    multiplier = 1.0
-    if regime.get("confidence", 1.0) < 0.5:
-        multiplier *= 0.7
-    if regime.get("transition_risk", 0.0) > 0.5:
-        multiplier *= 0.5
 
-    return base_notional * capital_weight * size_cap * multiplier
+def past_new_entry_cutoff(now_utc: datetime = None) -> bool:
+    now_utc = now_utc or datetime.now(timezone.utc)
+    return (
+        now_utc.hour > NEW_ENTRY_CUTOFF_UTC_HOUR
+        or (now_utc.hour == NEW_ENTRY_CUTOFF_UTC_HOUR and now_utc.minute >= NEW_ENTRY_CUTOFF_UTC_MINUTE)
+    )
+
+
+def pre_trade_veto(conn, track: str) -> tuple:
+    """
+    Final synchronous gate before submitting an order for a NEW position.
+    Re-reads master-directives.json fresh (kill switch may have been activated
+    since this process started) and re-checks track cooling-off and the
+    new-entry cutoff. Returns (vetoed: bool, reason: str).
+    Closes/liquidations must NOT go through this gate.
+    """
+    try:
+        directives = load_master_directives()
+    except FileNotFoundError:
+        return True, "pre_trade_veto: master-directives.json missing — NO-TRADE MODE"
+
+    if directives.get("global_kill_switch", False):
+        return True, "pre_trade_veto: global kill switch active"
+
+    if track and track in get_disabled_tracks(conn):
+        return True, f"pre_trade_veto: track {track} in cooling-off period"
+
+    if past_new_entry_cutoff():
+        return True, (
+            f"pre_trade_veto: past new-entry cutoff "
+            f"{NEW_ENTRY_CUTOFF_UTC_HOUR}:{NEW_ENTRY_CUTOFF_UTC_MINUTE:02d} UTC"
+        )
+
+    return False, ""
 
 
 # ---------------------------------------------------------------------------
@@ -171,12 +245,13 @@ _INACTIVITY_CLASS_MAP = {
     "GLOBAL_KILL_SWITCH": "regime_skip",
     "NO_TRADE_MODE": "regime_skip",
     "REGIME_MISMATCH": "regime_skip",
+    "ARCHETYPE_CONSOLIDATED": "no_edge",
 }
 
 
 def log_inactivity(conn, strategy_id: str, track: str, reason: str, regime: dict) -> None:
     """
-    Log inactivity as a first-class typed ticket.
+    Log inactivity as a first-class typed ticket in nwt_tickets.
     signal_missed is assigned only by the Learning Agent — never self-reported.
     """
     inactivity_class = _INACTIVITY_CLASS_MAP.get(reason, "no_edge")
@@ -205,6 +280,7 @@ def log_system_event(
     message: str,
     payload: dict = None,
 ) -> None:
+    """INSERT a row into nwt_system_log."""
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO nwt_system_log (level, component, message, payload) VALUES (%s, %s, %s, %s)",

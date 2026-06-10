@@ -23,20 +23,22 @@ def insert_position(conn, data: dict) -> str:
     Required keys in data:
         bot_source, asset, asset_type
     Optional keys:
-        direction, delta_exposure, notional_risk, entry_price, entry_time,
-        alpaca_order_id
+        strategy_id, direction, delta_exposure, notional_risk, entry_price,
+        entry_time, entry_bid, entry_ask, alpaca_order_id
     """
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO nwt_portfolio_ledger
-                (bot_source, asset, asset_type, direction, delta_exposure,
-                 notional_risk, entry_price, entry_time, alpaca_order_id, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
+                (bot_source, strategy_id, asset, asset_type, direction, delta_exposure,
+                 notional_risk, entry_price, entry_time, entry_bid, entry_ask,
+                 alpaca_order_id, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
             RETURNING position_id
             """,
             (
                 data["bot_source"],
+                data.get("strategy_id"),
                 data["asset"],
                 data["asset_type"],
                 data.get("direction"),
@@ -44,6 +46,8 @@ def insert_position(conn, data: dict) -> str:
                 data.get("notional_risk"),
                 data.get("entry_price"),
                 data.get("entry_time", datetime.now(timezone.utc)),
+                data.get("entry_bid"),
+                data.get("entry_ask"),
                 data.get("alpaca_order_id"),
             ),
         )
@@ -59,11 +63,13 @@ def close_position(
     exit_price: float,
     slippage: float,
     exit_reason: str = "unknown",
+    exit_bid: Optional[float] = None,
+    exit_ask: Optional[float] = None,
 ) -> None:
     """
-    UPDATE nwt_portfolio_ledger: set status='closed', exit_price, exit_time, realized_slippage, exit_reason.
-    exit_reason must be one of: target | stop | hard_close | max_hold | kill_switch | manual
-    Only this function writes exit fields. No other component writes exits.
+    UPDATE nwt_portfolio_ledger: set status='closed', exit_price, exit_time,
+    realized_slippage, exit_reason, and exit NBBO (feeds the pnl_adjusted haircut).
+    exit_reason: target | stop | hard_close | max_hold | kill_switch | manual
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -73,10 +79,12 @@ def close_position(
                 exit_price = %s,
                 exit_time = %s,
                 realized_slippage = %s,
-                exit_reason = %s
+                exit_reason = %s,
+                exit_bid = %s,
+                exit_ask = %s
             WHERE position_id = %s
             """,
-            (exit_price, datetime.now(timezone.utc), slippage, exit_reason, position_id),
+            (exit_price, datetime.now(timezone.utc), slippage, exit_reason, exit_bid, exit_ask, position_id),
         )
         if cur.rowcount == 0:
             logger.warning("close_position: no rows updated for position_id=%s", position_id)
