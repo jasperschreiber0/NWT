@@ -16,6 +16,7 @@ import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -24,6 +25,7 @@ from psycopg2.extras import RealDictCursor
 load_dotenv(Path(__file__).parent / ".env")
 
 from shared_context import (
+    check_no_trade_mode,
     get_db,
     insert_decision,
     insert_ticket,
@@ -46,6 +48,7 @@ ALPACA_HEADERS = {
 }
 
 ACCOUNT_SIZE = 97_000.0
+ET_TZ = ZoneInfo("America/New_York")
 
 
 # ---------------------------------------------------------------------------
@@ -187,10 +190,124 @@ def compute_qty_from_notional(sized_notional: float, option_price: float) -> int
 # Main
 # ---------------------------------------------------------------------------
 
+def _hard_close_utc() -> datetime:
+    """15:45 ET in UTC, DST-aware."""
+    et_today = datetime.now(ET_TZ).date()
+    hc = datetime(et_today.year, et_today.month, et_today.day, 15, 45, tzinfo=ET_TZ)
+    return hc.astimezone(timezone.utc)
+
+
+def _get_option_price(option_symbol: str) -> float | None:
+    """Fetch mark price for an options contract from Alpaca."""
+    try:
+        url = f"{ALPACA_BASE_URL}/v2/options/contracts/{option_symbol}"
+        resp = requests.get(url, headers=ALPACA_HEADERS, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        # Try mark_price, then last_price
+        price = data.get("mark_price") or data.get("last_price") or data.get("close_price")
+        return float(price) if price else None
+    except Exception:
+        return None
+
+
+def monitor_options_positions(conn) -> None:
+    """
+    Check all open options positions:
+    - 50% profit target → submit CLOSE_REQUEST
+    - 50% stop loss → submit CLOSE_REQUEST
+    - Past 15:45 ET hard close → submit CLOSE_REQUEST
+    Deduplicates: skips positions that already have a pending CLOSE_REQUEST.
+    """
+    now_utc = datetime.now(timezone.utc)
+    hard_close = _hard_close_utc()
+    past_hard_close = now_utc >= hard_close
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM nwt_portfolio_ledger WHERE status='open' AND asset_type='option'"
+        )
+        positions = [dict(r) for r in cur.fetchall()]
+
+    if not positions:
+        return
+
+    for pos in positions:
+        position_id = str(pos["position_id"])
+        symbol = pos.get("asset", "")
+        entry_price = float(pos.get("entry_price") or 0)
+        notional = float(pos.get("notional_risk") or 0)
+        qty = max(int(round(notional / (entry_price * 100))) if entry_price > 0 else 1, 1)
+
+        # Check if a close ticket already exists for this position
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM nwt_tickets
+                WHERE type IN ('CLOSE_REQUEST', 'FORCE_CLOSE')
+                  AND payload->>'position_id' = %s
+                  AND created_at > NOW() - INTERVAL '2 hours'
+                """,
+                (position_id,),
+            )
+            if cur.fetchone()[0] > 0:
+                continue  # Already have a pending close
+
+        exit_reason = None
+
+        if past_hard_close:
+            exit_reason = "hard_close"
+        elif entry_price > 0:
+            current_price = _get_option_price(symbol)
+            if current_price is not None:
+                pnl_pct = (current_price - entry_price) / entry_price
+                if pos.get("direction") == "short":
+                    pnl_pct = -pnl_pct
+                if pnl_pct >= 0.50:
+                    exit_reason = "target"
+                elif pnl_pct <= -0.50:
+                    exit_reason = "stop"
+
+        if exit_reason:
+            try:
+                insert_ticket(
+                    conn,
+                    from_agent="NWT_EXECUTION_AGENT",
+                    to_agent="EXECUTION_ENGINE",
+                    type_="CLOSE_REQUEST",
+                    payload={
+                        "approved": True,
+                        "bot_source": pos.get("bot_source", "NWT_EXECUTION_AGENT"),
+                        "symbol": symbol,
+                        "option_symbol": symbol,
+                        "direction": "close",
+                        "strategy_id": pos.get("bot_source", "CLOSE"),
+                        "sized_notional": notional,
+                        "qty": qty,
+                        "asset_type": "option",
+                        "time_in_force": "day",
+                        "exit_reason": exit_reason,
+                        "position_id": position_id,
+                    },
+                )
+                logger.info("Close request for %s position_id=%s reason=%s",
+                            symbol, position_id, exit_reason)
+            except Exception as exc:
+                logger.error("Failed to insert close request for %s: %s", position_id, exc)
+
+
 def main() -> None:
     conn = get_db()
 
     try:
+        # no_trade_mode check
+        halted, halt_reason = check_no_trade_mode(conn)
+        if halted:
+            logger.warning("no_trade_mode SET — execution agent exiting: %s", halt_reason)
+            log_system_event(conn, "WARNING", "execution_agent",
+                             f"no_trade_mode halted execution agent: {halt_reason}")
+            return
+
         try:
             directives = load_master_directives()
         except FileNotFoundError:
@@ -201,6 +318,14 @@ def main() -> None:
             logger.warning("Global kill switch active — execution agent exiting")
             log_system_event(conn, "WARNING", "execution_agent", "Kill switch active — no submissions")
             return
+
+        # Options position monitor (50% profit/stop/hard close)
+        try:
+            monitor_options_positions(conn)
+        except Exception as exc:
+            logger.error("Options monitor error: %s", exc)
+            log_system_event(conn, "ERROR", "execution_agent",
+                             f"Options monitor failed: {exc}")
 
         approved_proposals = fetch_approved_proposals(conn)
         logger.info("Found %d approved proposals to submit", len(approved_proposals))

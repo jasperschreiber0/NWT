@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import os
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -129,9 +129,51 @@ def log_event(conn, level, message, payload=None):
         print(f"[perf-tracker] WARNING: could not write to nwt_system_log: {exc}", file=sys.stderr)
 
 
+def write_equity_curve(conn) -> None:
+    """
+    Fetch Alpaca account equity and write today's row to nwt_equity_curve.
+    Risk Agent's drawdown calculation reads this table.
+    """
+    import os
+    import requests
+    alpaca_base = os.environ.get("ALPACA_BASE_URL", "").rstrip("/")
+    alpaca_key = os.environ.get("ALPACA_API_KEY", "")
+    alpaca_secret = os.environ.get("ALPACA_SECRET_KEY", "")
+    if not alpaca_base:
+        print("[perf-tracker] ALPACA_BASE_URL not set — skipping equity curve write", file=sys.stderr)
+        return
+    try:
+        resp = requests.get(
+            f"{alpaca_base}/v2/account",
+            headers={"APCA-API-KEY-ID": alpaca_key, "APCA-API-SECRET-KEY": alpaca_secret},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        equity = float(resp.json().get("equity", 0))
+        if equity <= 0:
+            return
+        today = datetime.now(timezone.utc).date()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_equity_curve (date, equity, source)
+                VALUES (%s, %s, 'alpaca')
+                ON CONFLICT (date) DO UPDATE SET equity=%s, source='alpaca'
+                """,
+                (today, equity, equity),
+            )
+        conn.commit()
+        print(f"[perf-tracker] Equity curve: {today} equity={equity:.2f}")
+    except Exception as exc:
+        print(f"[perf-tracker] WARNING: equity curve write failed: {exc}", file=sys.stderr)
+
+
 def main():
     conn = get_db()
     try:
+        # Write today's equity to nwt_equity_curve (used by Risk Agent drawdown rule)
+        write_equity_curve(conn)
+
         summary = compute_summary(conn)
         summary_path = PERF / "summary.json"
         with open(summary_path, "w") as f:

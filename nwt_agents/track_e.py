@@ -24,6 +24,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 import integrity_gate
 from shared_context import (
+    check_no_trade_mode,
     compute_final_sizing,
     get_db,
     get_strategy_genome,
@@ -169,6 +170,15 @@ def main() -> None:
         except FileNotFoundError:
             logger.error("master-directives.json not found — exiting")
             sys.exit(1)
+
+        halted, halt_reason = check_no_trade_mode(conn)
+        if halted:
+            logger.warning("no_trade_mode SET — Track E exiting: %s", halt_reason)
+            regime = directives.get("regime", {})
+            for i in range(1, 13):
+                log_inactivity(conn, f"E{i}", "E", "NO_TRADE_MODE", regime)
+            log_system_event(conn, "WARNING", "track_e", f"no_trade_mode — all E strategies inactive: {halt_reason}")
+            return
 
         if directives.get("global_kill_switch", False):
             logger.warning("Global kill switch active — Track E exiting")

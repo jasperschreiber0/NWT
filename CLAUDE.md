@@ -18,6 +18,14 @@
 | /home/northworld/trading/ | Wiped — full rebuild in progress | 2026-05-18 |
 | PM2 stack | Not yet deployed | 2026-05-18 |
 | nwt_agents cron | Not yet deployed | 2026-05-18 |
+| Phase 0 schema migration | Pending deploy | 2026-06-10 |
+| recon_agent.py | Built | 2026-06-10 |
+| no_trade_mode wiring | Built | 2026-06-10 |
+| Heartbeat (engine↔risk) | Built | 2026-06-10 |
+| Directional cap (60%) | Built | 2026-06-10 |
+| Exit lifecycle (equity monitor + options close) | Built | 2026-06-10 |
+| Inactivity ticket taxonomy | Built | 2026-06-10 |
+| Server hardening | Pending | 2026-06-10 |
 
 ---
 
@@ -589,6 +597,33 @@ Before go-live, the system must be able to answer "what breaks?" under historica
 
 ---
 
+## Reconciliation — Ledger vs Alpaca
+
+The ledger is the source of truth for DECISIONS. Alpaca is the source of truth for FILLS. These can diverge (crash between fill and ledger write, manual intervention, wiped DB with live positions). Divergence is detected, never assumed away.
+
+Recon agent: `nwt_agents/recon_agent.py`
+Runs: (a) as Integrity Gate step 7 before every session, (b) nightly 23:00 UTC.
+
+Mismatch classes:
+- `in_alpaca_not_ledger` → CRITICAL: set no_trade_mode, write ticket. Untracked risk.
+- `in_ledger_not_alpaca` → mark ledger row status='suspect', write ticket.
+- `qty_mismatch` → CRITICAL: set no_trade_mode, write ticket.
+
+Clean recon writes a ticket type='recon_ok' (so absence of recon is itself detectable).
+
+**COLD START IS AN IMPORT, NOT AN ASSUMPTION.** On first run against an empty ledger, recon_agent imports live Alpaca positions into the ledger with bot_source='UNATTRIBUTED'. "Assume zero exposure" applies only when Alpaca confirms zero positions.
+
+---
+
+## no_trade_mode
+
+Stored in `nwt_system_flags` table (flag='no_trade_mode'). When TRUE:
+- Every trading agent (Track C/D/E, execution_agent, execution_engine) checks at run start and exits immediately.
+- Only humans (or a clean recon gate after human acknowledgement) clear it.
+- Set by: recon_agent (critical mismatch), risk_agent (kill switch, heartbeat lost).
+
+---
+
 ## Startup Integrity Gate
 
 Before ANY trading session begins, system must verify:
@@ -597,8 +632,9 @@ Before ANY trading session begins, system must verify:
 2. DB connectivity (`psql "$NWT_DB_DSN" -c "\dt"`)
 3. Alpaca connectivity (`GET /v2/account`)
 4. Options chains accessible (`GET /v2/options/contracts?underlying_symbols=SPY`)
-5. Execution engine live
-6. Ledger writable (test insert + rollback)
+5. Ledger writable (test insert + rollback)
+6. Execution engine live (heartbeat row fresh, or outside market hours)
+7. Recon clean (`recon_agent.py --gate` exits 0)
 
 > **CRITICAL** If ANY check fails → system enters NO-TRADE MODE, logs reason, exits. Does not attempt to trade through failures.
 
@@ -693,18 +729,41 @@ CREATE TABLE nwt_strategy_decay (
 );
 
 CREATE TABLE nwt_strategy_genome (
-  strategy_id TEXT PRIMARY KEY,
+  strategy_id TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
   track TEXT NOT NULL,
   asset_universe TEXT[],
   dte_min INTEGER, dte_max INTEGER,
   iv_filter_max NUMERIC, entry_threshold NUMERIC,
   stop_loss_pct NUMERIC, profit_target_pct NUMERIC,
-  regime TEXT, version INTEGER DEFAULT 1,
+  regime TEXT,
   active BOOLEAN DEFAULT TRUE,
-  shadow_mode BOOLEAN DEFAULT FALSE,
-  trade_count_to_promote INTEGER DEFAULT 100,
+  parent_version INTEGER,            -- lineage for mutations
   created_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (strategy_id, version)
+);
+-- Exactly one active version per strategy
+CREATE UNIQUE INDEX one_active_genome ON nwt_strategy_genome (strategy_id) WHERE active;
+
+CREATE TABLE nwt_system_flags (
+  flag TEXT PRIMARY KEY,
+  value BOOLEAN NOT NULL DEFAULT FALSE,
+  reason TEXT, set_by TEXT,
   updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+INSERT INTO nwt_system_flags (flag, value) VALUES ('no_trade_mode', FALSE);
+
+CREATE TABLE nwt_heartbeat (
+  service TEXT PRIMARY KEY,
+  last_beat TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  status TEXT DEFAULT 'ok'
+);
+
+CREATE TABLE nwt_equity_curve (
+  date DATE PRIMARY KEY,
+  equity NUMERIC NOT NULL,
+  source TEXT DEFAULT 'alpaca',
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 ```
 
@@ -773,7 +832,14 @@ All model env vars overridable via `nwt_agents/.env`
 | VIX feed returns 0 | Treat as missing data, not a signal — do not use 0 |
 | ORB timing | Fire at 18:05 UTC not 18:00 — SIP data not ready at exactly 14:00 ET |
 | AEST vs UTC | Server is UTC, all cron times are UTC |
-| Append-only tickets | UPDATE to nwt_tickets silently fails (0 rows) — always INSERT to nwt_ticket_decisions |
+| Append-only tickets | UPDATE/DELETE on nwt_tickets raises an exception (trigger-enforced) — always INSERT to nwt_ticket_decisions |
+| no_trade_mode flag | Checked by every trading agent at run start — TRUE means halt immediately, no exceptions |
+| 15:45 ET hard close | Computed from ET with DST awareness (zoneinfo), never a fixed UTC time |
+| Genome PK is (strategy_id, version) | Query uses AND active=TRUE — one active version per strategy enforced by partial unique index |
+| nwt_trade_outcomes.position_id | Mandatory on every new row — fuzzy symbol/time attribution is a bug |
+| Performance gates read pnl_adjusted | Not raw pnl — paper fills are fantasy, evaluate conservatively |
+| Recon must pass before any session | in_alpaca_not_ledger is untracked risk — halt immediately |
+| Cold start = Alpaca import, not zero-assumption | zero only when Alpaca confirms zero |
 | Track C shares Track A Alpaca account | Ledger handles attribution |
 | China bot cron | Placeholder only — actual trigger is ADR liquidity confirmation post US open |
 | US bot order placement | Any version calling Alpaca order endpoints is wrong |
@@ -811,7 +877,7 @@ Stress simulations (see Stress Simulations section) must be run before go-live. 
 - Win rate >55%
 - Profit factor >1.5
 - Max single-day drawdown <3%
-- Best strategy win rate >65%
+- Best strategy win rate >65% — with ≥20 trades for that strategy (36 strategies on small samples: one WILL hit 65% by luck)
 - Consecutive losses <4
 - Stress simulations passed for all 6 required scenarios
 
@@ -837,3 +903,26 @@ Stress simulations (see Stress Simulations section) must be run before go-live. 
 - 35-50%: rare, usually involves hidden tail risk
 
 The system is optimised for survivability and medium-high compounding. Reaching 40%+ consistently requires leverage, concentration, or short-vol bias — all intentionally avoided in current design.
+
+---
+
+## Server Hardening (post-leak baseline)
+
+- SSH: `PasswordAuthentication no`, key-only. `PermitRootLogin prohibit-password`.
+- fail2ban active on sshd.
+- Postgres listens on localhost only (`listen_addresses = 'localhost'`).
+- .env files: `chmod 600`, owned by service user.
+- Verify after any infra change: `sshd -T | grep -E 'passwordauthentication|permitrootlogin'`
+
+**Deploy steps (run once, in a second SSH session before applying):**
+```bash
+# Confirm key auth works FIRST in a second session before disabling password auth
+grep -E "PasswordAuthentication|PermitRootLogin" /etc/ssh/sshd_config
+# Edit: PasswordAuthentication no, PermitRootLogin prohibit-password
+# systemctl reload sshd
+apt install fail2ban
+# Postgres: edit /etc/postgresql/*/main/postgresql.conf → listen_addresses = 'localhost'
+chmod 600 /home/northworld/trading/*/.env
+```
+
+> ⚠ Do NOT disable password auth until you have confirmed key-based login works in a live second session.

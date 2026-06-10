@@ -53,9 +53,17 @@ def insert_position(conn, data: dict) -> str:
     return str(position_id)
 
 
-def close_position(conn, position_id: str, exit_price: float, slippage: float) -> None:
+def close_position(
+    conn,
+    position_id: str,
+    exit_price: float,
+    slippage: float,
+    exit_reason: str = "unknown",
+) -> None:
     """
-    UPDATE nwt_portfolio_ledger: set status='closed', exit_price, exit_time, realized_slippage.
+    UPDATE nwt_portfolio_ledger: set status='closed', exit_price, exit_time, realized_slippage, exit_reason.
+    exit_reason must be one of: target | stop | hard_close | max_hold | kill_switch | manual
+    Only this function writes exit fields. No other component writes exits.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -64,15 +72,17 @@ def close_position(conn, position_id: str, exit_price: float, slippage: float) -
             SET status = 'closed',
                 exit_price = %s,
                 exit_time = %s,
-                realized_slippage = %s
+                realized_slippage = %s,
+                exit_reason = %s
             WHERE position_id = %s
             """,
-            (exit_price, datetime.now(timezone.utc), slippage, position_id),
+            (exit_price, datetime.now(timezone.utc), slippage, exit_reason, position_id),
         )
         if cur.rowcount == 0:
             logger.warning("close_position: no rows updated for position_id=%s", position_id)
     conn.commit()
-    logger.info("Closed position %s at %.4f (slippage=%.4f)", position_id, exit_price, slippage)
+    logger.info("Closed position %s at %.4f slippage=%.4f reason=%s",
+                position_id, exit_price, slippage, exit_reason)
 
 
 def get_open_positions(conn, bot_source: Optional[str] = None) -> list:

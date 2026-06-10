@@ -137,6 +137,69 @@ def fetch_cumulative_costs(conn) -> dict:
     return totals
 
 
+def fetch_daily_trade_stats(conn) -> dict:
+    """Query today's closed trades, PnL, and risk agent decisions from Postgres."""
+    today_start = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              COUNT(*) AS trades_closed,
+              COALESCE(SUM(pnl_adjusted), SUM(pnl), 0) AS pnl_today
+            FROM nwt_trade_outcomes
+            WHERE closed_at >= %s
+            """,
+            (today_start,),
+        )
+        row = cur.fetchone()
+    trades_closed = int(row[0] or 0)
+    pnl_today = float(row[1] or 0)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT decision, COUNT(*) FROM nwt_ticket_decisions
+            WHERE decided_by = 'RISK_AGENT'
+              AND created_at >= %s
+            GROUP BY decision
+            """,
+            (today_start,),
+        )
+        rows = cur.fetchall()
+    approved = sum(int(r[1]) for r in rows if r[0] == "APPROVED")
+    vetoed = sum(int(r[1]) for r in rows if r[0] == "VETOED")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM nwt_tickets WHERE type = 'inactivity' AND created_at >= %s",
+            (today_start,),
+        )
+        inactivity = int(cur.fetchone()[0] or 0)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM nwt_portfolio_ledger WHERE status = 'open'"
+        )
+        open_positions = int(cur.fetchone()[0] or 0)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT value FROM nwt_system_flags WHERE flag = 'no_trade_mode'"
+        )
+        row = cur.fetchone()
+    no_trade_mode = bool(row[0]) if row else False
+
+    return {
+        "trades_closed": trades_closed,
+        "pnl_today": pnl_today,
+        "approved": approved,
+        "vetoed": vetoed,
+        "inactivity": inactivity,
+        "open_positions": open_positions,
+        "no_trade_mode": no_trade_mode,
+    }
+
+
 def main() -> None:
     conn = get_db()
 
@@ -147,12 +210,26 @@ def main() -> None:
         cumulative_tokens = fetch_cumulative_costs(conn)
         cumulative_costs = compute_costs(cumulative_tokens)
 
+        trade_stats = fetch_daily_trade_stats(conn)
+
+        trades_today = trade_stats["trades_closed"]
+        cost_today = today_costs["total_cost_usd"]
+        cost_per_trade = (
+            round(cost_today / trades_today, 4) if trades_today > 0 else None
+        )
+
         summary = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "date": date.today().isoformat(),
             "today": {
                 "tokens": today_tokens,
                 "estimated_cost_usd": today_costs,
+                "trades_closed": trades_today,
+                "pnl_today": round(trade_stats["pnl_today"], 2),
+                "cost_per_trade_usd": cost_per_trade,
+                "risk_approved": trade_stats["approved"],
+                "risk_vetoed": trade_stats["vetoed"],
+                "inactivity_tickets": trade_stats["inactivity"],
             },
             "cumulative": {
                 "tokens": cumulative_tokens,
@@ -171,10 +248,10 @@ def main() -> None:
             json.dump(summary, f, indent=2)
 
         logger.info(
-            "Cost summary: today=$%.4f (haiku=$%.4f, sonnet=$%.4f) | cumulative=$%.4f",
-            today_costs["total_cost_usd"],
-            today_costs["haiku_cost_usd"],
-            today_costs["sonnet_cost_usd"],
+            "Cost summary: today=$%.4f | trades=%d | cost/trade=%s | cumulative=$%.4f",
+            cost_today,
+            trades_today,
+            f"${cost_per_trade:.4f}" if cost_per_trade is not None else "n/a",
             cumulative_costs["total_cost_usd"],
         )
 
@@ -182,9 +259,26 @@ def main() -> None:
             conn,
             "INFO",
             "cost_agent",
-            f"Daily cost: ${today_costs['total_cost_usd']:.4f} | Cumulative: ${cumulative_costs['total_cost_usd']:.4f}",
+            f"Daily cost: ${cost_today:.4f} | trades={trades_today} | cost/trade={cost_per_trade} | Cumulative: ${cumulative_costs['total_cost_usd']:.4f}",
             summary,
         )
+
+        # Daily digest to Telegram
+        try:
+            from notifier import send_daily_digest
+            send_daily_digest(
+                trades_today=trades_today,
+                pnl_today=trade_stats["pnl_today"],
+                cost_today=cost_today,
+                cost_per_trade=cost_per_trade,
+                inactivity_today=trade_stats["inactivity"],
+                approved_today=trade_stats["approved"],
+                vetoed_today=trade_stats["vetoed"],
+                no_trade_mode=trade_stats["no_trade_mode"],
+                open_positions=trade_stats["open_positions"],
+            )
+        except Exception as exc:
+            logger.warning("Telegram digest failed (non-fatal): %s", exc)
 
     finally:
         conn.close()

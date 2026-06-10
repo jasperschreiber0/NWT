@@ -1,6 +1,6 @@
 """
 nwt_agents/shared_context.py
-Single import module providing: regime, conviction data, and final_sizing to all track agents.
+Single import module providing: regime, conviction data, sizing, and control helpers to all agents.
 All agents must import from here — never duplicate these lookups.
 """
 
@@ -67,7 +67,7 @@ def load_layer0_data() -> dict:
 
 def get_strategy_genome(conn, strategy_id: str) -> dict:
     """
-    Query nwt_strategy_genome for the given strategy_id.
+    Query nwt_strategy_genome for the active row for the given strategy_id.
     Raises RuntimeError if not found or inactive — caller must NOT proceed.
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -77,8 +77,60 @@ def get_strategy_genome(conn, strategy_id: str) -> dict:
         )
         row = cur.fetchone()
     if not row:
-        raise RuntimeError(f"No genome row found for {strategy_id} — refusing to run")
+        raise RuntimeError(f"No active genome row found for {strategy_id} — refusing to run")
     return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# no_trade_mode — checked by every trading agent before doing anything
+# ---------------------------------------------------------------------------
+
+def check_no_trade_mode(conn) -> tuple[bool, str]:
+    """
+    Returns (is_halted, reason).
+    If is_halted is True the caller must log and exit immediately.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT value, reason FROM nwt_system_flags WHERE flag = 'no_trade_mode'",
+        )
+        row = cur.fetchone()
+    if row and row[0]:
+        return True, row[1] or "no_trade_mode flag is set"
+    return False, ""
+
+
+def set_no_trade_mode(conn, reason: str, set_by: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_system_flags (flag, value, reason, set_by, updated_at)
+            VALUES ('no_trade_mode', TRUE, %s, %s, NOW())
+            ON CONFLICT (flag) DO UPDATE
+              SET value=TRUE, reason=%s, set_by=%s, updated_at=NOW()
+            """,
+            (reason, set_by, reason, set_by),
+        )
+    conn.commit()
+    try:
+        from notifier import alert_no_trade_mode
+        alert_no_trade_mode(reason)
+    except Exception:
+        pass
+
+
+def clear_no_trade_mode(conn, cleared_by: str) -> None:
+    """Only called after human-acknowledged recon pass or manual override."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE nwt_system_flags
+            SET value=FALSE, reason=NULL, set_by=%s, updated_at=NOW()
+            WHERE flag='no_trade_mode'
+            """,
+            (cleared_by,),
+        )
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -105,21 +157,46 @@ def compute_final_sizing(directives: dict, base_notional: float, bot_key: str) -
 
 
 # ---------------------------------------------------------------------------
-# Logging helpers
+# Inactivity — first-class state, logged as typed ticket
 # ---------------------------------------------------------------------------
 
-def log_inactivity(conn, strategy_id: str, track: str, reason: str, regime: dict) -> None:
-    """Log a do-nothing decision to nwt_inactivity_log. Inactivity is a first-class state."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO nwt_inactivity_log (strategy_id, track, reason, regime_at_decision)
-            VALUES (%s, %s, %s, %s)
-            """,
-            (strategy_id, track, reason, json.dumps(regime)),
-        )
-    conn.commit()
+_INACTIVITY_CLASS_MAP = {
+    "NO_CONVICTION_MATCH": "no_edge",
+    "NO_SYMBOL_MATCH": "no_edge",
+    "CONVICTION_BELOW_THRESHOLD": "no_edge",
+    "NO_DIRECTIONAL_STRATEGY_AVAILABLE": "no_edge",
+    "INSUFFICIENT_QUANT_EDGE": "no_edge",
+    "ZERO_SIZING": "regime_skip",
+    "SHADOW_MODE": "regime_skip",
+    "GLOBAL_KILL_SWITCH": "regime_skip",
+    "NO_TRADE_MODE": "regime_skip",
+    "REGIME_MISMATCH": "regime_skip",
+}
 
+
+def log_inactivity(conn, strategy_id: str, track: str, reason: str, regime: dict) -> None:
+    """
+    Log inactivity as a first-class typed ticket.
+    signal_missed is assigned only by the Learning Agent — never self-reported.
+    """
+    inactivity_class = _INACTIVITY_CLASS_MAP.get(reason, "no_edge")
+    payload = {
+        "class": inactivity_class,
+        "bot": track,
+        "strategy_id": strategy_id,
+        "reason": reason,
+        "regime": regime,
+    }
+    try:
+        insert_ticket(conn, f"TRACK_{track}", "SYSTEM", "inactivity", payload)
+    except Exception as exc:
+        log_system_event(conn, "WARNING", f"track_{track.lower()}",
+                         f"log_inactivity ticket insert failed for {strategy_id}: {exc}", payload)
+
+
+# ---------------------------------------------------------------------------
+# System log
+# ---------------------------------------------------------------------------
 
 def log_system_event(
     conn,
@@ -128,7 +205,6 @@ def log_system_event(
     message: str,
     payload: dict = None,
 ) -> None:
-    """INSERT a row into nwt_system_log."""
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO nwt_system_log (level, component, message, payload) VALUES (%s, %s, %s, %s)",

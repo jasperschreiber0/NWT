@@ -9,13 +9,17 @@ Checks (in order):
   3. Alpaca connectivity (GET /v2/account)
   4. Options chains accessible (GET /v2/options/contracts?underlying_symbols=SPY&limit=1)
   5. Ledger writable (test INSERT + ROLLBACK)
+  6. Execution engine live (heartbeat row fresh, or no market hours)
+  7. Recon clean (recon_agent --gate exits 0)
 """
 
 import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import psycopg2
 import requests
@@ -155,9 +159,55 @@ def _check_ledger_writable() -> None:
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def _is_market_hours() -> bool:
+    et_now = datetime.now(ZoneInfo("America/New_York"))
+    return datetime(1, 1, 1, 9, 30).time() <= et_now.time() <= datetime(1, 1, 1, 16, 0).time()
+
+
+def _check_heartbeat() -> None:
+    """Step 6: execution engine heartbeat must be fresh during market hours."""
+    if not _is_market_hours():
+        return
+    try:
+        conn = psycopg2.connect(os.environ["NWT_DB_DSN"])
+        with conn.cursor() as cur:
+            cur.execute("SELECT last_beat FROM nwt_heartbeat WHERE service = 'execution_engine'")
+            row = cur.fetchone()
+        conn.close()
+        if row:
+            age = (datetime.now(timezone.utc) - row[0].replace(tzinfo=timezone.utc)).total_seconds()
+            if age > 600:  # 10 min stale at gate time is a problem
+                _fail(
+                    f"Execution engine heartbeat is {age:.0f}s old during market hours",
+                    {"last_beat": str(row[0]), "age_seconds": age},
+                )
+        # No row = engine hasn't run yet, not a failure at startup
+    except Exception as exc:
+        _fail(f"Heartbeat check failed: {exc}")
+
+
+def _check_recon() -> None:
+    """Step 7: recon_agent --gate must exit 0 (clean ledger vs Alpaca)."""
+    try:
+        recon_script = Path(__file__).parent / "recon_agent.py"
+        result = subprocess.run(
+            [sys.executable, str(recon_script), "--gate"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            _fail(
+                f"Recon gate failed (exit {result.returncode}): {result.stderr[:500] or result.stdout[:500]}",
+                {"returncode": result.returncode},
+            )
+    except subprocess.TimeoutExpired:
+        _fail("Recon gate timed out after 60s")
+    except Exception as exc:
+        _fail(f"Recon gate check failed: {exc}")
+
+
 def run_integrity_gate(skip_duplicate_check: bool = False) -> None:
     """
-    Run all 5 startup checks.
+    Run all 7 startup checks.
     Raises SystemExit(1) on the first failure.
     """
     script_name = Path(sys.argv[0]).name if sys.argv else "unknown"
@@ -169,6 +219,8 @@ def run_integrity_gate(skip_duplicate_check: bool = False) -> None:
     _check_alpaca_connectivity()
     _check_options_chains()
     _check_ledger_writable()
+    _check_heartbeat()
+    _check_recon()
 
     # Log successful gate pass to DB
     try:
@@ -181,9 +233,9 @@ def run_integrity_gate(skip_duplicate_check: bool = False) -> None:
         conn.commit()
         conn.close()
     except Exception:
-        pass  # Non-fatal if logging fails after all checks pass
+        pass
 
-    print(f"[INTEGRITY GATE] All checks passed for {script_name}", flush=True)
+    print(f"[INTEGRITY GATE] All 7 checks passed for {script_name}", flush=True)
 
 
 if __name__ == "__main__":
