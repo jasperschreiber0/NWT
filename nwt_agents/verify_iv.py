@@ -74,7 +74,8 @@ def show_ticker(provider: AlpacaIVProvider, ticker: str) -> None:
           f"hv_20d={snap['hv_20d']}  hv_iv_spread={snap['hv_iv_spread']}")
     print(f"  detail: {snap['detail']}")
 
-    # Raw per-strike IVs around ATM for the near expiry, for eyeballing
+    # Raw per-strike IVs around ATM for the expiries the computation
+    # actually used, so the computed value can be compared directly
     spot = snap["spot"]
     quotes = provider.get_chain(
         ticker,
@@ -83,7 +84,11 @@ def show_ticker(provider: AlpacaIVProvider, ticker: str) -> None:
         strike_gte=spot * 0.95,
         strike_lte=spot * 1.05,
     )
-    expiries = sorted({q.expiry for q in quotes})[:2]
+    used = (snap["detail"].get("atm_30") or {}).get("expiries")
+    if used:
+        expiries = sorted({q.expiry for q in quotes if str(q.expiry) in used})
+    else:
+        expiries = sorted({q.expiry for q in quotes})[:2]
     for exp in expiries:
         print(f"\n  raw chain — expiry {exp} ({(exp - today).days} DTE):")
         print(f"  {'strike':>10} {'call bid/ask':>16} {'call IV':>9} "

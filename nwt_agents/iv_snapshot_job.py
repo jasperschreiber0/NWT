@@ -14,8 +14,9 @@ Exit code 0 if at least one ticker stored, 1 if all failed.
 import logging
 import os
 import sys
-from datetime import date
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -46,7 +47,10 @@ def main() -> None:
     conn = get_db()
     provider = AlpacaIVProvider()
     universe = get_universe()
-    today = date.today()
+    # Rows are stamped with the US-Eastern trading date — the server runs
+    # AEST, so date.today() at the 00:35 AEST cron would label every row
+    # one day AFTER its actual US session and corrupt attribution joins.
+    today = datetime.now(ZoneInfo("America/New_York")).date()
 
     stored, failed = [], []
     try:
