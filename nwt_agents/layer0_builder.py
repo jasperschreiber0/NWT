@@ -20,6 +20,12 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 import integrity_gate
+from iv_pipeline.alpaca_provider import AlpacaIVProvider
+from iv_pipeline.pipeline import compute_ticker_iv
+from iv_pipeline.provider import IVUnavailableError
+from iv_pipeline.signals import compute_rank_signals
+from iv_pipeline.store import get_iv_series
+from iv_pipeline.vol_regime import classify_vol_regime
 from shared_context import get_db, kill_switch_is_active, load_master_directives, log_inactivity, log_system_event
 
 logging.basicConfig(
@@ -31,7 +37,6 @@ logger = logging.getLogger("layer0_builder")
 
 AGENTS_DIR = Path(os.environ.get("NWT_AGENTS_DIR", Path(__file__).parent))
 ALPACA_DATA_URL = os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-ALPACA_BASE_URL = os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
 
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID": os.environ["NWT_ALPACA_KEY_ID"],
@@ -39,7 +44,6 @@ ALPACA_HEADERS = {
 }
 
 SYMBOLS = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "VGK", "FXI", "KWEB", "MCHI"]
-OPTIONS_SYMBOLS = ["SPY", "QQQ"]
 
 
 # ---------------------------------------------------------------------------
@@ -65,80 +69,54 @@ def fetch_bars(symbol: str, days: int = 25) -> list:
     return bars[-days:] if len(bars) >= days else bars
 
 
-def fetch_options_snapshot(symbol: str) -> dict:
+_EMPTY_IV_FIELDS = {
+    "iv": 0.0,                 # 30-DTE ATM IV — 0.0 means MISSING, hard-filtered downstream
+    "iv_rank": None,
+    "iv_percentile": None,
+    "iv_confidence": "low",
+    "iv_history_days": 0,
+    "term_slope": None,
+    "put_skew_25d": None,
+    "hv_20d": None,
+    "hv_iv_spread": None,
+}
+
+
+def fetch_symbol_iv(provider, conn, symbol: str, closes: list) -> dict:
     """
-    Fetch options snapshot for a symbol.
-    Returns dict with iv, put_call_ratio, spy_iv_skew approximation.
+    Real IV fields for one symbol via the IV pipeline:
+    30-DTE ATM IV (interpolated, sanity-bounded) + rank/percentile with a
+    confidence label from nwt_iv_history, term slope, 25-delta put skew,
+    and the honestly-named hv_20d / hv_iv_spread realized leg.
+
+    On IVUnavailableError (data tier has no IV) re-raises — caller must
+    surface it, never proxy. Other failures return _EMPTY_IV_FIELDS.
     """
-    url = f"{ALPACA_BASE_URL}/v2/options/contracts"
-    # Get near-term (7-30 DTE) contracts
-    today = date.today()
-    exp_min = (today + timedelta(days=7)).isoformat()
-    exp_max = (today + timedelta(days=30)).isoformat()
-    params = {
-        "underlying_symbols": symbol,
-        "expiration_date_gte": exp_min,
-        "expiration_date_lte": exp_max,
-        "limit": 50,
+    try:
+        snap = compute_ticker_iv(provider, symbol, closes=closes)
+    except IVUnavailableError:
+        raise
+    except Exception as exc:
+        logger.warning("IV pipeline failed for %s: %s", symbol, exc)
+        return {**_EMPTY_IV_FIELDS, "put_call_volume_ratio": None}
+
+    atm_iv = snap["atm_iv_30d"]
+    fields = {
+        **_EMPTY_IV_FIELDS,
+        "iv": atm_iv or 0.0,
+        "term_slope": snap["term_slope"],
+        "put_skew_25d": snap["put_skew_25d"],
+        "hv_20d": snap["hv_20d"],
+        "hv_iv_spread": snap["hv_iv_spread"],
+        "put_call_volume_ratio": snap["put_call_volume_ratio"],
     }
-    try:
-        resp = requests.get(url, headers=ALPACA_HEADERS, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        contracts = data.get("option_contracts", []) if isinstance(data, dict) else data
-        if not contracts:
-            return {"iv": 0.0, "put_call_ratio": 1.0, "iv_skew": 0.0}
-
-        # Compute average IV from contracts that have implied_volatility
-        ivs_call = []
-        ivs_put = []
-        for c in contracts:
-            iv = c.get("implied_volatility") or c.get("close_price")  # fallback
-            if iv is None:
-                continue
-            try:
-                iv_float = float(iv)
-                if iv_float > 0:
-                    if c.get("type") == "call":
-                        ivs_call.append(iv_float)
-                    elif c.get("type") == "put":
-                        ivs_put.append(iv_float)
-            except (TypeError, ValueError):
-                continue
-
-        all_ivs = ivs_call + ivs_put
-        avg_iv = float(np.mean(all_ivs)) if all_ivs else 0.0
-        avg_call_iv = float(np.mean(ivs_call)) if ivs_call else 0.0
-        avg_put_iv = float(np.mean(ivs_put)) if ivs_put else 0.0
-
-        n_calls = len(ivs_call)
-        n_puts = len(ivs_put)
-        put_call_ratio = (n_puts / n_calls) if n_calls > 0 else 1.0
-        iv_skew = avg_put_iv - avg_call_iv  # positive = put skew elevated
-
-        return {
-            "iv": avg_iv,
-            "put_call_ratio": round(put_call_ratio, 3),
-            "iv_skew": round(iv_skew, 4),
-        }
-    except Exception as exc:
-        logger.warning("Options snapshot for %s failed: %s", symbol, exc)
-        return {"iv": 0.0, "put_call_ratio": 1.0, "iv_skew": 0.0}
-
-
-def fetch_vix() -> float:
-    """Fetch VIX level. Returns 0.0 on failure (treat as missing, not signal)."""
-    try:
-        url = f"{ALPACA_DATA_URL}/v2/stocks/VIXY/trades/latest"
-        resp = requests.get(url, headers=ALPACA_HEADERS, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        price = float(data["trade"]["p"])
-        # VIXY ~= VIX/10 as a rough proxy; use raw price as indicator
-        return price
-    except Exception as exc:
-        logger.warning("VIX fetch failed (using 0.0 as missing): %s", exc)
-        return 0.0
+    if atm_iv:
+        try:
+            history = get_iv_series(conn, symbol)
+            fields.update(compute_rank_signals(history, atm_iv))
+        except Exception as exc:
+            logger.warning("IV history read failed for %s: %s", symbol, exc)
+    return fields
 
 
 # ---------------------------------------------------------------------------
@@ -256,15 +234,8 @@ def main() -> None:
 
     logger.info("Fetching market data for %d symbols", len(SYMBOLS))
 
-    # Fetch VIX
-    vix = fetch_vix()
-    logger.info("VIX: %.2f", vix)
-
-    # Fetch options snapshots for SPY and QQQ
-    spy_snap = fetch_options_snapshot("SPY")
-    qqq_snap = fetch_options_snapshot("QQQ")
-    put_call_ratio = spy_snap["put_call_ratio"]
-    spy_iv_skew = spy_snap["iv_skew"]
+    provider = AlpacaIVProvider()
+    iv_tier_blocked = False
 
     # Fetch earnings calendar
     earnings_map = fetch_earnings_within_5d(SYMBOLS)
@@ -273,7 +244,7 @@ def main() -> None:
     symbols_data = {}
     for symbol in SYMBOLS:
         try:
-            bars = fetch_bars(symbol, days=20)
+            bars = fetch_bars(symbol, days=25)
             if len(bars) < 2:
                 logger.warning("Insufficient bars for %s (%d bars)", symbol, len(bars))
                 symbols_data[symbol] = {
@@ -281,7 +252,7 @@ def main() -> None:
                     "momentum_5d": 0.0,
                     "rsi_14": 50.0,
                     "atr_14": 0.0,
-                    "iv": 0.0,
+                    **_EMPTY_IV_FIELDS,
                     "earnings_within_5d": earnings_map.get(symbol, False),
                     "error": "insufficient_bars",
                 }
@@ -293,25 +264,35 @@ def main() -> None:
             rsi_14 = compute_rsi(closes)
             atr_14 = compute_atr(bars)
 
-            # IV: use options snapshot for SPY/QQQ, else 0
-            if symbol == "SPY":
-                iv = spy_snap["iv"]
-            elif symbol == "QQQ":
-                iv = qqq_snap["iv"]
+            # Real IV via pipeline — every optionable symbol, not just SPY/QQQ
+            if iv_tier_blocked:
+                iv_fields = {**_EMPTY_IV_FIELDS, "put_call_volume_ratio": None}
             else:
-                iv = 0.0  # Non-optionable in our universe for direct IV fetch
+                try:
+                    iv_fields = fetch_symbol_iv(provider, conn, symbol, closes)
+                except IVUnavailableError as exc:
+                    # Subscription tier has no IV — surface loudly ONCE,
+                    # leave IV missing (downstream hard-filters iv<=0).
+                    iv_tier_blocked = True
+                    logger.error("IV UNAVAILABLE on current Alpaca data tier: %s", exc)
+                    log_system_event(conn, "ERROR", "layer0_builder",
+                                     "IV unavailable — Alpaca data tier has no "
+                                     "greeks/IV; no symbol will pass IV gates today",
+                                     {"error": str(exc)})
+                    iv_fields = {**_EMPTY_IV_FIELDS, "put_call_volume_ratio": None}
 
             symbols_data[symbol] = {
                 "price": round(current_price, 4),
                 "momentum_5d": momentum_5d,
                 "rsi_14": rsi_14,
                 "atr_14": atr_14,
-                "iv": round(iv, 4),
+                **iv_fields,
                 "earnings_within_5d": earnings_map.get(symbol, False),
             }
             logger.info(
-                "%s: price=%.2f mom=%.3f rsi=%.1f atr=%.2f iv=%.3f earnings=%s",
-                symbol, current_price, momentum_5d, rsi_14, atr_14, iv,
+                "%s: price=%.2f mom=%.3f rsi=%.1f atr=%.2f iv=%.3f rank=%s conf=%s earnings=%s",
+                symbol, current_price, momentum_5d, rsi_14, atr_14,
+                iv_fields["iv"], iv_fields["iv_rank"], iv_fields["iv_confidence"],
                 earnings_map.get(symbol, False),
             )
         except Exception as exc:
@@ -321,17 +302,33 @@ def main() -> None:
                 "momentum_5d": 0.0,
                 "rsi_14": 50.0,
                 "atr_14": 0.0,
-                "iv": 0.0,
+                **_EMPTY_IV_FIELDS,
                 "earnings_within_5d": False,
                 "error": str(exc),
             }
 
+    spy = symbols_data.get("SPY", {})
+
+    # VIX-comparable level: SPY 30-DTE ATM IV x 100 (a real options-market
+    # measure). The old VIXY-share-price hack is gone — VIXY's price is an
+    # ETF NAV, not a vol index. 0.0 still means MISSING, never a signal.
+    vix = round(spy.get("iv", 0.0) * 100, 2)
+    vix_source = "spy_atm_iv_30d_x100" if vix > 0 else "unavailable"
+
+    # Vol regime filter — consumed by Risk Agent and track sizing:
+    # stressed → halt premium selling; elevated → half size; calm → normal
+    vol_regime = classify_vol_regime(vix if vix > 0 else None, spy.get("term_slope"))
+    logger.info("VIX proxy: %.2f (%s) | vol_regime=%s (%s)",
+                vix, vix_source, vol_regime["regime"], vol_regime["reason"])
+
     output = {
         "built_at": datetime.now(timezone.utc).isoformat(),
         "vix": vix,
+        "vix_source": vix_source,
+        "vol_regime": vol_regime,
         "symbols": symbols_data,
-        "put_call_ratio": put_call_ratio,
-        "spy_iv_skew": spy_iv_skew,
+        "put_call_ratio": spy.get("put_call_volume_ratio") or 1.0,
+        "spy_iv_skew": spy.get("put_skew_25d") or 0.0,
     }
 
     out_path = AGENTS_DIR / "layer0_data.json"
@@ -344,7 +341,9 @@ def main() -> None:
         "INFO",
         "layer0_builder",
         "Layer 0 data built successfully",
-        {"symbols": list(symbols_data.keys()), "vix": vix},
+        {"symbols": list(symbols_data.keys()), "vix": vix,
+         "vix_source": vix_source, "vol_regime": vol_regime["regime"],
+         "iv_tier_blocked": iv_tier_blocked},
     )
     conn.close()
 

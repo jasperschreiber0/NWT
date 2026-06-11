@@ -144,6 +144,41 @@ def compute_final_sizing(directives: dict, base_notional: float, bot_key: str) -
     return base_notional * capital_weight * size_cap * multiplier
 
 
+def apply_vol_sizing(strategy_type: str, symbol: str, sized_notional: float) -> tuple:
+    """
+    Vol-regime + IV-confidence gate for premium-selling strategies
+    (real IV pipeline): stressed → 0 (halt), elevated/unknown → half size,
+    calm → full; low IV-history confidence caps at half size.
+    Debit strategies pass through untouched.
+
+    Returns (final_notional, info) — info is attached to the proposal
+    payload so the Risk Agent and Learning Agent can audit the decision.
+    """
+    from iv_pipeline.vol_regime import is_premium_selling, premium_selling_multiplier
+
+    layer0 = load_layer0_data()
+    vol_regime = (layer0.get("vol_regime") or {}).get("regime", "unknown")
+    iv_confidence = (
+        layer0.get("symbols", {}).get(symbol, {}).get("iv_confidence", "low")
+    )
+
+    if not is_premium_selling(strategy_type):
+        return sized_notional, {
+            "vol_regime": vol_regime,
+            "iv_confidence": iv_confidence,
+            "vol_sizing_multiplier": 1.0,
+            "premium_selling": False,
+        }
+
+    mult = premium_selling_multiplier(vol_regime, iv_confidence)
+    return sized_notional * mult, {
+        "vol_regime": vol_regime,
+        "iv_confidence": iv_confidence,
+        "vol_sizing_multiplier": mult,
+        "premium_selling": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # no_trade_mode — checked by every trading agent before doing anything
 # ---------------------------------------------------------------------------

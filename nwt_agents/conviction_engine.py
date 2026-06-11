@@ -110,7 +110,9 @@ Symbol: {symbol}
 - 5d momentum: {layer0_sym.get('momentum_5d', 0):.3f}
 - RSI(14): {layer0_sym.get('rsi_14', 50):.1f}
 - ATR(14): {layer0_sym.get('atr_14', 0):.2f}
-- Implied volatility: {layer0_sym.get('iv', 0):.3f}
+- 30-DTE ATM implied volatility: {layer0_sym.get('iv', 0):.3f}
+- IV rank (52wk window, {layer0_sym.get('iv_confidence', 'low')} confidence): {layer0_sym.get('iv_rank') if layer0_sym.get('iv_rank') is not None else 'n/a'}
+- IV-HV spread (vol risk premium): {layer0_sym.get('hv_iv_spread') if layer0_sym.get('hv_iv_spread') is not None else 'n/a'}
 - Earnings within 5d: {layer0_sym.get('earnings_within_5d', False)}
 
 Propose a specific options strategy for this symbol given the current regime and IV environment.
@@ -212,6 +214,16 @@ def main() -> None:
             layer0_sym = symbols_data.get(symbol, item.get("layer0", {}))
             iv = layer0_sym.get("iv", 0.0)
 
+            # Defense in depth: prescreener hard-filters iv<=0, but never let
+            # a missing-IV symbol reach strategy gating (the old HV/close-price
+            # proxy bug class). Skip loudly instead.
+            if iv <= 0:
+                logger.warning("Skipping %s — IV missing (iv=%.3f)", symbol, iv)
+                log_system_event(conn, "WARNING", "conviction_engine",
+                                 f"Skipped {symbol}: IV missing — no strategy gate "
+                                 f"may run on absent IV data", {"symbol": symbol})
+                continue
+
             logger.info("Processing conviction for %s", symbol)
 
             # Call Sonnet
@@ -237,6 +249,10 @@ def main() -> None:
             proposal["prescreener_score"] = item.get("score", 0)
             proposal["prescreener_direction"] = item.get("direction")
             proposal["iv_at_conviction"] = iv
+            proposal["iv_rank_at_conviction"] = layer0_sym.get("iv_rank")
+            proposal["iv_confidence"] = layer0_sym.get("iv_confidence", "low")
+            proposal["hv_iv_spread_at_conviction"] = layer0_sym.get("hv_iv_spread")
+            proposal["vol_regime_at_conviction"] = layer0.get("vol_regime", {}).get("regime")
             proposal["vix_at_conviction"] = vix
             proposal["regime_at_conviction"] = regime  # full JSONB object
             proposal["created_at"] = datetime.now(timezone.utc).isoformat()
