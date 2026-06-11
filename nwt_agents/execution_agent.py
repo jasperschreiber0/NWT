@@ -43,6 +43,17 @@ logger = logging.getLogger("execution_agent")
 
 ALPACA_BASE_URL = os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
 ALPACA_DATA_URL = os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+
+# PAPER-ONLY HARD GUARD: this agent submits orders. It refuses to start
+# against anything but the paper API unless live trading is explicitly and
+# deliberately enabled via NWT_ALLOW_LIVE_TRADING=true (go-live gate).
+if "paper-api" not in ALPACA_BASE_URL and os.environ.get("NWT_ALLOW_LIVE_TRADING", "").lower() != "true":
+    logger.critical(
+        "REFUSING TO START: NWT_ALPACA_BASE_URL=%s is not the paper API and "
+        "NWT_ALLOW_LIVE_TRADING is not set. Paper-only is enforced in code.",
+        ALPACA_BASE_URL,
+    )
+    sys.exit(1)
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID": os.environ.get("NWT_ALPACA_KEY_ID", ""),
     "APCA-API-SECRET-KEY": os.environ.get("NWT_ALPACA_SECRET_KEY", ""),
