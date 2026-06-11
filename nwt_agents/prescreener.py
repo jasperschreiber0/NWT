@@ -62,7 +62,10 @@ def apply_hard_filters(symbols_data: dict, vix: float) -> tuple[list, list]:
             reasons.append("earnings_within_5d=True")
 
         iv = data.get("iv", 0.0)
-        if iv > 0.80:
+        if iv <= 0:
+            # Real-IV pipeline: 0 means data missing/blocked — never trade on it
+            reasons.append("IV missing (pipeline returned no ATM IV)")
+        elif iv > 0.80:
             reasons.append(f"IV={iv:.2f} > 0.80")
 
         if data.get("price", 0.0) == 0.0:
@@ -85,9 +88,12 @@ def build_haiku_prompt(survivors: list, symbols_data: dict, vix: float, regime: 
     symbol_lines = []
     for s in survivors:
         d = symbols_data[s]
+        iv_rank = d.get("iv_rank")
+        rank_str = f"{iv_rank:.2f}" if iv_rank is not None else "n/a"
         symbol_lines.append(
             f"- {s}: price={d['price']}, momentum_5d={d['momentum_5d']:.3f}, "
-            f"rsi_14={d['rsi_14']:.1f}, atr_14={d['atr_14']:.2f}, iv={d['iv']:.3f}"
+            f"rsi_14={d['rsi_14']:.1f}, atr_14={d['atr_14']:.2f}, iv={d['iv']:.3f}, "
+            f"iv_rank={rank_str} ({d.get('iv_confidence', 'low')} confidence)"
         )
 
     return f"""You are a trading pre-screener for an options strategy system.
@@ -104,7 +110,7 @@ For each symbol, score the conviction for a directional options trade (0-10) bas
 - Current regime alignment
 - Price momentum
 - RSI positioning (extremes = contrarian, mid = trend)
-- Implied volatility level
+- Implied volatility level and IV rank (rank near 1 = rich vol, near 0 = cheap vol)
 - Overall setup quality
 
 Return ONLY valid JSON in this exact format (no markdown, no explanation):

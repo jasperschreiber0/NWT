@@ -24,6 +24,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 import integrity_gate
 from shared_context import (
+    apply_vol_sizing,
     check_no_trade_mode,
     compute_final_sizing,
     get_db,
@@ -97,25 +98,34 @@ def compute_quantitative_edge(layer0: dict, symbol: str, conviction_ticket: dict
             "statistical_confidence": min(0.5 + edge_magnitude * 0.4, 0.95),
         }
 
-    # Edge type 2: Vol spread — IV vs approximated realized vol
-    # Approximate realized vol from ATR
-    atr = sym_data.get("atr_14", 0.0)
-    price = sym_data.get("price", 1.0)
-    if price > 0 and atr > 0:
-        realized_vol_proxy = (atr / price) * (252 ** 0.5)  # Annualized
-        vol_spread = iv - realized_vol_proxy
-        if abs(vol_spread) > 0.05:
-            edge_magnitude = min(abs(vol_spread) / 0.20, 1.0)
-            direction_desc = "IV elevated above realized" if vol_spread > 0 else "IV compressed below realized"
-            return {
-                "edge_type": "vol_spread",
-                "edge_magnitude": round(edge_magnitude, 3),
-                "edge_description": (
-                    f"{symbol}: {direction_desc} — "
-                    f"IV={iv:.3f}, realized_proxy={realized_vol_proxy:.3f}, spread={vol_spread:.3f}"
-                ),
-                "statistical_confidence": min(0.45 + edge_magnitude * 0.35, 0.90),
-            }
+    # Edge type 2: Vol risk premium — 30-DTE ATM IV minus 20-day realized vol
+    # (hv_iv_spread from the IV pipeline). ATR proxy is a fallback only when
+    # the pipeline leg is missing, and is labeled as such.
+    hv_iv_spread = sym_data.get("hv_iv_spread")
+    if hv_iv_spread is not None:
+        vol_spread = float(hv_iv_spread)
+        realized_desc = f"hv_20d={sym_data.get('hv_20d')}"
+    else:
+        vol_spread = None
+        realized_desc = ""
+        atr = sym_data.get("atr_14", 0.0)
+        price = sym_data.get("price", 1.0)
+        if price > 0 and atr > 0:
+            realized_vol_proxy = (atr / price) * (252 ** 0.5)  # Annualized
+            vol_spread = iv - realized_vol_proxy
+            realized_desc = f"realized_proxy={realized_vol_proxy:.3f} (ATR fallback)"
+    if vol_spread is not None and abs(vol_spread) > 0.05:
+        edge_magnitude = min(abs(vol_spread) / 0.20, 1.0)
+        direction_desc = "IV elevated above realized" if vol_spread > 0 else "IV compressed below realized"
+        return {
+            "edge_type": "vol_spread",
+            "edge_magnitude": round(edge_magnitude, 3),
+            "edge_description": (
+                f"{symbol}: {direction_desc} — "
+                f"IV={iv:.3f}, {realized_desc}, spread={vol_spread:.3f}"
+            ),
+            "statistical_confidence": min(0.45 + edge_magnitude * 0.35, 0.90),
+        }
 
     # Edge type 3: VIX regime edge (VIX above/below threshold)
     if vix > 0 and strategy_type in ("vix_calls", "long_put", "bear_put_spread"):
@@ -239,6 +249,17 @@ def main() -> None:
                 log_inactivity(conn, strategy_id, "E", "ZERO_SIZING", regime)
                 continue
 
+            strategy_type = best_ticket.get("strategy_type", "iron_condor")
+
+            # Vol-regime gate (real IV pipeline): premium selling halted when
+            # stressed, halved when elevated or IV rank confidence is low
+            sized_notional, vol_gate = apply_vol_sizing(strategy_type, symbol, sized_notional)
+            if sized_notional <= 0:
+                logger.info("%s: premium selling halted — vol_regime=%s",
+                            strategy_id, vol_gate["vol_regime"])
+                log_inactivity(conn, strategy_id, "E", "REGIME_MISMATCH", regime)
+                continue
+
             sq = best_ticket.get("signal_quality", {})
             dte_target = best_ticket.get("dte_target", genome.get("dte_min", 14))
             dte_target = max(genome["dte_min"], min(genome["dte_max"], dte_target))
@@ -247,7 +268,8 @@ def main() -> None:
                 "from_track": "E",
                 "strategy_id": strategy_id,
                 "symbol": symbol,
-                "strategy_type": best_ticket.get("strategy_type", "iron_condor"),
+                "strategy_type": strategy_type,
+                "vol_gate": vol_gate,
                 "direction": best_ticket.get("direction", "long"),
                 "confidence": best_ticket.get("confidence", 0.0),
                 "conviction_score": best_ticket.get("conviction_score", 0),

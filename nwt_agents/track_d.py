@@ -20,6 +20,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 import integrity_gate
 from shared_context import (
+    apply_vol_sizing,
     check_no_trade_mode,
     compute_final_sizing,
     get_db,
@@ -180,6 +181,17 @@ def main() -> None:
                 continue
 
             symbol = best_ticket["symbol"]
+            strategy_type = best_ticket.get("strategy_type", "long_call")
+
+            # Vol-regime gate (real IV pipeline) — only throttles premium
+            # selling; Track D's debit structures pass through at 1.0x
+            sized_notional, vol_gate = apply_vol_sizing(strategy_type, symbol, sized_notional)
+            if sized_notional <= 0:
+                logger.info("%s: premium selling halted — vol_regime=%s",
+                            strategy_id, vol_gate["vol_regime"])
+                log_inactivity(conn, strategy_id, "D", "REGIME_MISMATCH", regime)
+                continue
+
             sq = best_ticket.get("signal_quality", {})
 
             # Track D: prefer longer DTE (21-45 from genome)
@@ -192,7 +204,8 @@ def main() -> None:
                 "strategy_id": strategy_id,
                 "archetype": archetype,
                 "symbol": symbol,
-                "strategy_type": best_ticket.get("strategy_type", "long_call"),
+                "strategy_type": strategy_type,
+                "vol_gate": vol_gate,
                 "direction": best_ticket.get("direction", "long"),
                 "confidence": best_ticket.get("confidence", 0.0),
                 "conviction_score": best_ticket.get("conviction_score", 0),

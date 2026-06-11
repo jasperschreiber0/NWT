@@ -22,6 +22,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 import integrity_gate
 from shared_context import (
+    apply_vol_sizing,
     check_no_trade_mode,
     compute_final_sizing,
     get_db,
@@ -162,6 +163,18 @@ def main() -> None:
                 continue
 
             symbol = best_ticket["symbol"]
+            strategy_type = best_ticket.get("strategy_type", "iron_condor")
+
+            # Vol-regime gate (real IV pipeline): premium selling is halted in
+            # a stressed regime, halved when elevated or when the IV history
+            # window is too short for a confident IV rank.
+            sized_notional, vol_gate = apply_vol_sizing(strategy_type, symbol, sized_notional)
+            if sized_notional <= 0:
+                logger.info("%s: premium selling halted — vol_regime=%s",
+                            strategy_id, vol_gate["vol_regime"])
+                log_inactivity(conn, strategy_id, "C", "REGIME_MISMATCH", regime)
+                continue
+
             sq = best_ticket.get("signal_quality", {})
 
             proposal = {
@@ -169,7 +182,8 @@ def main() -> None:
                 "strategy_id": strategy_id,
                 "archetype": archetype,
                 "symbol": symbol,
-                "strategy_type": best_ticket.get("strategy_type", "iron_condor"),
+                "strategy_type": strategy_type,
+                "vol_gate": vol_gate,
                 "direction": best_ticket.get("direction", "long"),
                 "confidence": best_ticket.get("confidence", 0.0),
                 "conviction_score": best_ticket.get("conviction_score", 0),

@@ -18,6 +18,10 @@ NWT_DIR=/home/northworld/trading/nwt_agents
 0 0 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 track_d.py >> /var/log/nwt/track_d.log 2>&1
 30 0 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 track_e.py >> /var/log/nwt/track_e.log 2>&1
 
+# IV history snapshot — 14:35 UTC = 00:35 AEST Tue-Sat (after US open).
+# Data job: runs even in no_trade_mode; feeds nwt_iv_history for IV rank.
+35 0 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 iv_snapshot_job.py >> /var/log/nwt/iv_snapshot.log 2>&1
+
 # Risk agent every 5 min, 13:00-20:00 UTC = 23:xx AEST Mon-Fri + 00:xx-06:xx AEST Tue-Sat
 */5 23 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 risk_agent.py >> /var/log/nwt/risk.log 2>&1
 */5 0-6 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 risk_agent.py >> /var/log/nwt/risk.log 2>&1
