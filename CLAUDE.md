@@ -25,6 +25,8 @@
 | Directional cap (60%) | Built | 2026-06-10 |
 | Exit lifecycle (equity monitor + options close) | Built | 2026-06-10 |
 | Inactivity ticket taxonomy | Built | 2026-06-10 |
+| Real IV pipeline (iv_pipeline pkg, nwt_iv_history, vol regime gate) | Built — pending deploy | 2026-06-11 |
+| Paper-only hard guard (execution engine + agent) | Built — pending deploy | 2026-06-11 |
 | Server hardening | Pending | 2026-06-10 |
 
 ---
@@ -434,6 +436,17 @@ Skip if: IV>80, signal<0.5, earnings within 5d, VIX>40, regime confidence <0.5.
 - **Profit target:** 50% max profit (spreads) / 100% gain (long)
 - **Stop:** 50% premium paid
 - **Hard close:** all positions by 15:45 ET, no exceptions
+
+### IV Pipeline (real implied volatility — June 2026)
+
+Path: `nwt_agents/iv_pipeline/` — provider-abstracted (Alpaca primary; Polygon/Tradier stubs behind the same interface).
+
+- **layer0 `iv` is now 30-DTE ATM IV** (two straddling expiries, ATM call/put average, linear DTE interpolation, sanity-bounded 1%–400%). The old "average IV over 50 arbitrary contracts with close-price fallback" is gone. `iv=0.0` means MISSING — prescreener hard-filters it; no strategy gate may run on absent IV.
+- **History store:** `nwt_iv_history` (migration `db/migrate_iv_history.sql`), written daily by `iv_snapshot_job.py` (cron 14:35 UTC, runs even in no_trade_mode — data continuity beats trading halts).
+- **Signals per symbol:** `iv_rank`, `iv_percentile` (over available history), `iv_confidence` (low <90d, medium 90–249d, high 250+d), `term_slope` (30d−60d), `put_skew_25d`, `hv_20d` (honest name for realized vol — never labeled IV), `hv_iv_spread`.
+- **VIX is a proxy:** layer0 `vix` = SPY 30-DTE ATM IV × 100 (`vix_source` field). The VIXY-share-price hack is dead. 0 still means missing.
+- **Vol regime gate:** `vol_regime` in layer0 = calm (<20) | elevated (20–28) | stressed (≥28), escalated one notch on term-structure backwardation (slope > +0.02). Premium selling: stressed → halted (Risk Agent Rule 18), elevated/unknown or low IV confidence → half size (track sizing via `apply_vol_sizing`, double-checked by Risk Agent Rule 19).
+- **Verification:** `verify_iv.py [tickers]` prints computed ATM IV next to raw per-strike IVs; `verify_iv.py --check-feed` reports whether the Alpaca data tier returns IV at all. If the tier has no IV, the pipeline raises `IVUnavailableError` and IV gates halt — it never silently falls back.
 
 ### Track E Requirement
 
@@ -848,6 +861,10 @@ All model env vars overridable via `nwt_agents/.env`
 | Cold start | System assumes zero exposure until ledger populates — explicit, not an error |
 | Regime is now an object | regime_at_entry/exit are JSONB — not plain text strings. Any agent reading regime as a string is non-compliant. |
 | Mutation shadow mode | No strategy mutation may be promoted without shadow-mode results. Observing from 30 trades, promoting after 100+. |
+| layer0 iv=0.0 | Means IV data MISSING (pipeline/tier failure) — hard-filtered, never traded on. Real values are 30-DTE ATM IV |
+| Options IV source | Data API `/v1beta1/options/snapshots/{sym}` — the trading API `/v2/options/contracts` listing has NO reliable IV (old close-price-as-IV bug) |
+| Paper-only guard | Execution engine + execution agent refuse to start on a non-paper base URL unless `NWT_ALLOW_LIVE_TRADING=true` |
+| IV rank bootstrap | Rank/percentile computed over available history with `iv_confidence` label; premium selling capped at half size until 90+ days of `nwt_iv_history` |
 
 ---
 
