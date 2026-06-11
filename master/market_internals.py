@@ -64,18 +64,20 @@ def _get_bars(
 
 
 def _get_options_snapshot(
-    base_url: str,
+    data_url: str,
     api_key: str,
     secret_key: str,
     symbol: str = "SPY",
 ) -> Optional[dict]:
     """
-    Fetch options snapshot for a symbol.
+    Fetch option chain snapshot (greeks/IV included) from the Alpaca DATA
+    API — the trading API has no snapshot endpoint, which is why this
+    previously always returned None.
     Returns raw snapshot dict or None on failure.
     """
-    url = f"{base_url}/v2/options/snapshots"
+    url = f"{data_url}/v1beta1/options/snapshots/{symbol}"
     headers = _alpaca_headers(api_key, secret_key)
-    params = {"symbols": symbol}
+    params = {"limit": 500}
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         resp.raise_for_status()
@@ -224,15 +226,19 @@ def _put_call_skew(snapshot: Optional[dict]) -> Optional[float]:
         if not isinstance(contract_data, dict):
             continue
         greeks = contract_data.get("greeks") or {}
-        iv = greeks.get("iv") or contract_data.get("impliedVolatility")
+        iv = contract_data.get("impliedVolatility") or greeks.get("iv")
         if iv is None or iv <= 0:
             continue
-        # Determine put vs call from contract symbol (P = put, C = call)
-        # Alpaca option symbol format: SPY250620C00580000
+        # OCC symbol format: ROOT + YYMMDD + C/P + 8-digit strike.
+        # The C/P flag is always 9 chars from the end (strike is 8 digits) —
+        # scanning the whole tail matched date digits and root letters.
         upper_key = contract_key.upper()
-        if "P" in upper_key[6:]:  # skip the ticker prefix
+        if len(upper_key) < 16:
+            continue
+        cp_flag = upper_key[-9]
+        if cp_flag == "P":
             put_ivs.append(float(iv))
-        elif "C" in upper_key[6:]:
+        elif cp_flag == "C":
             call_ivs.append(float(iv))
 
     if not put_ivs or not call_ivs:
@@ -346,9 +352,9 @@ def fetch_market_internals(
     # Breadth score
     result["breadth_score"] = _breadth_score(bars_map)
 
-    # Put/call skew from options snapshot
+    # Put/call skew from options snapshot (DATA API — greeks/IV live there)
     snapshot = _get_options_snapshot(
-        base_url=alpaca_base_url,
+        data_url=alpaca_data_url,
         api_key=alpaca_api_key,
         secret_key=alpaca_secret_key,
         symbol="SPY",
