@@ -28,6 +28,10 @@ WHERE strategy_id IN ('D3','D4','D8','D11');
 
 -- Track E: moved to shadow mode until quantitative_edge quality is proven.
 -- Shadow strategies log inactivity (SHADOW_MODE) instead of erroring out.
+-- shadow_mode is a runtime flag read by the track agents — re-added here in
+-- case an earlier migration removed it (orthogonal to genome versioning).
+ALTER TABLE nwt_strategy_genome ADD COLUMN IF NOT EXISTS shadow_mode BOOLEAN DEFAULT FALSE;
+
 UPDATE nwt_strategy_genome SET archetype = 'E-VOL-DESK', shadow_mode = TRUE
 WHERE track = 'E';
 

@@ -71,7 +71,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_active_genome
   ON nwt_strategy_genome (strategy_id) WHERE (active = TRUE);
 
 ALTER TABLE nwt_strategy_genome DROP COLUMN IF EXISTS updated_at;
-ALTER TABLE nwt_strategy_genome DROP COLUMN IF EXISTS shadow_mode;
+-- shadow_mode is KEPT: it is a runtime flag read by track_c/d/e
+-- (genome.get("shadow_mode") gates live proposals — Track E shadow-moded
+-- after the May 30 false-edge incident). Versioning via (strategy_id, version)
+-- is orthogonal to this flag.
+ALTER TABLE nwt_strategy_genome ADD COLUMN IF NOT EXISTS shadow_mode BOOLEAN DEFAULT FALSE;
 ALTER TABLE nwt_strategy_genome DROP COLUMN IF EXISTS trade_count_to_promote;
 
 -- ============================================================
