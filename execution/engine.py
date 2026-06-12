@@ -28,7 +28,7 @@ from psycopg2.extras import RealDictCursor
 from ledger import close_position, get_open_positions, insert_position, log_system_event
 
 _here = Path(__file__).parent
-load_dotenv(_here / ".env")
+load_dotenv(_here / ".env", override=True)  # .env beats stale PM2 daemon env
 
 logging.basicConfig(
     level=logging.INFO,

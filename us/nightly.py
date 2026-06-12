@@ -29,7 +29,7 @@ BOT_DIR = Path(__file__).parent
 SHARED_DIR = BOT_DIR.parent / "shared"
 NOTES_FILE = BOT_DIR / "nightly_notes.json"
 
-load_dotenv(BOT_DIR / ".env")
+load_dotenv(BOT_DIR / ".env", override=True)  # .env beats stale PM2 daemon env
 
 logging.basicConfig(
     level=logging.INFO,
