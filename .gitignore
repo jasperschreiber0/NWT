@@ -3,3 +3,13 @@ __pycache__/
 *.pyo
 .env
 *.log
+
+# Runtime artifacts written by the agents on the server — never commit
+nwt_agents/layer0_data.json
+nwt_agents/prescreened_symbols.json
+nwt_agents/conviction_tickets.json
+nwt_agents/conviction_summary.txt
+nwt_agents/cost_summary.json
+nwt_agents/snapshot.json
+us/nightly_notes.json
+.pytest_cache/
