@@ -138,16 +138,23 @@ def run_recon(conn, mode: str) -> bool:
     # 3: Qty mismatch → CRITICAL
     for sym in set(alpaca_map) & set(ledger_map):
         alpaca_qty = alpaca_map[sym]["qty"]
-        ledger_count = len(ledger_map[sym])
-        # For options each contract is one ledger row; for equity check notional count
-        asset_type = ledger_map[sym][0].get("asset_type", "equity")
-        if asset_type == "option":
-            if abs(alpaca_qty - ledger_count) > 0.5:
-                entry = {"class": "qty_mismatch", "symbol": sym,
-                         "alpaca_qty": alpaca_qty, "ledger_rows": ledger_count}
-                logger.error("CRITICAL qty mismatch: %s alpaca=%.0f ledger=%d", sym, alpaca_qty, ledger_count)
-                mismatches.append(entry)
-                critical = True
+        rows = ledger_map[sym]
+        asset_type = rows[0].get("asset_type", "equity")
+        # Use SUM(qty) from ledger if available; fall back to row count for options
+        ledger_qty_sum = sum(r["qty"] for r in rows if r.get("qty") is not None)
+        if ledger_qty_sum > 0:
+            ledger_qty = ledger_qty_sum
+        elif asset_type == "option":
+            ledger_qty = len(rows)
+        else:
+            ledger_qty = None  # equity qty check not enforced without column data
+
+        if ledger_qty is not None and abs(alpaca_qty - ledger_qty) > 0.5:
+            entry = {"class": "qty_mismatch", "symbol": sym,
+                     "alpaca_qty": alpaca_qty, "ledger_qty": ledger_qty}
+            logger.error("CRITICAL qty mismatch: %s alpaca=%.0f ledger=%.0f", sym, alpaca_qty, ledger_qty)
+            mismatches.append(entry)
+            critical = True
 
     if not mismatches:
         insert_ticket(conn, "RECON_AGENT", "SYSTEM", "recon_ok", {
@@ -221,10 +228,10 @@ def cold_start_import(conn) -> None:
                 """
                 INSERT INTO nwt_portfolio_ledger
                   (bot_source, asset, asset_type, direction, notional_risk,
-                   entry_price, entry_time, status)
-                VALUES ('UNATTRIBUTED', %s, %s, %s, %s, %s, NOW(), 'open')
+                   entry_price, entry_time, qty, status)
+                VALUES ('UNATTRIBUTED', %s, %s, %s, %s, %s, NOW(), %s, 'open')
                 """,
-                (sym, asset_type, side, abs(qty) * avg_entry, avg_entry),
+                (sym, asset_type, side, abs(qty) * avg_entry, avg_entry, int(abs(qty))),
             )
         conn.commit()
         logger.info("Imported UNATTRIBUTED: %s %s qty=%.0f", side, sym, abs(qty))

@@ -24,7 +24,7 @@ def insert_position(conn, data: dict) -> str:
         bot_source, asset, asset_type
     Optional keys:
         strategy_id, direction, delta_exposure, notional_risk, entry_price,
-        entry_time, entry_bid, entry_ask, alpaca_order_id
+        entry_time, entry_bid, entry_ask, alpaca_order_id, qty
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -32,8 +32,8 @@ def insert_position(conn, data: dict) -> str:
             INSERT INTO nwt_portfolio_ledger
                 (bot_source, strategy_id, asset, asset_type, direction, delta_exposure,
                  notional_risk, entry_price, entry_time, entry_bid, entry_ask,
-                 alpaca_order_id, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
+                 alpaca_order_id, qty, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
             RETURNING position_id
             """,
             (
@@ -49,6 +49,7 @@ def insert_position(conn, data: dict) -> str:
                 data.get("entry_bid"),
                 data.get("entry_ask"),
                 data.get("alpaca_order_id"),
+                data.get("qty"),
             ),
         )
         position_id = cur.fetchone()[0]

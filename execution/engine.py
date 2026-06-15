@@ -796,6 +796,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         "entry_bid": entry_bid,
         "entry_ask": entry_ask,
         "alpaca_order_id": alpaca_order_id,
+        "qty": int(payload.get("qty", 1)),
     }
 
     try:
