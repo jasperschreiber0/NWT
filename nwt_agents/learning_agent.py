@@ -108,7 +108,28 @@ def find_original_ticket(conn, alpaca_order_id: str, asset: str) -> Optional[dic
             (alpaca_order_id, asset, asset),
         )
         row = cur.fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    ticket = dict(row)
+    # If this is a TRADE_REQUEST and regime_at_decision is missing, follow
+    # source_proposal_ticket_id back to the TRADE_PROPOSAL to get it.
+    payload = ticket.get("payload") or {}
+    if ticket.get("type") == "TRADE_REQUEST" and not payload.get("regime_at_decision"):
+        source_id = payload.get("source_proposal_ticket_id")
+        if source_id:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM nwt_tickets WHERE ticket_id = %s",
+                    (source_id,),
+                )
+                proposal_row = cur.fetchone()
+            if proposal_row:
+                proposal = dict(proposal_row)
+                proposal_payload = proposal.get("payload") or {}
+                regime = proposal_payload.get("regime_at_decision")
+                if regime:
+                    ticket["payload"] = {**payload, "regime_at_decision": regime}
+    return ticket
 
 
 def _half_spread(price: float, bid, ask, asset_type: str) -> tuple:
