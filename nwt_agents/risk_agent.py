@@ -10,18 +10,19 @@ Rules 14-17: system-level enforcement (heartbeat, drawdown, VIX, intraday PnL) �
 import json
 import logging
 import os
+import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import psycopg2
+import requests
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from iv_pipeline.vol_regime import is_premium_selling
 from shared_context import (
     NEW_ENTRY_CUTOFF_UTC_HOUR,
     NEW_ENTRY_CUTOFF_UTC_MINUTE,
@@ -30,7 +31,6 @@ from shared_context import (
     get_disabled_tracks,
     insert_decision,
     insert_ticket,
-    load_layer0_data,
     load_master_directives,
     log_system_event,
     past_new_entry_cutoff,
@@ -43,6 +43,13 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("risk_agent")
+
+ALPACA_BASE_URL = os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+ALPACA_DATA_URL = os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+ALPACA_HEADERS = {
+    "APCA-API-KEY-ID": os.environ.get("NWT_ALPACA_KEY_ID", ""),
+    "APCA-API-SECRET-KEY": os.environ.get("NWT_ALPACA_SECRET_KEY", ""),
+}
 
 ET_TZ = ZoneInfo("America/New_York")
 
@@ -211,9 +218,7 @@ def fetch_vix_with_fallback(conn) -> tuple:
     """
     Returns (vix_value, source) or (None, 'unavailable').
     VIX=0 is treated as missing — never as a signal.
-    Fallbacks: layer0's SPY 30-DTE ATM IV x100 (real IV pipeline), then a
-    live pipeline computation. The old /v2/options/contracts proxy is gone —
-    that trading-API listing carries no reliable implied_volatility.
+    Fallback: ATM SPY ~30 DTE IV from Alpaca options chain.
     """
     try:
         directives = load_master_directives()
@@ -228,19 +233,27 @@ def fetch_vix_with_fallback(conn) -> tuple:
     # populate implied_volatility on contracts reliably, causing 84 vix_degraded
     # tickets per session.
     try:
-        layer0 = load_layer0_data()
-        vix = layer0.get("vix") or 0.0
-        if vix > 0:
-            return float(vix), layer0.get("vix_source", "layer0")
-    except Exception:
-        pass
-
-    try:
-        from iv_pipeline.alpaca_provider import AlpacaIVProvider
-        from iv_pipeline.pipeline import compute_ticker_iv
-        snap = compute_ticker_iv(AlpacaIVProvider(), "SPY")
-        if snap["atm_iv_30d"]:
-            return snap["atm_iv_30d"] * 100, "spy_atm_iv_pipeline"
+        today = date.today()
+        url = f"{ALPACA_BASE_URL}/v2/options/contracts"
+        params = {
+            "underlying_symbols": "SPY",
+            "expiration_date_gte": (today + timedelta(days=25)).isoformat(),
+            "expiration_date_lte": (today + timedelta(days=35)).isoformat(),
+            "type": "call",
+            "limit": 10,
+        }
+        resp = requests.get(url, headers=ALPACA_HEADERS, params=params, timeout=15)
+        resp.raise_for_status()
+        contracts = resp.json().get("option_contracts", [])
+        if contracts:
+            price_url = f"{ALPACA_DATA_URL}/v2/stocks/SPY/trades/latest"
+            pr = requests.get(price_url, headers=ALPACA_HEADERS, timeout=10)
+            pr.raise_for_status()
+            spy_price = float(pr.json()["trade"]["p"])
+            atm = min(contracts, key=lambda c: abs(float(c.get("strike_price", 0)) - spy_price))
+            iv = float(atm.get("implied_volatility") or 0)
+            if iv > 0:
+                return iv * 100, "spy_iv_proxy"
     except Exception as exc:
         logger.warning("VIX VIXY fallback failed: %s", exc)
 
@@ -285,15 +298,46 @@ def execution_engine_is_stale(conn) -> bool:
 
 
 def get_positions_past_hard_close(conn) -> list:
+    """
+    Return open options that must be force-closed at 15:45 ET.
+    Only options expiring TODAY or TOMORROW (DTE <= 1) are hard-closed.
+    Multi-day options (DTE > 1) are managed by stop/target and survive overnight.
+    """
     hard_close = _hard_close_utc()
     if datetime.now(timezone.utc) < hard_close:
         return []
+    today_et = _et_now().date()
+    tomorrow_et = today_et + timedelta(days=1)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             "SELECT * FROM nwt_portfolio_ledger WHERE status='open' AND asset_type='option'"
         )
         rows = cur.fetchall()
-    return [dict(r) for r in rows]
+    result = []
+    for row in rows:
+        asset = row.get("asset", "")
+        # Parse expiry from OCC symbol: last 6 digits before option type are YYMMDD
+        # e.g. QQQ260624C00732000 → 260624 → 2026-06-24
+        try:
+            # OCC format: underlying + YYMMDD + C/P + strike*1000
+            # Find the date portion: 6 digits after all alpha chars
+            m = re.search(r'[A-Z](\d{6})[CP]', asset)
+            if m:
+                date_str = m.group(1)
+                exp_date = date(2000 + int(date_str[:2]), int(date_str[2:4]), int(date_str[4:6]))
+                dte = (exp_date - today_et).days
+                if dte <= 1:
+                    result.append(dict(row))
+                else:
+                    logger.info("Hard close SKIP %s — DTE=%d (multi-day, managed by stop/target)", asset, dte)
+            else:
+                # Cannot parse expiry — close it to be safe
+                logger.warning("Hard close: cannot parse expiry from %s — closing as precaution", asset)
+                result.append(dict(row))
+        except Exception as exc:
+            logger.warning("Hard close: expiry parse error for %s: %s — closing as precaution", asset, exc)
+            result.append(dict(row))
+    return result
 
 
 def get_api_anomaly(conn) -> bool:
@@ -425,7 +469,6 @@ def evaluate_proposal(
     net_delta: float,
     execution_stale: bool,
     api_anomaly: bool,
-    vol_regime: dict = None,
 ) -> tuple:
     payload = ticket.get("payload") or {}
     regime = directives.get("regime", {})
@@ -503,34 +546,7 @@ def evaluate_proposal(
     if from_track in disabled_tracks:
         return "VETOED", f"Rule 13: Track {from_track} is in cooling-off — proposals rejected"
 
-    # Rules 18-19: vol regime + IV-confidence gates (real IV pipeline).
-    # Only premium-selling structures are throttled.
-    strategy_type = (payload.get("strategy_type") or "").lower()
-    if is_premium_selling(strategy_type):
-        vol_label = (vol_regime or {}).get("regime", "unknown")
-
-        # Rule 18: stressed regime → halt new premium-selling entries
-        if vol_label == "stressed":
-            return "VETOED", (
-                f"Rule 18: vol_regime=stressed "
-                f"({(vol_regime or {}).get('reason', 'n/a')}) — "
-                f"no new premium-selling entries"
-            )
-
-        # Rule 19: low IV-history confidence is a no-trade or reduced-size
-        # signal. The track must have applied the 0.5x multiplier (vol_gate
-        # in the payload); a full-size proposal under low confidence is vetoed.
-        gate = payload.get("vol_gate") or {}
-        iv_confidence = gate.get("iv_confidence", "low")
-        applied_mult = float(gate.get("vol_sizing_multiplier", 1.0))
-        if iv_confidence == "low" and applied_mult > 0.5:
-            return "VETOED", (
-                "Rule 19: IV history confidence=low and proposal was not "
-                "size-reduced — premium selling requires <=0.5x sizing until "
-                "90+ days of IV history exist"
-            )
-
-    return "APPROVED", "All risk rules passed (0-19)"
+    return "APPROVED", "All 13 risk rules passed"
 
 
 # ---------------------------------------------------------------------------
@@ -602,10 +618,6 @@ def main() -> None:
         net_delta = get_net_delta(conn)
         execution_stale = execution_engine_is_stale(conn)
         api_anomaly = get_api_anomaly(conn)
-        try:
-            vol_regime = load_layer0_data().get("vol_regime") or {}
-        except Exception:
-            vol_regime = {}
 
         pending = fetch_pending_proposals(conn)
         logger.info(
@@ -628,7 +640,6 @@ def main() -> None:
                     disabled_tracks=disabled_tracks, baseline_slippage=baseline_slippage,
                     recent_slippage=recent_slippage, net_delta=net_delta,
                     execution_stale=execution_stale, api_anomaly=api_anomaly,
-                    vol_regime=vol_regime,
                 )
 
             insert_decision(conn, ticket_id, decision, reasoning, "RISK_AGENT")

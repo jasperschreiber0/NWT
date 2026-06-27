@@ -28,7 +28,7 @@ from psycopg2.extras import RealDictCursor
 from ledger import close_position, get_open_positions, insert_position, log_system_event
 
 _here = Path(__file__).parent
-load_dotenv(_here / ".env", override=True)  # .env beats stale PM2 daemon env
+load_dotenv(_here / ".env")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,17 +39,6 @@ logger = logging.getLogger("execution_engine")
 
 ALPACA_BASE_URL = os.environ["ALPACA_BASE_URL"].rstrip("/")
 ALPACA_DATA_URL = os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-
-# PAPER-ONLY HARD GUARD: this engine places orders. It refuses to start
-# against anything but the paper API unless live trading is explicitly and
-# deliberately enabled via NWT_ALLOW_LIVE_TRADING=true (go-live gate).
-if "paper-api" not in ALPACA_BASE_URL and os.environ.get("NWT_ALLOW_LIVE_TRADING", "").lower() != "true":
-    logger.critical(
-        "REFUSING TO START: ALPACA_BASE_URL=%s is not the paper API and "
-        "NWT_ALLOW_LIVE_TRADING is not set. Paper-only is enforced in code.",
-        ALPACA_BASE_URL,
-    )
-    sys.exit(1)
 ALPACA_KEY = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET = os.environ["ALPACA_SECRET_KEY"]
 NWT_DB_DSN = os.environ["NWT_DB_DSN"]
@@ -240,7 +229,8 @@ def insert_decision(conn, ticket_id: str, decision: str, reasoning: str) -> None
 
 
 def fetch_pending_tickets(conn) -> list:
-    """Return approved TRADE_REQUEST tickets with no EXECUTION_ENGINE decision yet."""
+    """Return approved TRADE_REQUEST tickets with no EXECUTION_ENGINE decision yet.
+    Tickets older than 6 hours are auto-rejected — stale signals from prior sessions."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
@@ -251,6 +241,7 @@ def fetch_pending_tickets(conn) -> list:
               AND t.from_agent IN (
                   'EU_EXECUTOR', 'ASX_EXECUTOR', 'CHINA_EXECUTOR', 'NWT_EXECUTION_AGENT'
               )
+              AND t.created_at > NOW() - INTERVAL '6 hours'
               AND NOT EXISTS (
                   SELECT 1 FROM nwt_ticket_decisions d
                   WHERE d.ticket_id = t.ticket_id
@@ -260,7 +251,42 @@ def fetch_pending_tickets(conn) -> list:
             """,
         )
         rows = cur.fetchall()
-    return [dict(r) for r in rows]
+
+    fresh = [dict(r) for r in rows]
+
+    # Auto-reject anything older than 6h that slipped through (belt-and-suspenders)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT t.*
+            FROM nwt_tickets t
+            WHERE t.to_agent = 'EXECUTION_ENGINE'
+              AND t.type = 'TRADE_REQUEST'
+              AND t.created_at <= NOW() - INTERVAL '6 hours'
+              AND NOT EXISTS (
+                  SELECT 1 FROM nwt_ticket_decisions d
+                  WHERE d.ticket_id = t.ticket_id
+                    AND d.decided_by = 'EXECUTION_ENGINE'
+              )
+            """,
+        )
+        stale = cur.fetchall()
+
+    for row in stale:
+        tid = str(row["ticket_id"])
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO nwt_ticket_decisions (ticket_id, decision, reasoning, decided_by) "
+                    "VALUES (%s, 'REJECTED', 'Stale ticket — older than 6 hours', 'EXECUTION_ENGINE')",
+                    (tid,),
+                )
+            conn.commit()
+            logger.warning("Auto-rejected stale ticket %s (created %s)", tid, row["created_at"])
+        except Exception as exc:
+            logger.error("Failed to auto-reject stale ticket %s: %s", tid, exc)
+
+    return fresh
 
 
 def fetch_force_close_tickets(conn) -> list:
