@@ -25,6 +25,7 @@ from shared_context import (
     get_db,
     get_strategy_genome,
     insert_ticket,
+    kill_switch_is_active,
     load_conviction_tickets,
     load_master_directives,
     log_inactivity,
@@ -103,7 +104,7 @@ def main() -> None:
             log_system_event(conn, "WARNING", "track_d", f"no_trade_mode — all D strategies inactive: {halt_reason}")
             return
 
-        if directives.get("global_kill_switch", False):
+        if kill_switch_is_active(directives):
             logger.warning("Global kill switch active — Track D exiting")
             regime = directives.get("regime", {})
             for i in range(1, 13):

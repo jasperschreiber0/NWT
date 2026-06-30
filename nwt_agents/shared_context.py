@@ -5,8 +5,9 @@ All agents must import from here — never duplicate these lookups.
 """
 
 import json
+import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import psycopg2
@@ -42,6 +43,39 @@ def load_master_directives() -> dict:
     path = _shared_dir() / "master-directives.json"
     with open(path) as f:
         return json.load(f)
+
+
+_ks_logger = logging.getLogger("shared_context.kill_switch")
+
+def kill_switch_is_active(directives: dict) -> bool:
+    """
+    Returns True only if global_kill_switch=True AND the directive file is fresh
+    (written within the last 1 calendar day, server-local time).
+
+    A stale kill switch — e.g. activated Friday, still in the file Monday morning
+    because master-strategist doesn't run on weekends — is silently ignored here.
+    Risk agent evaluates kill-switch conditions in real time throughout each session,
+    so a stale file state is never the right authority at session start.
+    """
+    if not directives.get("global_kill_switch", False):
+        return False
+
+    directive_date_str = directives.get("date", "")
+    try:
+        directive_date = date.fromisoformat(directive_date_str)
+        days_old = (date.today() - directive_date).days
+        if days_old > 1:
+            _ks_logger.warning(
+                "Stale kill switch detected (directive date=%s, %d days old) — "
+                "ignoring; risk_agent will re-evaluate live conditions this session",
+                directive_date_str, days_old,
+            )
+            return False
+    except (ValueError, TypeError):
+        # Cannot determine age — honour conservatively
+        pass
+
+    return True
 
 
 def load_conviction_tickets() -> list:

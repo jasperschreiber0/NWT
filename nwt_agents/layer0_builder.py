@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 import integrity_gate
-from shared_context import get_db, load_master_directives, log_inactivity, log_system_event
+from shared_context import get_db, kill_switch_is_active, load_master_directives, log_inactivity, log_system_event
 
 logging.basicConfig(
     level=logging.INFO,
@@ -236,7 +236,7 @@ def main() -> None:
     # Check global kill switch
     try:
         directives = load_master_directives()
-        if directives.get("global_kill_switch", False):
+        if kill_switch_is_active(directives):
             logger.warning("Global kill switch active — logging inactivity for all strategies and exiting")
             regime = directives.get("regime", {})
             all_strategy_ids = [f"C{i}" for i in range(1, 13)] + \

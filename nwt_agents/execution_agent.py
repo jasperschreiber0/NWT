@@ -29,6 +29,7 @@ from shared_context import (
     get_db,
     insert_decision,
     insert_ticket,
+    kill_switch_is_active,
     load_master_directives,
     log_system_event,
     pre_trade_veto,
@@ -315,7 +316,7 @@ def main() -> None:
             logger.error("master-directives.json not found — exiting")
             sys.exit(1)
 
-        if directives.get("global_kill_switch", False):
+        if kill_switch_is_active(directives):
             logger.warning("Global kill switch active — execution agent exiting")
             log_system_event(conn, "WARNING", "execution_agent", "Kill switch active — no submissions")
             return

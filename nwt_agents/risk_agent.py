@@ -217,7 +217,10 @@ def fetch_vix_with_fallback(conn) -> tuple:
     """
     Returns (vix_value, source) or (None, 'unavailable').
     VIX=0 is treated as missing — never as a signal.
-    Fallback: ATM SPY ~30 DTE IV from Alpaca options chain.
+
+    Source priority:
+      1. master-directives.json vix field (written by master-strategist at session start)
+      2. VIXY daily close from Alpaca Data API (same proxy master-strategist uses)
     """
     try:
         directives = load_master_directives()
@@ -227,30 +230,29 @@ def fetch_vix_with_fallback(conn) -> tuple:
     except Exception:
         pass
 
+    # Fallback: VIXY latest daily bar from Alpaca Data API.
+    # The old SPY options IV proxy is not used — Alpaca paper trading does not
+    # populate implied_volatility on contracts reliably, causing 84 vix_degraded
+    # tickets per session.
     try:
-        today = date.today()
-        url = f"{ALPACA_BASE_URL}/v2/options/contracts"
+        start = (date.today() - timedelta(days=5)).isoformat()
+        url = f"{ALPACA_DATA_URL}/v2/stocks/bars"
         params = {
-            "underlying_symbols": "SPY",
-            "expiration_date_gte": (today + timedelta(days=25)).isoformat(),
-            "expiration_date_lte": (today + timedelta(days=35)).isoformat(),
-            "type": "call",
-            "limit": 10,
+            "symbols": "VIXY",
+            "timeframe": "1Day",
+            "start": start,
+            "adjustment": "raw",
         }
         resp = requests.get(url, headers=ALPACA_HEADERS, params=params, timeout=15)
         resp.raise_for_status()
-        contracts = resp.json().get("option_contracts", [])
-        if contracts:
-            price_url = f"{ALPACA_DATA_URL}/v2/stocks/SPY/trades/latest"
-            pr = requests.get(price_url, headers=ALPACA_HEADERS, timeout=10)
-            pr.raise_for_status()
-            spy_price = float(pr.json()["trade"]["p"])
-            atm = min(contracts, key=lambda c: abs(float(c.get("strike_price", 0)) - spy_price))
-            iv = float(atm.get("implied_volatility") or 0)
-            if iv > 0:
-                return iv * 100, "spy_iv_proxy"
+        bars = resp.json().get("bars", {}).get("VIXY", [])
+        if bars:
+            last_close = float(bars[-1].get("c") or 0)
+            if last_close > 0:
+                # VIXY is a VIX short-term futures ETF — close price approximates VIX
+                return last_close, "vixy_proxy"
     except Exception as exc:
-        logger.warning("VIX fallback computation failed: %s", exc)
+        logger.warning("VIX VIXY fallback failed: %s", exc)
 
     return None, "unavailable"
 
