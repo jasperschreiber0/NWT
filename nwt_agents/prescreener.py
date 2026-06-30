@@ -85,9 +85,10 @@ def build_haiku_prompt(survivors: list, symbols_data: dict, vix: float, regime: 
     symbol_lines = []
     for s in survivors:
         d = symbols_data[s]
+        iv_note = f"iv={d['iv']:.3f}({'options' if d.get('iv_source') == 'options' else 'histvol~' if d.get('iv_source') == 'histvol' else 'missing'})"
         symbol_lines.append(
             f"- {s}: price={d['price']}, momentum_5d={d['momentum_5d']:.3f}, "
-            f"rsi_14={d['rsi_14']:.1f}, atr_14={d['atr_14']:.2f}, iv={d['iv']:.3f}"
+            f"rsi_14={d['rsi_14']:.1f}, atr_14={d['atr_14']:.2f}, {iv_note}"
         )
 
     return f"""You are a trading pre-screener for an options strategy system.
@@ -100,11 +101,13 @@ Current market context:
 Symbols passing hard filters:
 {chr(10).join(symbol_lines)}
 
+IV notation: "options" = live implied volatility; "histvol~" = historical vol proxy (estimated); "missing" = no data.
+
 For each symbol, score the conviction for a directional options trade (0-10) based on:
 - Current regime alignment
 - Price momentum
 - RSI positioning (extremes = contrarian, mid = trend)
-- Implied volatility level
+- Implied volatility level (use histvol~ as reasonable estimate when live IV unavailable)
 - Overall setup quality
 
 Return ONLY valid JSON in this exact format (no markdown, no explanation):
@@ -122,7 +125,8 @@ Rules:
 - score >= 5: include in final list
 - score < 5: still include but with skip_reason explaining why
 - direction must be "long" or "short"
-- skip_reason is null if score >= 5"""
+- skip_reason is null if score >= 5
+- Do NOT score symbols with iv_source=missing below 5 solely because of missing IV — use momentum and regime"""
 
 
 def call_haiku(prompt: str) -> list:

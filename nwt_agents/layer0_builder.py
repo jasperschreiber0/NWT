@@ -39,7 +39,7 @@ ALPACA_HEADERS = {
 }
 
 SYMBOLS = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "VGK", "FXI", "KWEB", "MCHI"]
-OPTIONS_SYMBOLS = ["SPY", "QQQ"]
+OPTIONS_SYMBOLS = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA"]
 
 
 # ---------------------------------------------------------------------------
@@ -89,16 +89,18 @@ def fetch_options_snapshot(symbol: str) -> dict:
         if not contracts:
             return {"iv": 0.0, "put_call_ratio": 1.0, "iv_skew": 0.0}
 
-        # Compute average IV from contracts that have implied_volatility
+        # Compute average IV from contracts that have implied_volatility.
+        # Never fall back to close_price — contract dollar prices are not IV.
         ivs_call = []
         ivs_put = []
         for c in contracts:
-            iv = c.get("implied_volatility") or c.get("close_price")  # fallback
-            if iv is None:
+            raw_iv = c.get("implied_volatility")
+            if raw_iv is None:
                 continue
             try:
-                iv_float = float(iv)
-                if iv_float > 0:
+                iv_float = float(raw_iv)
+                # Sanity range: 1% to 300% annualised. Reject anything outside.
+                if 0.01 <= iv_float <= 3.0:
                     if c.get("type") == "call":
                         ivs_call.append(iv_float)
                     elif c.get("type") == "put":
@@ -186,6 +188,14 @@ def compute_momentum_5d(closes: list) -> float:
     return round((closes[-1] - closes[-6]) / closes[-6], 4)
 
 
+def compute_historical_vol(closes: list, period: int = 20) -> float:
+    """Annualised historical volatility from log returns — used as IV proxy when options data is absent."""
+    if len(closes) < period + 1:
+        return 0.0
+    log_returns = np.diff(np.log(np.array(closes[-(period + 1):], dtype=float)))
+    return round(float(np.std(log_returns) * np.sqrt(252)), 4)
+
+
 # ---------------------------------------------------------------------------
 # Earnings check via Nasdaq API
 # ---------------------------------------------------------------------------
@@ -260,9 +270,12 @@ def main() -> None:
     vix = fetch_vix()
     logger.info("VIX: %.2f", vix)
 
-    # Fetch options snapshots for SPY and QQQ
-    spy_snap = fetch_options_snapshot("SPY")
-    qqq_snap = fetch_options_snapshot("QQQ")
+    # Fetch options snapshots for all optionable symbols in our universe
+    options_snaps = {}
+    for sym in OPTIONS_SYMBOLS:
+        options_snaps[sym] = fetch_options_snapshot(sym)
+
+    spy_snap = options_snaps.get("SPY", {"iv": 0.0, "put_call_ratio": 1.0, "iv_skew": 0.0})
     put_call_ratio = spy_snap["put_call_ratio"]
     spy_iv_skew = spy_snap["iv_skew"]
 
@@ -282,6 +295,7 @@ def main() -> None:
                     "rsi_14": 50.0,
                     "atr_14": 0.0,
                     "iv": 0.0,
+                    "iv_source": "missing",
                     "earnings_within_5d": earnings_map.get(symbol, False),
                     "error": "insufficient_bars",
                 }
@@ -293,13 +307,16 @@ def main() -> None:
             rsi_14 = compute_rsi(closes)
             atr_14 = compute_atr(bars)
 
-            # IV: use options snapshot for SPY/QQQ, else 0
-            if symbol == "SPY":
-                iv = spy_snap["iv"]
-            elif symbol == "QQQ":
-                iv = qqq_snap["iv"]
+            # IV: live options snapshot first, then historical vol proxy.
+            # Historical vol is a reasonable estimate when options data is absent —
+            # it avoids symbols being scored blind by Haiku on iv=0.
+            snap_iv = options_snaps.get(symbol, {}).get("iv", 0.0)
+            if snap_iv > 0.0:
+                iv = snap_iv
+                iv_source = "options"
             else:
-                iv = 0.0  # Non-optionable in our universe for direct IV fetch
+                iv = compute_historical_vol(closes)
+                iv_source = "histvol"
 
             symbols_data[symbol] = {
                 "price": round(current_price, 4),
@@ -307,11 +324,12 @@ def main() -> None:
                 "rsi_14": rsi_14,
                 "atr_14": atr_14,
                 "iv": round(iv, 4),
+                "iv_source": iv_source,
                 "earnings_within_5d": earnings_map.get(symbol, False),
             }
             logger.info(
-                "%s: price=%.2f mom=%.3f rsi=%.1f atr=%.2f iv=%.3f earnings=%s",
-                symbol, current_price, momentum_5d, rsi_14, atr_14, iv,
+                "%s: price=%.2f mom=%.3f rsi=%.1f atr=%.2f iv=%.3f(%s) earnings=%s",
+                symbol, current_price, momentum_5d, rsi_14, atr_14, iv, iv_source,
                 earnings_map.get(symbol, False),
             )
         except Exception as exc:
@@ -322,6 +340,7 @@ def main() -> None:
                 "rsi_14": 50.0,
                 "atr_14": 0.0,
                 "iv": 0.0,
+                "iv_source": "missing",
                 "earnings_within_5d": False,
                 "error": str(exc),
             }
