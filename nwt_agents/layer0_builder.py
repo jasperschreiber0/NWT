@@ -30,8 +30,17 @@ logging.basicConfig(
 logger = logging.getLogger("layer0_builder")
 
 AGENTS_DIR = Path(os.environ.get("NWT_AGENTS_DIR", Path(__file__).parent))
-ALPACA_DATA_URL = os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-ALPACA_BASE_URL = os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+
+def _strip_alpaca_url(raw: str) -> str:
+    """Strip trailing slash and accidental /v2 suffix — a common .env misconfiguration
+    that turns every API call into /v2/v2/... and causes silent 404s on all data fetches."""
+    url = raw.rstrip("/")
+    if url.endswith("/v2"):
+        url = url[:-3]
+    return url
+
+ALPACA_DATA_URL = _strip_alpaca_url(os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets"))
+ALPACA_BASE_URL = _strip_alpaca_url(os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets"))
 
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID": os.environ["NWT_ALPACA_KEY_ID"],
@@ -264,6 +273,8 @@ def main() -> None:
         logger.warning("master-directives.json not found — proceeding without kill switch check")
         directives = {}
 
+    logger.info("Alpaca DATA URL: %s", ALPACA_DATA_URL)
+    logger.info("Alpaca BASE URL: %s", ALPACA_BASE_URL)
     logger.info("Fetching market data for %d symbols", len(SYMBOLS))
 
     # Fetch VIX

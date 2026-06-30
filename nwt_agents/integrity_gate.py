@@ -33,7 +33,10 @@ def _alpaca_headers() -> dict:
 
 
 def _alpaca_base() -> str:
-    return os.environ["NWT_ALPACA_BASE_URL"].rstrip("/")
+    url = os.environ["NWT_ALPACA_BASE_URL"].rstrip("/")
+    if url.endswith("/v2"):
+        url = url[:-3]
+    return url
 
 
 def _log_critical(message: str, payload: dict = None) -> None:

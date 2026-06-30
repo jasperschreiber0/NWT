@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS nwt_portfolio_ledger (
   exit_bid NUMERIC,             -- NBBO at exit
   exit_ask NUMERIC,
   realized_slippage NUMERIC,
+  exit_reason TEXT,
   status TEXT DEFAULT 'open',
   alpaca_order_id TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW()

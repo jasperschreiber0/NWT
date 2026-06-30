@@ -105,7 +105,9 @@ def check_tracks_ran(conn, today) -> tuple:
 
 
 def check_activity_logged(conn, today) -> tuple:
-    """Proposals OR inactivity rows. 'No edge present' is a valid green outcome."""
+    """Proposals OR inactivity tickets. 'No edge present' is a valid green outcome.
+    log_inactivity() writes to nwt_tickets (type='inactivity'), not nwt_inactivity_log,
+    so we query both sources to catch all logged activity."""
     proposals = _count(
         conn,
         """
@@ -115,7 +117,16 @@ def check_activity_logged(conn, today) -> tuple:
         """,
         (today,),
     )
-    inactivity = _count(
+    inactivity_tickets = _count(
+        conn,
+        """
+        SELECT COUNT(*) FROM nwt_tickets
+        WHERE type = 'inactivity'
+          AND (created_at AT TIME ZONE 'UTC')::date = %s
+        """,
+        (today,),
+    )
+    inactivity_log = _count(
         conn,
         """
         SELECT COUNT(*) FROM nwt_inactivity_log
@@ -123,7 +134,12 @@ def check_activity_logged(conn, today) -> tuple:
         """,
         (today,),
     )
-    return (proposals + inactivity) > 0, {"proposals": proposals, "inactivity_rows": inactivity}
+    total_inactivity = inactivity_tickets + inactivity_log
+    return (proposals + total_inactivity) > 0, {
+        "proposals": proposals,
+        "inactivity_tickets": inactivity_tickets,
+        "inactivity_rows": inactivity_log,
+    }
 
 
 def check_risk_agent_clear(conn, today) -> tuple:

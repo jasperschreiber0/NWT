@@ -251,7 +251,10 @@ _INACTIVITY_CLASS_MAP = {
 
 def log_inactivity(conn, strategy_id: str, track: str, reason: str, regime: dict) -> None:
     """
-    Log inactivity as a first-class typed ticket in nwt_tickets.
+    Log inactivity as a first-class typed ticket in nwt_tickets AND a row in
+    nwt_inactivity_log. Both are needed: nwt_tickets carries the full payload
+    (queried by cost_agent), nwt_inactivity_log is the lightweight table queried
+    by session_scorecard.check_activity_logged.
     signal_missed is assigned only by the Learning Agent — never self-reported.
     """
     inactivity_class = _INACTIVITY_CLASS_MAP.get(reason, "no_edge")
@@ -267,6 +270,19 @@ def log_inactivity(conn, strategy_id: str, track: str, reason: str, regime: dict
     except Exception as exc:
         log_system_event(conn, "WARNING", f"track_{track.lower()}",
                          f"log_inactivity ticket insert failed for {strategy_id}: {exc}", payload)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_inactivity_log (strategy_id, track, reason, regime_at_decision)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (strategy_id, track, reason, json.dumps(regime)),
+            )
+        conn.commit()
+    except Exception as exc:
+        log_system_event(conn, "WARNING", f"track_{track.lower()}",
+                         f"log_inactivity nwt_inactivity_log insert failed for {strategy_id}: {exc}")
 
 
 # ---------------------------------------------------------------------------
