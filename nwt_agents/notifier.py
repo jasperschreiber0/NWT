@@ -83,5 +83,35 @@ def send_daily_digest(
     _send(msg)
 
 
+def send_daily_digest_with_scorecard(
+    *,
+    trades_today: int,
+    pnl_today: float,
+    cost_today: float,
+    cost_per_trade: float | None,
+    inactivity_today: int,
+    approved_today: int,
+    vetoed_today: int,
+    no_trade_mode: bool,
+    open_positions: int,
+    session_green: bool,
+    failed_checks: list,
+) -> None:
+    """Combined daily digest + session scorecard. Sent at 21:15 UTC from session_scorecard."""
+    status = "🔴 HALTED" if no_trade_mode else "🟢 LIVE"
+    scorecard = "🟢 GREEN" if session_green else f"🔴 RED — {', '.join(failed_checks)}"
+    cpt = f"${cost_per_trade:.4f}" if cost_per_trade is not None else "n/a"
+    msg = (
+        f"📊 <b>NWT Daily Digest</b> — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n"
+        f"Status: {status}  |  Session: {scorecard}\n"
+        f"Trades closed: {trades_today}  |  PnL: ${pnl_today:+.2f}\n"
+        f"Risk: approved={approved_today}  vetoed={vetoed_today}  inactive={inactivity_today}\n"
+        f"Open positions: {open_positions}\n"
+        f"API cost: ${cost_today:.4f}  |  cost/trade: {cpt}\n"
+        f"{_ts()}"
+    )
+    _send(msg)
+
+
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")

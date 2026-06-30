@@ -221,6 +221,8 @@ def main() -> None:
         summary = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "date": date.today().isoformat(),
+            "no_trade_mode": trade_stats["no_trade_mode"],
+            "open_positions": trade_stats["open_positions"],
             "today": {
                 "tokens": today_tokens,
                 "estimated_cost_usd": today_costs,
@@ -263,22 +265,8 @@ def main() -> None:
             summary,
         )
 
-        # Daily digest to Telegram
-        try:
-            from notifier import send_daily_digest
-            send_daily_digest(
-                trades_today=trades_today,
-                pnl_today=trade_stats["pnl_today"],
-                cost_today=cost_today,
-                cost_per_trade=cost_per_trade,
-                inactivity_today=trade_stats["inactivity"],
-                approved_today=trade_stats["approved"],
-                vetoed_today=trade_stats["vetoed"],
-                no_trade_mode=trade_stats["no_trade_mode"],
-                open_positions=trade_stats["open_positions"],
-            )
-        except Exception as exc:
-            logger.warning("Telegram digest failed (non-fatal): %s", exc)
+        # Telegram digest is sent by session_scorecard.py at 21:15 UTC so it can
+        # include the green/red scorecard result alongside the cost/trade stats.
 
     finally:
         conn.close()

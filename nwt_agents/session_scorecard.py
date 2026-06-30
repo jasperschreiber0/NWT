@@ -13,6 +13,7 @@ activity: a day where every track logged NO_EDGE is a green day.
 
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,8 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 from shared_context import get_db, load_master_directives, log_system_event
+
+AGENTS_DIR = Path(os.environ.get("NWT_AGENTS_DIR", Path(__file__).parent))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -249,6 +252,30 @@ def main() -> None:
         )
         logger.info("Session %s scored %s%s", today, "GREEN" if green else "RED",
                     "" if green else f" — failed: {failed}")
+
+        # Send combined daily digest now that scorecard is ready.
+        # cost_summary.json is written by cost_agent.py at 21:00 UTC (15 min ago).
+        try:
+            from notifier import send_daily_digest_with_scorecard
+            cost_path = AGENTS_DIR / "cost_summary.json"
+            with open(cost_path) as f:
+                cost_data = json.load(f)
+            t = cost_data.get("today", {})
+            send_daily_digest_with_scorecard(
+                trades_today=t.get("trades_closed", 0),
+                pnl_today=float(t.get("pnl_today", 0)),
+                cost_today=float(t.get("estimated_cost_usd", {}).get("total_cost_usd", 0)),
+                cost_per_trade=t.get("cost_per_trade_usd"),
+                inactivity_today=t.get("inactivity_tickets", 0),
+                approved_today=t.get("risk_approved", 0),
+                vetoed_today=t.get("risk_vetoed", 0),
+                no_trade_mode=cost_data.get("no_trade_mode", False),
+                open_positions=cost_data.get("open_positions", 0),
+                session_green=green,
+                failed_checks=failed,
+            )
+        except Exception as exc:
+            logger.warning("Daily digest send failed (non-fatal): %s", exc)
 
     finally:
         conn.close()
