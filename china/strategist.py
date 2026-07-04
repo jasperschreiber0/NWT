@@ -36,7 +36,7 @@ SHARED_DIR = BOT_DIR.parent / "shared"
 CANDIDATES_FILE = SHARED_DIR / "china-candidates.json"
 DIRECTIVES_FILE = SHARED_DIR / "master-directives.json"
 
-load_dotenv(BOT_DIR / ".env")
+load_dotenv(BOT_DIR / ".env", override=True)
 
 logging.basicConfig(
     level=logging.INFO,
