@@ -142,6 +142,7 @@ def main() -> None:
             # China holding period is 1 day to 3 weeks — use gtc as default
             # so position can be managed over the hold window
             ticket_payload = {
+                "approved": True,  # directives gate (kill switch / status / sizing) already passed above
                 "bot": candidate["bot"],
                 "symbol": candidate["symbol"],
                 "direction": candidate["direction"],
