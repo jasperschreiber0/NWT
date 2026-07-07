@@ -257,33 +257,59 @@ def compute_exposure(positions: list[dict]) -> dict:
 
 def compute_drawdown(conn: psycopg2.extensions.connection) -> float:
     """
-    Compute maximum drawdown from nwt_trade_outcomes cumulative PnL.
-    Returns 0.0 if no trades yet (cold start).
-    Drawdown is expressed as a fraction (e.g. 0.08 = 8%).
+    Compute current drawdown from nwt_equity_curve (real account equity,
+    30-day rolling peak) — mirrors nwt_agents/risk_agent.py::get_current_drawdown().
+    Falls back to nwt_trade_outcomes cumulative pnl_adjusted only if the
+    equity curve has no rows yet (cold start).
+    Returns 0.0 if no data at all. Drawdown is expressed as a fraction
+    (e.g. 0.08 = 8%). Must NOT be computed as % of cumulative trade PnL —
+    with few trades that denominator is tiny and produces false kill-switch
+    triggers unrelated to real account risk.
     """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT equity FROM nwt_equity_curve ORDER BY date DESC LIMIT 30")
+            rows = cur.fetchall()
+    except Exception as exc:
+        logger.warning("Could not read nwt_equity_curve for drawdown: %s", exc)
+        rows = []
+
+    if rows:
+        equities = [float(r[0]) for r in rows]
+        equities.reverse()
+        peak = max(equities)
+        current = equities[-1]
+        max_dd = max(0.0, (peak - current) / peak) if peak > 0 else 0.0
+        logger.info(
+            "Drawdown (equity curve): peak=%.2f current=%.2f max_drawdown=%.4f (%.2f%%)",
+            peak, current, max_dd, max_dd * 100,
+        )
+        return round(max_dd, 6)
+
+    # Cold start fallback — equity curve not populated yet
     query = """
-        SELECT pnl, closed_at
+        SELECT COALESCE(pnl_adjusted, pnl) AS pnl, closed_at
         FROM nwt_trade_outcomes
-        WHERE pnl IS NOT NULL AND closed_at IS NOT NULL
+        WHERE closed_at IS NOT NULL AND COALESCE(pnl_adjusted, pnl) IS NOT NULL
         ORDER BY closed_at ASC
     """
     try:
         with conn.cursor() as cur:
             cur.execute(query)
-            rows = cur.fetchall()
+            trade_rows = cur.fetchall()
     except Exception as exc:
         logger.warning("Could not read nwt_trade_outcomes for drawdown: %s", exc)
         return 0.0
 
-    if not rows:
-        logger.info("Drawdown: no closed trades yet — drawdown=0.0 (cold start)")
+    if not trade_rows:
+        logger.info("Drawdown: no equity curve and no closed trades yet — drawdown=0.0 (cold start)")
         return 0.0
 
     cum_pnl = 0.0
     peak = 0.0
     max_dd = 0.0
 
-    for (pnl, _) in rows:
+    for (pnl, _) in trade_rows:
         if pnl is None:
             continue
         cum_pnl += float(pnl)
@@ -295,7 +321,7 @@ def compute_drawdown(conn: psycopg2.extensions.connection) -> float:
                 max_dd = dd
 
     logger.info(
-        "Drawdown: cumulative_pnl=%.2f peak=%.2f max_drawdown=%.4f (%.2f%%)",
+        "Drawdown (cold-start trade fallback): cumulative_pnl=%.2f peak=%.2f max_drawdown=%.4f (%.2f%%)",
         cum_pnl,
         peak,
         max_dd,

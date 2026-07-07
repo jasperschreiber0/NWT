@@ -150,6 +150,7 @@ def main() -> None:
             sized_notional = round(sized_notional, 2)
 
             ticket_payload = {
+                "approved": True,  # directives gate (kill switch / status / sizing) already passed above
                 "bot": candidate["bot"],
                 "symbol": candidate["symbol"],
                 "direction": candidate["direction"],
