@@ -83,5 +83,11 @@ def send_daily_digest(
     _send(msg)
 
 
+def send_triage_digest(text: str) -> None:
+    """Morning triage digest. Already formatted by triage_agent — sent as-is.
+    No-ops silently if Telegram is not configured."""
+    _send(text)
+
+
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")

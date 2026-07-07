@@ -41,6 +41,11 @@ NWT_DIR=/home/northworld/trading/nwt_agents
 # Session scorecard (green/red) — 21:15 UTC = 07:15 AEST Tue-Sat, after learning agent
 15 7 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 session_scorecard.py >> /var/log/nwt/scorecard.log 2>&1
 
+# Morning triage digest — 21:30 UTC = 07:30 AEST Tue-Sat, after the scorecard.
+# Read-only: classifies overnight errors benign vs escalate, dedups recurring
+# faults by signature, emits one digest (Postgres + notifier). No trade authority.
+30 7 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 triage_agent.py >> /var/log/nwt/triage.log 2>&1
+
 # Recon nightly — 23:00 UTC = 09:00 AEST Tue-Sat (after learning agent, before next session)
 0 9 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 recon_agent.py --nightly >> /var/log/nwt/recon.log 2>&1
 
