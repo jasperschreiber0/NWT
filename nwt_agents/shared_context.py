@@ -87,6 +87,22 @@ def get_strategy_genome(conn, strategy_id: str) -> dict:
     return dict(row)
 
 
+def get_active_strategy_ids(conn, track: str) -> list:
+    """
+    Active strategy_ids for a track, e.g. track='C' -> ['C1', 'C2', ...].
+    Replaces hardcoded range(1, 13) loops in track_c/d/e.py so deactivating
+    a strategy (decay retirement, strategy focus migrations) doesn't produce
+    spurious genome_missing faults for strategies that were deliberately
+    turned off.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT strategy_id FROM nwt_strategy_genome WHERE track = %s AND active = TRUE ORDER BY strategy_id",
+            (track,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
 # ---------------------------------------------------------------------------
 # Sizing
 # ---------------------------------------------------------------------------
@@ -267,6 +283,65 @@ def log_inactivity(conn, strategy_id: str, track: str, reason: str, regime: dict
     except Exception as exc:
         log_system_event(conn, "WARNING", f"track_{track.lower()}",
                          f"log_inactivity ticket insert failed for {strategy_id}: {exc}", payload)
+
+
+# ---------------------------------------------------------------------------
+# Shadow candidate logging — nwt_decision_inputs
+# Every strategy eligible to propose a trade gets logged here, win or lose
+# the archetype-consolidation pick, so the Learning Agent can eventually
+# score signal quality on candidates that never got a real ticket. This is
+# separate from log_inactivity: log_inactivity is the operational ticket
+# audit trail; nwt_decision_inputs is the analytical dataset shadow_decision_
+# evaluator.py later fills in with would_have_won / shadow_pnl_pct.
+# ---------------------------------------------------------------------------
+
+def log_decision_input(
+    conn,
+    run_date,
+    symbol: str,
+    strategy_id: str,
+    track: str,
+    regime: dict,
+    conviction_score: float,
+    archetype: str,
+    is_winner: bool,
+    decision: str,
+    direction: str = None,
+    rejection_reason: str = None,
+    entry_price_ref: float = None,
+    target_pct: float = None,
+    stop_pct: float = None,
+    dte_target: int = None,
+    ticket_id: str = None,
+) -> None:
+    """
+    INSERT one row into nwt_decision_inputs for a candidate that was eligible
+    to trade this run (matched regime + asset_universe + entry_threshold),
+    whether or not it was the archetype winner. entry_price_ref/target_pct/
+    stop_pct/dte_target are required for shadow_decision_evaluator.py to
+    later compute would_have_won; leave them None if unavailable (e.g. no
+    layer0 price data) rather than guessing.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_decision_inputs
+                    (run_date, symbol, strategy_id, track, regime, conviction_score,
+                     archetype, is_winner, decision, direction, rejection_reason,
+                     entry_price_ref, target_pct, stop_pct, dte_target, ticket_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    run_date, symbol, strategy_id, track, json.dumps(regime), conviction_score,
+                    archetype, is_winner, decision, direction, rejection_reason,
+                    entry_price_ref, target_pct, stop_pct, dte_target, ticket_id,
+                ),
+            )
+        conn.commit()
+    except Exception as exc:
+        log_system_event(conn, "WARNING", f"track_{track.lower()}",
+                         f"log_decision_input insert failed for {strategy_id}: {exc}")
 
 
 # ---------------------------------------------------------------------------

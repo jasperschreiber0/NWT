@@ -26,12 +26,14 @@ import integrity_gate
 from shared_context import (
     check_no_trade_mode,
     compute_final_sizing,
+    get_active_strategy_ids,
     get_db,
     get_strategy_genome,
     insert_ticket,
     load_conviction_tickets,
     load_layer0_data,
     load_master_directives,
+    log_decision_input,
     log_inactivity,
     log_system_event,
 )
@@ -171,31 +173,33 @@ def main() -> None:
             logger.error("master-directives.json not found — exiting")
             sys.exit(1)
 
+        active_strategy_ids = get_active_strategy_ids(conn, "E")
+
         halted, halt_reason = check_no_trade_mode(conn)
         if halted:
             logger.warning("no_trade_mode SET — Track E exiting: %s", halt_reason)
             regime = directives.get("regime", {})
-            for i in range(1, 13):
-                log_inactivity(conn, f"E{i}", "E", "NO_TRADE_MODE", regime)
+            for strategy_id in active_strategy_ids:
+                log_inactivity(conn, strategy_id, "E", "NO_TRADE_MODE", regime)
             log_system_event(conn, "WARNING", "track_e", f"no_trade_mode — all E strategies inactive: {halt_reason}")
             return
 
         if directives.get("global_kill_switch", False):
             logger.warning("Global kill switch active — Track E exiting")
             regime = directives.get("regime", {})
-            for i in range(1, 13):
-                log_inactivity(conn, f"E{i}", "E", "GLOBAL_KILL_SWITCH", regime)
+            for strategy_id in active_strategy_ids:
+                log_inactivity(conn, strategy_id, "E", "GLOBAL_KILL_SWITCH", regime)
             log_system_event(conn, "WARNING", "track_e", "Kill switch active — all E strategies inactive")
             return
 
         regime = directives.get("regime", {})
         conviction_tickets = load_conviction_tickets()
         layer0 = load_layer0_data()
+        run_date = datetime.now(timezone.utc).date()
 
         proposals_submitted = 0
 
-        for i in range(1, 13):
-            strategy_id = f"E{i}"
+        for strategy_id in active_strategy_ids:
 
             try:
                 genome = get_strategy_genome(conn, strategy_id)
@@ -234,14 +238,29 @@ def main() -> None:
             base_notional = ACCOUNT_SIZE * TRADE_PCT
             sized_notional = compute_final_sizing(directives, base_notional, "us")
 
+            dte_target = best_ticket.get("dte_target", genome.get("dte_min", 14))
+            dte_target = max(genome["dte_min"], min(genome["dte_max"], dte_target))
+            entry_price_ref = layer0.get("symbols", {}).get(symbol, {}).get("price") or None
+            shadow_fields = {
+                "direction": best_ticket.get("direction", "long"),
+                "entry_price_ref": entry_price_ref,
+                "target_pct": float(genome["profit_target_pct"]),
+                "stop_pct": -abs(float(genome["stop_loss_pct"])),
+                "dte_target": dte_target,
+            }
+
             if sized_notional <= 0:
                 logger.info("%s: sized_notional=0", strategy_id)
                 log_inactivity(conn, strategy_id, "E", "ZERO_SIZING", regime)
+                log_decision_input(
+                    conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
+                    track="E", regime=regime, conviction_score=best_ticket.get("conviction_score", 0),
+                    archetype=genome.get("archetype") or strategy_id, is_winner=True,
+                    decision="REJECTED_TRACK", rejection_reason="ZERO_SIZING", **shadow_fields,
+                )
                 continue
 
             sq = best_ticket.get("signal_quality", {})
-            dte_target = best_ticket.get("dte_target", genome.get("dte_min", 14))
-            dte_target = max(genome["dte_min"], min(genome["dte_max"], dte_target))
 
             proposal = {
                 "from_track": "E",
@@ -290,6 +309,12 @@ def main() -> None:
                     strategy_id, ticket_id, symbol, quant_edge["edge_magnitude"],
                 )
                 proposals_submitted += 1
+                log_decision_input(
+                    conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
+                    track="E", regime=regime, conviction_score=best_ticket.get("conviction_score", 0),
+                    archetype=genome.get("archetype") or strategy_id, is_winner=True,
+                    decision="TRADE_PROPOSED", ticket_id=ticket_id, **shadow_fields,
+                )
             except Exception as exc:
                 logger.error("%s: failed to insert ticket: %s", strategy_id, exc)
                 log_system_event(conn, "ERROR", "track_e", f"{strategy_id} ticket insert failed: {exc}")

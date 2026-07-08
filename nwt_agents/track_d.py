@@ -22,11 +22,14 @@ import integrity_gate
 from shared_context import (
     check_no_trade_mode,
     compute_final_sizing,
+    get_active_strategy_ids,
     get_db,
     get_strategy_genome,
     insert_ticket,
     load_conviction_tickets,
+    load_layer0_data,
     load_master_directives,
+    log_decision_input,
     log_inactivity,
     log_system_event,
 )
@@ -94,32 +97,35 @@ def main() -> None:
             logger.error("master-directives.json not found — exiting")
             sys.exit(1)
 
+        active_strategy_ids = get_active_strategy_ids(conn, "D")
+
         halted, halt_reason = check_no_trade_mode(conn)
         if halted:
             logger.warning("no_trade_mode SET — Track D exiting: %s", halt_reason)
             regime = directives.get("regime", {})
-            for i in range(1, 13):
-                log_inactivity(conn, f"D{i}", "D", "NO_TRADE_MODE", regime)
+            for strategy_id in active_strategy_ids:
+                log_inactivity(conn, strategy_id, "D", "NO_TRADE_MODE", regime)
             log_system_event(conn, "WARNING", "track_d", f"no_trade_mode — all D strategies inactive: {halt_reason}")
             return
 
         if directives.get("global_kill_switch", False):
             logger.warning("Global kill switch active — Track D exiting")
             regime = directives.get("regime", {})
-            for i in range(1, 13):
-                log_inactivity(conn, f"D{i}", "D", "GLOBAL_KILL_SWITCH", regime)
+            for strategy_id in active_strategy_ids:
+                log_inactivity(conn, strategy_id, "D", "GLOBAL_KILL_SWITCH", regime)
             log_system_event(conn, "WARNING", "track_d", "Kill switch active — all D strategies inactive")
             return
 
         regime = directives.get("regime", {})
         conviction_tickets = load_conviction_tickets()
+        layer0 = load_layer0_data()
+        run_date = datetime.now(timezone.utc).date()
 
         proposals_submitted = 0
 
         # Pass 1 — each strategy finds its best conviction match
         candidates = []  # (strategy_id, genome, best_ticket)
-        for i in range(1, 13):
-            strategy_id = f"D{i}"
+        for strategy_id in active_strategy_ids:
 
             try:
                 genome = get_strategy_genome(conn, strategy_id)
@@ -154,7 +160,9 @@ def main() -> None:
             candidates.append((strategy_id, genome, best_ticket))
 
         # Pass 2 — consolidate: at most ONE proposal per archetype per day
-        # (same rationale as Track C — pool thin samples, drop correlated dupes)
+        # (same rationale as Track C — pool thin samples, drop correlated dupes).
+        # Every eligible candidate still logged to nwt_decision_inputs for
+        # shadow attribution, win or lose the archetype pick.
         winners = {}  # archetype -> (strategy_id, genome, ticket)
         for strategy_id, genome, ticket in candidates:
             arch = genome.get("archetype") or strategy_id
@@ -164,28 +172,57 @@ def main() -> None:
             ):
                 winners[arch] = (strategy_id, genome, ticket)
 
-        for strategy_id, genome, _ in candidates:
+        def _shadow_fields(genome: dict, ticket: dict) -> dict:
+            symbol = ticket.get("symbol")
+            entry_price_ref = layer0.get("symbols", {}).get(symbol, {}).get("price") or None
+            # Track D: prefer longer DTE (21-45 from genome)
+            dte_target = ticket.get("dte_target", genome.get("dte_max", 45))
+            dte_target = max(genome["dte_min"], min(genome["dte_max"], dte_target))
+            return {
+                "direction": ticket.get("direction", "long"),
+                "entry_price_ref": entry_price_ref,
+                "target_pct": float(genome["profit_target_pct"]),
+                "stop_pct": -abs(float(genome["stop_loss_pct"])),
+                "dte_target": dte_target,
+            }
+
+        for strategy_id, genome, ticket in candidates:
             arch = genome.get("archetype") or strategy_id
             if winners[arch][0] != strategy_id:
                 logger.info("%s: consolidated into archetype %s (lower conviction)", strategy_id, arch)
                 log_inactivity(conn, strategy_id, "D", "ARCHETYPE_CONSOLIDATED", regime)
+                winner_id, _, winner_ticket = winners[arch]
+                log_decision_input(
+                    conn, run_date=run_date, symbol=ticket.get("symbol"), strategy_id=strategy_id,
+                    track="D", regime=regime, conviction_score=ticket.get("conviction_score", 0),
+                    archetype=arch, is_winner=False, decision="REJECTED_TRACK",
+                    rejection_reason=(
+                        f"ARCHETYPE_CONSOLIDATED: conviction {ticket.get('conviction_score', 0)} "
+                        f"< winner {winner_id} conviction {winner_ticket.get('conviction_score', 0)}"
+                    ),
+                    **_shadow_fields(genome, ticket),
+                )
 
         for archetype, (strategy_id, genome, best_ticket) in winners.items():
             base_notional = ACCOUNT_SIZE * TRADE_PCT
             sized_notional = compute_final_sizing(directives, base_notional, "us")
+            shadow_fields = _shadow_fields(genome, best_ticket)
 
             if sized_notional <= 0:
                 logger.info("%s: sized_notional=0 — bot paused", strategy_id)
                 log_inactivity(conn, strategy_id, "D", "ZERO_SIZING", regime)
+                log_decision_input(
+                    conn, run_date=run_date, symbol=best_ticket.get("symbol"), strategy_id=strategy_id,
+                    track="D", regime=regime, conviction_score=best_ticket.get("conviction_score", 0),
+                    archetype=archetype, is_winner=True, decision="REJECTED_TRACK",
+                    rejection_reason="ZERO_SIZING", **shadow_fields,
+                )
                 continue
 
             symbol = best_ticket["symbol"]
             sq = best_ticket.get("signal_quality", {})
 
-            # Track D: prefer longer DTE (21-45 from genome)
-            dte_target = best_ticket.get("dte_target", genome.get("dte_max", 45))
-            # Clamp to genome range
-            dte_target = max(genome["dte_min"], min(genome["dte_max"], dte_target))
+            dte_target = shadow_fields["dte_target"]
 
             proposal = {
                 "from_track": "D",
@@ -222,6 +259,12 @@ def main() -> None:
                 )
                 logger.info("%s: submitted proposal ticket %s for %s", strategy_id, ticket_id, symbol)
                 proposals_submitted += 1
+                log_decision_input(
+                    conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
+                    track="D", regime=regime, conviction_score=best_ticket.get("conviction_score", 0),
+                    archetype=archetype, is_winner=True, decision="TRADE_PROPOSED",
+                    ticket_id=ticket_id, **shadow_fields,
+                )
             except Exception as exc:
                 logger.error("%s: failed to insert ticket: %s", strategy_id, exc)
                 log_system_event(conn, "ERROR", "track_d", f"{strategy_id} ticket insert failed: {exc}")
