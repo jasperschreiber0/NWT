@@ -41,6 +41,11 @@ NWT_DIR=/home/northworld/trading/nwt_agents
 # Session scorecard (green/red) — 21:15 UTC = 07:15 AEST Tue-Sat, after learning agent
 15 7 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 session_scorecard.py >> /var/log/nwt/scorecard.log 2>&1
 
+# Shadow decision evaluator — 21:20 UTC = 07:20 AEST Tue-Sat, after scorecard
+# Fills in would_have_won/shadow_pnl_pct for archetype-consolidated and
+# zero-sized candidates whose dte_target window has elapsed.
+20 7 * * 2-6 cd $NWT_DIR && set -a && source .env && set +a && python3 shadow_decision_evaluator.py >> /var/log/nwt/shadow_eval.log 2>&1
+
 # Morning triage digest — 21:30 UTC = 07:30 AEST Tue-Sat, after the scorecard.
 # Read-only: classifies overnight errors benign vs escalate, dedups recurring
 # faults by signature, emits one digest (Postgres + notifier). No trade authority.
