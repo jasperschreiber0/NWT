@@ -14,7 +14,7 @@ activity: a day where every track logged NO_EDGE is a green day.
 import json
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -62,12 +62,19 @@ def check_integrity_gate(conn, today) -> tuple:
 
 
 def check_directives_fresh(today) -> tuple:
+    """Portfolio Brain (master-strategist) fires at 21:30 UTC, which is AFTER
+    this scorecard's own 21:15 UTC run. So the directives file in force for
+    today's session was written at 21:30 UTC yesterday and is dated yesterday
+    — comparing it against today's date is always False and pins the
+    scorecard RED forever. Accept yesterday's date (the steady-state case)
+    or today's (in case this check runs late relative to master)."""
     try:
         directives = load_master_directives()
     except FileNotFoundError:
         return False, {"directives_date": None}
     d = directives.get("date")
-    return d == today.isoformat(), {"directives_date": d}
+    expected = (today - timedelta(days=1)).isoformat()
+    return d in (expected, today.isoformat()), {"directives_date": d, "expected": expected}
 
 
 def check_conviction_ran(conn, today) -> tuple:
