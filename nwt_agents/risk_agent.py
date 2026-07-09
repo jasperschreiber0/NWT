@@ -188,7 +188,14 @@ def get_average_slippage(conn) -> float:
             """
         )
         row = cur.fetchone()
-    return float(row[0]) if row and row[0] is not None else 0.001
+    # No fills in the last 7 days = no real baseline yet. Returning 0 (not a
+    # placeholder like 0.001) is deliberate: Rules 3/10 below gate on
+    # `baseline_slippage > 0` to skip the check until real data exists. A
+    # nonzero placeholder here silently substitutes for a genuine baseline,
+    # and the first real options fill (routinely 0.2-0.5%+ slippage) trips
+    # a false "spread widening" veto — which then prevents the fill that
+    # would have supplied real data, deadlocking the system at zero trades.
+    return float(row[0]) if row and row[0] is not None else 0.0
 
 
 def get_recent_slippage(conn) -> float:
