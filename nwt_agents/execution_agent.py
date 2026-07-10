@@ -388,8 +388,15 @@ def main() -> None:
                 continue
 
             option_symbol = contract["option_symbol"]
-            # Estimate qty (default 1 contract if we can't get option price)
-            qty = max(int(sized_notional / (200)), 1)  # Conservative: assume ~$2/share = $200/contract
+            option_price = _get_option_price(option_symbol)
+            if option_price and option_price > 0:
+                qty = compute_qty_from_notional(sized_notional, option_price)
+            else:
+                logger.warning(
+                    "Ticket %s: could not fetch live price for %s — falling back to "
+                    "conservative $200/contract estimate", ticket_id, option_symbol,
+                )
+                qty = max(int(sized_notional / 200), 1)
 
             # Build execution payload for the Execution Engine
             execution_payload = {

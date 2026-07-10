@@ -776,6 +776,9 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
                          {"ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id})
         return
 
+    filled_qty_str = filled_order.get("filled_qty")
+    filled_qty = float(filled_qty_str) if filled_qty_str else float(payload.get("qty", 1))
+
     slippage = (abs(fill_price - expected_price) / expected_price
                 if expected_price and expected_price > 0 else 0.0)
 
@@ -791,6 +794,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         "direction": direction,
         "delta_exposure": delta_exposure,
         "notional_risk": sized_notional,
+        "qty": filled_qty,
         "entry_price": fill_price,
         "entry_time": datetime.now(timezone.utc),
         "entry_bid": entry_bid,

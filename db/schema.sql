@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS nwt_portfolio_ledger (
   direction TEXT,
   delta_exposure NUMERIC,
   notional_risk NUMERIC,
+  qty NUMERIC,                  -- actual filled contract/share qty from Alpaca — NOT inferred from row count
   entry_price NUMERIC,
   entry_time TIMESTAMPTZ,
   entry_bid NUMERIC,            -- NBBO at entry — feeds pnl_adjusted haircut
