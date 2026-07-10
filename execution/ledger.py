@@ -23,17 +23,21 @@ def insert_position(conn, data: dict) -> str:
     Required keys in data:
         bot_source, asset, asset_type
     Optional keys:
-        strategy_id, direction, delta_exposure, notional_risk, entry_price,
+        strategy_id, direction, delta_exposure, notional_risk, qty, entry_price,
         entry_time, entry_bid, entry_ask, alpaca_order_id
+
+    qty is the actual filled contract/share count from Alpaca — recon_agent.py
+    sums it per symbol to reconcile against Alpaca's live position, so it must
+    reflect the real fill, not row count or a pre-fill estimate.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO nwt_portfolio_ledger
                 (bot_source, strategy_id, asset, asset_type, direction, delta_exposure,
-                 notional_risk, entry_price, entry_time, entry_bid, entry_ask,
+                 notional_risk, qty, entry_price, entry_time, entry_bid, entry_ask,
                  alpaca_order_id, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
             RETURNING position_id
             """,
             (
@@ -44,6 +48,7 @@ def insert_position(conn, data: dict) -> str:
                 data.get("direction"),
                 data.get("delta_exposure"),
                 data.get("notional_risk"),
+                data.get("qty"),
                 data.get("entry_price"),
                 data.get("entry_time", datetime.now(timezone.utc)),
                 data.get("entry_bid"),

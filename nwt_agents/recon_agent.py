@@ -14,6 +14,8 @@ Logic:
   4. Classify mismatches:
      - in_alpaca_not_ledger → CRITICAL: set no_trade_mode, exit 1
      - qty_mismatch         → CRITICAL: set no_trade_mode, exit 1
+                               (options only — compares Alpaca qty against the
+                               SUM of real filled qty per ledger row, not row count)
      - in_ledger_not_alpaca → mark suspect, non-critical, exit 1
 
 Clean recon writes type='recon_ok'. Absence of recon is itself detectable.
@@ -136,18 +138,22 @@ def run_recon(conn, mode: str) -> bool:
                 conn.commit()
 
     # 3: Qty mismatch → CRITICAL
+    # Compares Alpaca's live qty against the SUM of real filled qty recorded
+    # per ledger row (nwt_portfolio_ledger.qty, populated from the Alpaca fill
+    # at order time) — not row count. A single order can fill more than one
+    # contract, so "1 row = 1 contract" does not hold.
     for sym in set(alpaca_map) & set(ledger_map):
-        alpaca_qty = alpaca_map[sym]["qty"]
-        ledger_count = len(ledger_map[sym])
-        # For options each contract is one ledger row; for equity check notional count
         asset_type = ledger_map[sym][0].get("asset_type", "equity")
-        if asset_type == "option":
-            if abs(alpaca_qty - ledger_count) > 0.5:
-                entry = {"class": "qty_mismatch", "symbol": sym,
-                         "alpaca_qty": alpaca_qty, "ledger_rows": ledger_count}
-                logger.error("CRITICAL qty mismatch: %s alpaca=%.0f ledger=%d", sym, alpaca_qty, ledger_count)
-                mismatches.append(entry)
-                critical = True
+        if asset_type != "option":
+            continue
+        alpaca_qty = alpaca_map[sym]["qty"]
+        ledger_qty = sum(float(row.get("qty") or 0) for row in ledger_map[sym])
+        if abs(alpaca_qty - ledger_qty) > 0.5:
+            entry = {"class": "qty_mismatch", "symbol": sym,
+                     "alpaca_qty": alpaca_qty, "ledger_qty": ledger_qty}
+            logger.error("CRITICAL qty mismatch: %s alpaca=%.0f ledger=%.0f", sym, alpaca_qty, ledger_qty)
+            mismatches.append(entry)
+            critical = True
 
     if not mismatches:
         insert_ticket(conn, "RECON_AGENT", "SYSTEM", "recon_ok", {
