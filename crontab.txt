@@ -26,8 +26,14 @@ NWT_DIR=/home/northworld/trading/nwt_agents
 # Risk agent every 5 min, 13:00-20:00 UTC Mon-Fri
 */5 13-20 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 risk_agent.py >> /var/log/nwt/risk.log 2>&1
 
-# Execution agent every 5 min, 13:00-19:00 UTC Mon-Fri
-*/5 13-19 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 execution_agent.py >> /var/log/nwt/execution.log 2>&1
+# Execution agent every 5 min, 13:00-20:00 UTC Mon-Fri.
+# NOTE: was 13:00-19:00 — that window ends BEFORE the DST-aware 15:45 ET hard
+# close in winter (20:45 UTC in EST), so this agent's own options position
+# monitor (monitor_options_positions) couldn't reach the winter hard-close
+# time at all; coverage in that gap relied entirely on risk_agent.py's
+# independent force_close_past_hard_close path. Widened to match risk_agent
+# and execution_engine's own windows.
+*/5 13-20 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 execution_agent.py >> /var/log/nwt/execution.log 2>&1
 
 # Execution engine every 5 min, 13:00-20:00 UTC Mon-Fri
 */5 13-20 * * 1-5 cd /home/northworld/trading/execution && set -a && source .env && set +a && python3 engine.py >> /var/log/nwt/execution_engine.log 2>&1

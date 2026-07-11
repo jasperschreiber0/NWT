@@ -216,23 +216,39 @@ def track_f_pending(_: None = Depends(require_auth)):
         conn.close()
 
 
+def _track_f_update(sql: str, theme: str) -> dict:
+    """
+    Track F has no production scanner yet — nwt_emerging_themes does not
+    exist in any schema/migration file. Rather than a raw 500 (UndefinedTable)
+    when someone clicks Approve/Reject on the dashboard's "not yet deployed"
+    tab, return a clear, typed error the frontend can show.
+    """
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (theme,))
+        conn.commit()
+        return {"ok": True, "theme": theme}
+    except psycopg2.errors.UndefinedTable:
+        conn.rollback()
+        raise HTTPException(
+            status_code=501,
+            detail="Track F is not deployed yet — nwt_emerging_themes does not exist.",
+        )
+    finally:
+        conn.close()
+
+
 @app.post("/api/track-f/approve")
 async def track_f_approve(request: Request, _: None = Depends(require_auth)):
     body  = await request.json()
     theme = body.get("candidate_theme")
     if not theme:
         raise HTTPException(status_code=400, detail="candidate_theme required")
-    conn = db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE nwt_emerging_themes SET status='approved', approved_at=NOW() WHERE candidate_theme=%s AND status='pending'",
-                (theme,)
-            )
-        conn.commit()
-        return {"ok": True, "theme": theme}
-    finally:
-        conn.close()
+    return _track_f_update(
+        "UPDATE nwt_emerging_themes SET status='approved', approved_at=NOW() WHERE candidate_theme=%s AND status='pending'",
+        theme,
+    )
 
 
 @app.post("/api/track-f/reject")
@@ -241,17 +257,10 @@ async def track_f_reject(request: Request, _: None = Depends(require_auth)):
     theme = body.get("candidate_theme")
     if not theme:
         raise HTTPException(status_code=400, detail="candidate_theme required")
-    conn = db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE nwt_emerging_themes SET status='rejected' WHERE candidate_theme=%s AND status='pending'",
-                (theme,)
-            )
-        conn.commit()
-        return {"ok": True, "theme": theme}
-    finally:
-        conn.close()
+    return _track_f_update(
+        "UPDATE nwt_emerging_themes SET status='rejected' WHERE candidate_theme=%s AND status='pending'",
+        theme,
+    )
 
 
 @app.get("/api/track-f/candidates")

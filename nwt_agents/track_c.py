@@ -34,6 +34,7 @@ from shared_context import (
     log_decision_input,
     log_inactivity,
     log_system_event,
+    regime_matches,
 )
 
 logging.basicConfig(
@@ -45,16 +46,6 @@ logger = logging.getLogger("track_c")
 
 ACCOUNT_SIZE = 97_000.0  # ~$97k equity
 TRADE_PCT = 0.02         # 2% per trade
-
-
-def regime_matches(genome_regime: str, current_regime: dict) -> bool:
-    """Check if genome's regime string matches the current primary or secondary regime."""
-    primary = current_regime.get("primary_regime", "").lower()
-    secondary = (current_regime.get("secondary_regime") or "").lower()
-    genome_r = (genome_regime or "").lower()
-    if genome_r in ("any", "", "all"):
-        return True
-    return genome_r == primary or genome_r == secondary
 
 
 def find_best_ticket(conviction_tickets: list, genome: dict, current_regime: dict) -> dict | None:

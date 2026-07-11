@@ -8,24 +8,27 @@
 
 ## Current Status
 
+> **NOTE** Rows below marked *(repo)* describe what's in this repository and can be verified by reading it. Rows marked *(server)* describe live infrastructure state this repo cannot see — re-verify those with the Session Startup Checklist below before trusting them; they were last confirmed on the date shown and may be stale.
+
 | Check | Status | Date |
 |---|---|---|
-| VPS online | Intact | 2026-05-18 |
-| Alpaca keys | Same (PA3844MEHFIO) | 2026-05-18 |
-| Anthropic API key | Rotated (new key) | 2026-05-18 |
-| Discord webhook | Dead — not being replaced yet | 2026-05-18 |
-| Postgres nwt_agents DB | Wiped | 2026-05-18 |
-| /home/northworld/trading/ | Wiped — full rebuild in progress | 2026-05-18 |
-| PM2 stack | Not yet deployed | 2026-05-18 |
-| nwt_agents cron | Not yet deployed | 2026-05-18 |
-| Phase 0 schema migration | Pending deploy | 2026-06-10 |
-| recon_agent.py | Built | 2026-06-10 |
-| no_trade_mode wiring | Built | 2026-06-10 |
-| Heartbeat (engine↔risk) | Built | 2026-06-10 |
-| Directional cap (60%) | Built | 2026-06-10 |
-| Exit lifecycle (equity monitor + options close) | Built | 2026-06-10 |
-| Inactivity ticket taxonomy | Built | 2026-06-10 |
-| Server hardening | Pending | 2026-06-10 |
+| VPS online *(server)* | Last confirmed intact | 2026-05-18 |
+| Alpaca keys *(server)* | Last confirmed same (PA3844MEHFIO) | 2026-05-18 |
+| Anthropic API key *(server)* | Last rotated | 2026-05-18 |
+| Discord webhook | Dead, not replaced — Telegram (`nwt_agents/notifier.py`) is the live alerting channel instead | 2026-07-11 |
+| Postgres nwt_agents DB *(server)* | Last confirmed state: wiped for rebuild | 2026-05-18 |
+| PM2 stack *(repo)* | `ecosystem.config.cjs` defines all Track A bots + dashboard, `time_zone: 'UTC'` explicit on every app | 2026-07-11 |
+| nwt_agents cron *(repo)* | `crontab.txt` defines the full conviction stack + risk/execution/learning/recon schedule, `SHELL=/bin/bash` first line, confirmed UTC | 2026-07-11 |
+| db/schema.sql + migrate_*.sql *(repo)* | Present; apply in filename/date order — schema.sql alone is the Day-1 baseline only | 2026-07-11 |
+| recon_agent.py *(repo)* | Built; `--gate` now auto-runs cold-start import first; `--clear-if-clean` added for human-acknowledged recovery | 2026-07-11 |
+| no_trade_mode wiring *(repo)* | Built; `clear_no_trade_mode()` now reachable via `recon_agent.py --clear-if-clean` | 2026-07-11 |
+| Heartbeat (engine↔risk) *(repo)* | Built, end-to-end wired (`execution/engine.py` writes, `risk_agent.py`/`integrity_gate.py` read) | 2026-07-11 |
+| Directional cap (60%) *(repo)* | Built in `execution/engine.py` (`DIRECTIONAL_CAP_PCT`); distinct from `master/strategist.py`'s `PER_BOT_WEIGHT_CEILING` (0.65) — see Stack 3 | 2026-07-11 |
+| Risk Agent sizing-reduction rules (3, 7) *(repo)* | Built — `sizing_multiplier` on `nwt_ticket_decisions`, applied by `execution_agent.py`; used to only log a warning | 2026-07-11 |
+| Exit lifecycle (equity monitor + options close) *(repo)* | Built; equity monitor now prefers the ticket's own `stop_pct`/`target_pct` (persisted on the ledger row) over genome/hardcoded defaults | 2026-07-11 |
+| Inactivity ticket taxonomy *(repo)* | Built; session scorecard now counts both Track A's `nwt_inactivity_log` and Track C/D/E's `nwt_tickets(type='inactivity')` | 2026-07-11 |
+| Same-regime 5+ sessions rule *(repo)* | Built — `nwt_regime_history` + `regime_classifier.py`'s session-persistence check | 2026-07-11 |
+| Server hardening *(server)* | Not verified in this pass — re-run the deploy steps in Server Hardening below and confirm with `sshd -T` | 2026-05-18 |
 
 ---
 
@@ -86,7 +89,7 @@ This system is a **learning and attribution engine first**, trading engine secon
 | Shared dir | /home/northworld/trading/shared/ |
 | Entity | Builda AI ABN 41 615 978 808 |
 | Broker | Alpaca Paper — PA3844MEHFIO (~$97k equity, ~$83k options BP) |
-| Alerting | Postgres logging only (Discord dead until further notice) |
+| Alerting | Postgres logging (all agents) + Telegram (`nwt_agents/notifier.py` — kill switch, no_trade_mode, heartbeat loss, recon critical, daily digest). Discord dead, not replaced by Discord. |
 
 ---
 
@@ -178,6 +181,8 @@ Process manager: PM2 — all processes must be in this file to survive reboot.
 
 ### PM2 Schedule (UTC)
 
+> **NOTE** Server timezone is confirmed UTC via `timedatectl` (see `crontab.txt`'s own header comment). `ecosystem.config.cjs` sets `time_zone: 'UTC'` explicitly on every app so this can't silently drift again — this file previously assumed AEST (UTC+10) for PM2's `cron_restart` while `crontab.txt` used literal UTC for the same server, meaning every job below could have been firing ~10 hours off depending on which assumption was actually correct. If in doubt, re-verify with `timedatectl` before trusting either file.
+
 | PM2 Name | Schedule (UTC) | Path |
 |---|---|---|
 | master-strategist | 21:30 (after US close) | master/ |
@@ -188,10 +193,9 @@ Process manager: PM2 — all processes must be in this file to survive reboot.
 | us-nightly | 10:30 | us/ |
 | us-trader | 18:05 (14:05 ET ORB) | us/ |
 | perf-tracker | 00:00 | performance/ |
-| china-strategist | event-triggered* | china/ |
-| china-executor | event-triggered* | china/ |
+| nwt-dashboard | always-on (FastAPI, port 8080) | dashboard/ |
 
-*China bot is event-triggered, not fixed-time cron. Fires after ADR liquidity confirmation post US open. Do not hardcode a UTC time.
+China bot (`china-strategist`, `china-executor`) is **not** a PM2 app — it is event-triggered (fires after ADR liquidity confirmation post US open), so it runs from `crontab.txt`'s polling window (`0,30 14-18 * * 1-5` UTC) instead of PM2's `cron_restart`. Do not add PM2 entries for it: crontab already supervises it, and a second supervisor running the same scripts would trip the Startup Integrity Gate's duplicate-runner check.
 
 ### Bot Isolation Rules
 
@@ -393,10 +397,19 @@ Runs separately from PM2 via crontab.
 | 13:00-13:45 | Conviction stack (layer0 -> prescreener -> engine -> summary) |
 | 14:00 | Track C + D decide |
 | 14:30 | Track E decides |
-| 13:00-21:00 | Risk Agent every 5min |
-| 13:00-21:00 | Execution Agent every 5min |
-| 13:00-21:00 | Snapshot writer every 15min |
+| 14:00-18:00 (every 30min) | China strategist + executor (event-triggered, self-gates on ADR liquidity) |
+| 13:00-20:00 | Risk Agent every 5min |
+| 13:00-20:00 | Execution Agent every 5min |
+| 13:00-20:00 | Execution Engine every 5min |
+| 13:00-20:00 | Snapshot writer every 15min |
 | 21:00 | Learning Agent + cost agent |
+| 21:15 | Session scorecard (green/red) |
+| 21:20 | Shadow decision evaluator |
+| 21:30 | Morning triage digest (read-only, no trade authority) |
+| 22:30 | DB backup (local dump, 7-day rotation) |
+| 23:00 | Recon nightly (`recon_agent.py --nightly`) |
+
+See `crontab.txt` for the authoritative, current schedule — this table is kept in sync with it, but the file is the source of truth.
 
 > **CRITICAL** `SHELL=/bin/bash` must be the first line of crontab. `source` is bash-only — silently fails under `/bin/sh`. This caused 373 dead tickets in the prior deployment.
 > Verify: `crontab -l | head -1`

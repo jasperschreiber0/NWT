@@ -35,6 +35,7 @@ from psycopg2.extras import RealDictCursor
 load_dotenv(Path(__file__).parent / ".env")
 
 from shared_context import (
+    clear_no_trade_mode,
     get_db,
     insert_ticket,
     log_system_event,
@@ -255,6 +256,10 @@ def main() -> None:
     group.add_argument("--nightly", action="store_true", help="Nightly recon (always writes ticket)")
     group.add_argument("--cold-start-import", action="store_true", dest="cold_start",
                        help="Import Alpaca positions into empty ledger")
+    group.add_argument("--clear-if-clean", action="store_true", dest="clear_if_clean",
+                       help="Human-invoked only: run recon, and if clean, clear no_trade_mode. "
+                            "This is the 'clean recon gate after human acknowledgement' CLAUDE.md "
+                            "describes — it never runs on its own schedule, only when a human runs it.")
     args = parser.parse_args()
 
     conn = get_db()
@@ -262,8 +267,23 @@ def main() -> None:
         if args.cold_start:
             cold_start_import(conn)
         elif args.gate:
+            # Cold start is an import, not an assumption: if the ledger is
+            # empty, reconcile it against Alpaca's live positions before
+            # gating, so a wiped/fresh ledger with real Alpaca positions
+            # self-heals instead of being classified in_alpaca_not_ledger
+            # (CRITICAL) and halting trading. No-ops if the ledger already
+            # has open rows.
+            cold_start_import(conn)
             clean = run_recon(conn, "gate")
             sys.exit(0 if clean else 1)
+        elif args.clear_if_clean:
+            clean = run_recon(conn, "manual_clear_check")
+            if clean:
+                clear_no_trade_mode(conn, "recon_agent_manual_clear")
+                logger.info("Recon clean — no_trade_mode cleared")
+            else:
+                logger.error("Recon NOT clean — no_trade_mode left untouched")
+                sys.exit(1)
         else:  # nightly
             run_recon(conn, "nightly")
     finally:

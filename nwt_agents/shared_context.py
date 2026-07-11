@@ -6,16 +6,32 @@ All agents must import from here — never duplicate these lookups.
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import psycopg2
+import requests
 from psycopg2.extras import RealDictCursor
 
-# Shared timing constants — single definition for risk agent AND execution path
-NEW_ENTRY_CUTOFF_UTC_HOUR = 19    # No new entries after 19:30 UTC (15:30 EDT)
-NEW_ENTRY_CUTOFF_UTC_MINUTE = 30
+# Shared timing constants
 TRACK_COOLOFF_HOURS = 24
+
+# New-entry cutoff is 15:30 ET, computed DST-aware below — never a fixed UTC
+# hour/minute. A fixed "19:30 UTC" constant is only correct during EDT
+# (summer); in EST (winter) 15:30 ET is 20:30 UTC, an hour later, so a fixed
+# constant silently vetoes valid, already-approved trades for a third of the
+# year. risk_agent.py's own Rule 0 already computes this correctly — this is
+# the same logic, exposed here so every other caller (pre_trade_veto included)
+# uses the one true implementation instead of a second, driftable copy.
+ET_TZ = ZoneInfo("America/New_York")
+
+
+def new_entry_cutoff_utc(now: datetime = None) -> datetime:
+    """15:30 ET in UTC, fully DST-aware, for the date `now` (or today) falls on."""
+    et_now = (now or datetime.now(timezone.utc)).astimezone(ET_TZ)
+    cutoff = datetime(et_now.year, et_now.month, et_now.day, 15, 30, tzinfo=ET_TZ)
+    return cutoff.astimezone(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -50,13 +66,6 @@ def load_conviction_tickets() -> list:
         return []
     with open(path) as f:
         return json.load(f)
-
-
-def load_conviction_summary() -> str:
-    path = _agents_dir() / "conviction_summary.txt"
-    if not path.exists():
-        return ""
-    return path.read_text()
 
 
 def load_layer0_data() -> dict:
@@ -101,6 +110,78 @@ def get_active_strategy_ids(conn, track: str) -> list:
             (track,),
         )
         return [row[0] for row in cur.fetchall()]
+
+
+def regime_matches(genome_regime: str, current_regime: dict) -> bool:
+    """
+    Check if a genome row's regime string matches the current primary or
+    secondary regime. Single implementation — track_c/d/e.py each used to
+    carry an identical copy of this; a future fix to one and not the others
+    would silently fork regime-matching behavior across tracks.
+    """
+    primary = (current_regime.get("primary_regime") or "").lower()
+    secondary = (current_regime.get("secondary_regime") or "").lower()
+    genome_r = (genome_regime or "").lower()
+    if genome_r in ("any", "", "all"):
+        return True
+    return genome_r == primary or genome_r == secondary
+
+
+# ---------------------------------------------------------------------------
+# VIX proxy — single source of truth
+# ---------------------------------------------------------------------------
+
+def fetch_vix_proxy(alpaca_base_url: str, alpaca_data_url: str, alpaca_headers: dict,
+                     directives: dict = None) -> tuple:
+    """
+    Single implementation of a VIX-equivalent volatility reading, shared by
+    every agent that needs one. Returns (value, source) or (None, "unavailable").
+    VIX==0 is treated as missing, never as a signal.
+
+    Prefers master-directives.json's own `vix` field (set daily by Portfolio
+    Brain). Falls back to computing ATM SPY ~30 DTE implied volatility
+    directly from Alpaca's options chain when directives are stale/absent.
+
+    Deliberately never returns a raw VIXY (VIX futures ETF) price as if it
+    were the index: VIXY trades ~$12-18 in ordinary conditions because it
+    tracks front-month futures with contango roll decay, not spot VIX — a
+    caller comparing that price directly against a `> 40` kill-switch
+    threshold would find the check structurally unreachable. Two call sites
+    (layer0_builder.py's prescreener hard filter and risk_agent.py's kill
+    switch) used to compute two different, disagreeing "VIX" values; this
+    is the one both now share.
+    """
+    if directives:
+        vix = directives.get("vix") or 0.0
+        if vix > 0:
+            return float(vix), "master_directives"
+
+    try:
+        today = date.today()
+        url = f"{alpaca_base_url}/v2/options/contracts"
+        params = {
+            "underlying_symbols": "SPY",
+            "expiration_date_gte": (today + timedelta(days=25)).isoformat(),
+            "expiration_date_lte": (today + timedelta(days=35)).isoformat(),
+            "type": "call",
+            "limit": 10,
+        }
+        resp = requests.get(url, headers=alpaca_headers, params=params, timeout=15)
+        resp.raise_for_status()
+        contracts = resp.json().get("option_contracts", [])
+        if contracts:
+            price_url = f"{alpaca_data_url}/v2/stocks/SPY/trades/latest"
+            pr = requests.get(price_url, headers=alpaca_headers, timeout=10)
+            pr.raise_for_status()
+            spy_price = float(pr.json()["trade"]["p"])
+            atm = min(contracts, key=lambda c: abs(float(c.get("strike_price", 0)) - spy_price))
+            iv = float(atm.get("implied_volatility") or 0)
+            if iv > 0:
+                return iv * 100, "spy_iv_proxy"
+    except Exception:
+        pass
+
+    return None, "unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -212,10 +293,7 @@ def get_disabled_tracks(conn) -> set:
 
 def past_new_entry_cutoff(now_utc: datetime = None) -> bool:
     now_utc = now_utc or datetime.now(timezone.utc)
-    return (
-        now_utc.hour > NEW_ENTRY_CUTOFF_UTC_HOUR
-        or (now_utc.hour == NEW_ENTRY_CUTOFF_UTC_HOUR and now_utc.minute >= NEW_ENTRY_CUTOFF_UTC_MINUTE)
-    )
+    return now_utc >= new_entry_cutoff_utc(now_utc)
 
 
 def pre_trade_veto(conn, track: str) -> tuple:
@@ -240,7 +318,7 @@ def pre_trade_veto(conn, track: str) -> tuple:
     if past_new_entry_cutoff():
         return True, (
             f"pre_trade_veto: past new-entry cutoff "
-            f"{NEW_ENTRY_CUTOFF_UTC_HOUR}:{NEW_ENTRY_CUTOFF_UTC_MINUTE:02d} UTC"
+            f"{new_entry_cutoff_utc().strftime('%H:%M')} UTC (15:30 ET)"
         )
 
     return False, ""
@@ -396,14 +474,23 @@ def insert_decision(
     decision: str,
     reasoning: str,
     decided_by: str,
+    sizing_multiplier: float = None,
 ) -> None:
-    """INSERT into nwt_ticket_decisions. NEVER UPDATE nwt_tickets."""
+    """
+    INSERT into nwt_ticket_decisions. NEVER UPDATE nwt_tickets.
+
+    sizing_multiplier: optional 0-1 factor (RISK_AGENT Rules 3/7 — slippage
+    expansion, regime confidence < 0.4). execution_agent.py reads this back
+    and multiplies sized_notional by it before submitting the order. This is
+    the actual sizing-reduction mechanism; Rules 3/7 logging a WARNING with
+    no corresponding effect was the original bug.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO nwt_ticket_decisions (ticket_id, decision, reasoning, decided_by)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO nwt_ticket_decisions (ticket_id, decision, reasoning, decided_by, sizing_multiplier)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            (ticket_id, decision, reasoning, decided_by),
+            (ticket_id, decision, reasoning, decided_by, sizing_multiplier),
         )
     conn.commit()

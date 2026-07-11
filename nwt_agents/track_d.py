@@ -32,6 +32,7 @@ from shared_context import (
     log_decision_input,
     log_inactivity,
     log_system_event,
+    regime_matches,
 )
 
 logging.basicConfig(
@@ -49,15 +50,6 @@ DIRECTIONAL_STRATEGIES = {"long_call", "long_put", "bull_call_spread", "bear_put
 
 # Track D minimum conviction score
 TRACK_D_MIN_CONVICTION = 7
-
-
-def regime_matches(genome_regime: str, current_regime: dict) -> bool:
-    primary = current_regime.get("primary_regime", "").lower()
-    secondary = (current_regime.get("secondary_regime") or "").lower()
-    genome_r = (genome_regime or "").lower()
-    if genome_r in ("any", "", "all"):
-        return True
-    return genome_r == primary or genome_r == secondary
 
 
 def find_best_directional_ticket(

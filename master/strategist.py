@@ -64,8 +64,11 @@ BASELINE_WEIGHTS = {
     "china": 0.15,   # $15k / $97k
 }
 
-# Maximum single-bot weight (sanity cap)
-MAX_WEIGHT = 0.65
+# Per-bot capital-weight ceiling (sanity cap on any single bot's share of
+# total capital). Distinct from execution/engine.py's DIRECTIONAL_CAP_PCT
+# (0.60), which caps aggregate same-direction notional across all bots —
+# the two are complementary controls, not the same "directional cap" twice.
+PER_BOT_WEIGHT_CEILING = 0.65
 
 # ---------------------------------------------------------------------------
 # Integrity Gate
@@ -156,6 +159,40 @@ def read_open_positions(conn: psycopg2.extensions.connection) -> list[dict]:
     except Exception as exc:
         logger.error("Failed to read nwt_portfolio_ledger: %s", exc)
         return []
+
+# ---------------------------------------------------------------------------
+# Regime history — feeds the "same regime 5+ sessions" persistence rule
+# ---------------------------------------------------------------------------
+
+def fetch_recent_regime_history(conn: psycopg2.extensions.connection, limit: int = 10) -> list[str]:
+    """Prior sessions' primary_regime values, most recent first."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT primary_regime FROM nwt_regime_history ORDER BY computed_at DESC LIMIT %s",
+                (limit,),
+            )
+            return [row[0] for row in cur.fetchall()]
+    except Exception as exc:
+        logger.warning("Could not read nwt_regime_history: %s", exc)
+        return []
+
+
+def record_regime_history(
+    conn: psycopg2.extensions.connection, regime: dict, spy_vs_5d_pct: Optional[float]
+) -> None:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_regime_history (primary_regime, confidence, transition_risk, spy_vs_5d_pct)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (regime["primary_regime"], regime["confidence"], regime["transition_risk"], spy_vs_5d_pct),
+            )
+        conn.commit()
+    except Exception as exc:
+        logger.warning("Could not write nwt_regime_history: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Net Delta / Vega estimation
@@ -473,7 +510,7 @@ def compute_bot_permissions(
         scale = min(1.0, 1.0 / total_weight) if total_weight > 1.0 else 1.0
         for bot in weights:
             if statuses[bot] != "paused":
-                weights[bot] = round(min(weights[bot] * scale, MAX_WEIGHT), 4)
+                weights[bot] = round(min(weights[bot] * scale, PER_BOT_WEIGHT_CEILING), 4)
 
     # Ensure paused bots have 0 weight
     for bot in weights:
@@ -705,7 +742,9 @@ def main() -> int:
 
         # --- Regime classification ---
         logger.info("Classifying regime...")
-        regime = classify_regime(internals, exposure)
+        regime_history = fetch_recent_regime_history(conn)
+        regime = classify_regime(internals, exposure, regime_history=regime_history)
+        record_regime_history(conn, regime, internals.get("spy_vs_5d_pct"))
 
         # --- Kill switch ---
         vix = internals.get("vix")
