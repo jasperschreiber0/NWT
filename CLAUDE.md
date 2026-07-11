@@ -28,6 +28,9 @@
 | Exit lifecycle (equity monitor + options close) *(repo)* | Built; equity monitor now prefers the ticket's own `stop_pct`/`target_pct` (persisted on the ledger row) over genome/hardcoded defaults | 2026-07-11 |
 | Inactivity ticket taxonomy *(repo)* | Built; session scorecard now counts both Track A's `nwt_inactivity_log` and Track C/D/E's `nwt_tickets(type='inactivity')` | 2026-07-11 |
 | Same-regime 5+ sessions rule *(repo)* | Built — `nwt_regime_history` + `regime_classifier.py`'s session-persistence check | 2026-07-11 |
+| Learning Layer C — Strategy Mutator *(repo)* | Built — `nwt_agents/mutation_agent.py` (propose + promote), genome versioning + Learning Gate enforced | 2026-07-11 |
+| Learning Layer D — Portfolio Allocator *(repo)* | Built — `master/allocator.py`, wired into `strategist.py`'s `compute_bot_permissions` | 2026-07-11 |
+| Track F scanner *(repo)* | Built as a research signal surface (no order authority) — see Stack 6 | 2026-07-11 |
 | Server hardening *(server)* | Not verified in this pass — re-run the deploy steps in Server Hardening below and confirm with `sshd -T` | 2026-05-18 |
 
 ---
@@ -394,6 +397,7 @@ Runs separately from PM2 via crontab.
 
 | Time UTC | What fires |
 |---|---|
+| 12:00 | Track F scanner (research signal only, no order authority) |
 | 13:00-13:45 | Conviction stack (layer0 -> prescreener -> engine -> summary) |
 | 14:00 | Track C + D decide |
 | 14:30 | Track E decides |
@@ -403,8 +407,10 @@ Runs separately from PM2 via crontab.
 | 13:00-20:00 | Execution Engine every 5min |
 | 13:00-20:00 | Snapshot writer every 15min |
 | 21:00 | Learning Agent + cost agent |
+| 21:10 | Strategy Mutator — propose (`mutation_agent.py --propose`) |
 | 21:15 | Session scorecard (green/red) |
 | 21:20 | Shadow decision evaluator |
+| 21:22 | Strategy Mutator — promote (`mutation_agent.py --promote`) |
 | 21:30 | Morning triage digest (read-only, no trade authority) |
 | 22:30 | DB backup (local dump, 7-day rotation) |
 | 23:00 | Recon nightly (`recon_agent.py --nightly`) |
@@ -466,6 +472,27 @@ if not genome:
 
 ---
 
+## Stack 6 — Track F (Thematic Bottleneck Scanner)
+
+Path: `/home/northworld/trading/nwt_agents/track_f/`
+Runs: `scanner.py` daily 12:00 UTC Mon-Fri, before the conviction stack.
+
+> **NOTE — scope** Track F is a **research signal surface, not a 7th trading track.** It has no order authority, no genome, no sizing/risk/isolation rules — none are defined anywhere in this document. It scores tickers, surfaces candidates for human review through the dashboard's approve/reject workflow, and stops there. Giving it order authority would be a deliberate, separate product decision requiring its own capital allocation, sizing, and risk rules — not assumed here.
+
+**What it does:**
+1. Scores each ticker in `themes.py`'s `CONFIRMED_THEMES` (ai_power, ai_networking, ai_cooling, nuclear, robotics, copper_constraint) against recent (30-day) SEC EDGAR filings, using the exact composite scoring method `track_f/validate_historical.py` already backtested against 4 known historical winners (NVDA/VRT/PWR/CCJ — 3/4 scored ≥60 before their moves; CCJ is a documented EDGAR EFTS limitation for Canadian foreign private issuers, not a method failure).
+2. Writes one `nwt_bottleneck_scores` row per (ticker, theme) per run, with momentum vs. the trailing 3 scans.
+3. A ticker scoring ≥60 (`BOTTLENECK_SCORE_CANDIDATE_THRESHOLD`) gets a `nwt_track_f_candidates` row (status='pending') for human review.
+4. Separately scans `CANDIDATE_THEMES` — speculative, not-yet-confirmed themes, scored the same way. If a candidate theme's aggregate momentum crosses a threshold, upserts `nwt_emerging_themes` (status='pending'). Approving one there does **not** edit `CONFIRMED_THEMES` in code — it only means the dashboard's theme-exposure endpoint starts counting that theme's tickers toward the 15% cap.
+
+**What's live vs. curated** in the composite score (`compute_bottleneck_score`'s four inputs):
+- `theme_momentum`, `constraint_severity`: computed live from EDGAR's current full-text search — identical method to the backtest.
+- `revenue_leverage`, `attention_gap`, `smart_money_score`, `crowding_penalty`: curated per-ticker in `themes.py` (`TICKER_APPROXIMATIONS`, defaulting conservatively), **not live**. Live institutional-flow (13F/Form 4) and analyst-coverage data are a real Phase-2 extension, not fabricated in v1.
+
+**Dashboard integration:** `/api/track-f/theme-exposure` derives theme→ticker membership from `nwt_bottleneck_scores` joined against `nwt_emerging_themes` (excluding non-approved candidate themes) — not a hardcoded dict, so an approval actually changes what counts toward the cap.
+
+---
+
 ## Risk Agent — Authority Model
 
 The Risk Agent is the single most authoritarian component in the system. It has more effective power than every other component combined.
@@ -523,19 +550,25 @@ Factor-based decomposition only. No narrative.
 - WRONG: "market was volatile"
 - RIGHT: "vega exposure +42% correlated with loss cluster in IV>50 regime"
 
-### Two Deferred Layers
+### Layer C — Strategy Mutator
 
-**Layer C — Strategy Mutator (shadow from 30 trades, promote after 100+)**
-
-Bounded mutations only: adjust DTE range, tighten IV filter, change entry threshold, adjust stop loss, reduce frequency per regime.
+Built: `nwt_agents/mutation_agent.py`. Shadow from 30 trades, promote after 100+ — bounded mutations only: tighten entry_threshold, tighten iv_filter_max, tighten stop_loss_pct (DTE-range and per-regime-frequency mutations are not yet implemented — see the file's own docstring for why).
 
 > ⚠ Mutation floor is 100+ trades per strategy bucket, across multiple volatility regimes, with frozen baselines and shadow-mode testing first. 30 trades is enough to observe, not enough to mutate. Promoting changes on 30 trades risks learning random variance, regime chasing, and overfitting to transient volatility structures.
 
 Shadow mode means: the mutated strategy runs alongside the baseline, its hypothetical outcomes recorded, but no capital is allocated to it until it passes the learning gate.
 
-**Layer D — Portfolio Allocator (after meaningful trade history per bot)**
+**How it actually works:**
+- `mutation_agent.py --propose` (21:10 UTC): for an active Track C/D strategy with `nwt_strategy_decay.decay_flag` set (or `win_loss_ratio_trend='compressing'`) and 30+ trades, inserts ONE new genome row — version `+1`, `active=FALSE`, `shadow_mode=TRUE`, `parent_version` set — with exactly one parameter changed. Never touches the active row. At most one pending shadow candidate per strategy; 14-day cooldown between proposals.
+- Track C/D (not E — every E strategy is already globally `shadow_mode=TRUE`) run a second, cheap evaluation pass each day against any pending shadow candidate's parameters, logged to `nwt_decision_inputs` tagged with `genome_version` (`shared_context.evaluate_shadow_mutation`). `shadow_decision_evaluator.py` fills in `would_have_won`/`shadow_pnl_pct` for these exactly like any other candidate.
+- `mutation_agent.py --promote` (21:22 UTC): for each pending shadow candidate, checks the Learning Gate below against its accumulated sample. Promotes (flips `active`), rejects-and-retires (gate's sample is complete but doesn't clear it), or waits (still gathering data) — logged to `nwt_mutation_log`, append-only. A promotion also writes an `nwt_tickets` row (`type='strategy_mutation_promoted'`) for the system-wide audit trail.
+- Respects `nwt_system_flags.mutation_frozen` — the Risk Agent's "freeze mutation promotion" authority. Freezing blocks promotion only, never proposal.
 
-Learns which bot works in which regime. Answers "where should capital go?" — NOT "what should we trade?"
+### Layer D — Portfolio Allocator
+
+Built: `master/allocator.py`, called from `master/strategist.py`. Learns which bot works in which regime. Answers "where should capital go?" — NOT "what should we trade?"
+
+Not a separate service — `compute_dynamic_weights()` replaces the hardcoded `BASELINE_WEIGHTS` dict as `compute_bot_permissions()`'s starting point. A bot only gets tilted away from baseline once it clears 15 closed trades (joined `nwt_trade_outcomes` → `nwt_portfolio_ledger` via `position_id`); the tilt is a bounded z-score across bots (±25% of baseline weight, one outlier bot can't dominate), conditioned on today's regime once a bot has 8+ trades in that specific regime, falling back to the bot's overall performance otherwise. Cold start (no history) returns baseline weights unchanged — explicit, not an error. Every run's inputs/outputs are logged to `nwt_allocator_history` for audit.
 
 ### The Learning Gate
 

@@ -112,6 +112,64 @@ def get_active_strategy_ids(conn, track: str) -> list:
         return [row[0] for row in cur.fetchall()]
 
 
+def get_shadow_genome(conn, strategy_id: str) -> dict:
+    """
+    Return the pending shadow-mutation candidate version for a strategy_id,
+    if one exists (shadow_mode=TRUE, active=FALSE, highest version). Returns
+    {} if none — a strategy with no shadow candidate is the normal case.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT * FROM nwt_strategy_genome
+            WHERE strategy_id = %s AND shadow_mode = TRUE AND active = FALSE
+            ORDER BY version DESC LIMIT 1
+            """,
+            (strategy_id,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else {}
+
+
+def is_mutation_frozen(conn) -> bool:
+    """Risk Agent authority: freeze mutation promotion (never proposal)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM nwt_system_flags WHERE flag = 'mutation_frozen'")
+        row = cur.fetchone()
+    return bool(row and row[0])
+
+
+def set_mutation_frozen(conn, frozen: bool, reason: str, set_by: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_system_flags (flag, value, reason, set_by, updated_at)
+            VALUES ('mutation_frozen', %s, %s, %s, NOW())
+            ON CONFLICT (flag) DO UPDATE SET value=%s, reason=%s, set_by=%s, updated_at=NOW()
+            """,
+            (frozen, reason, set_by, frozen, reason, set_by),
+        )
+    conn.commit()
+
+
+def upsert_agent_state(conn, agent: str, status: str, detail: dict = None) -> None:
+    """Generic per-agent status row, surfaced by the dashboard's /api/performance."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_agent_state (agent, status, detail, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (agent) DO UPDATE SET status=%s, detail=%s, updated_at=NOW()
+                """,
+                (agent, status, json.dumps(detail) if detail is not None else None,
+                 status, json.dumps(detail) if detail is not None else None),
+            )
+        conn.commit()
+    except Exception:
+        pass  # status surface must never break the calling agent
+
+
 def regime_matches(genome_regime: str, current_regime: dict) -> bool:
     """
     Check if a genome row's regime string matches the current primary or
@@ -391,6 +449,7 @@ def log_decision_input(
     stop_pct: float = None,
     dte_target: int = None,
     ticket_id: str = None,
+    genome_version: int = None,
 ) -> None:
     """
     INSERT one row into nwt_decision_inputs for a candidate that was eligible
@@ -399,6 +458,11 @@ def log_decision_input(
     stop_pct/dte_target are required for shadow_decision_evaluator.py to
     later compute would_have_won; leave them None if unavailable (e.g. no
     layer0 price data) rather than guessing.
+
+    genome_version ties a row to the specific genome version it was
+    evaluated against — set it when logging a Strategy Mutator shadow
+    evaluation (decision='SHADOW_MUTATION') so the promotion job can group
+    a mutation candidate's outcomes separately from its baseline's.
     """
     try:
         with conn.cursor() as cur:
@@ -407,19 +471,85 @@ def log_decision_input(
                 INSERT INTO nwt_decision_inputs
                     (run_date, symbol, strategy_id, track, regime, conviction_score,
                      archetype, is_winner, decision, direction, rejection_reason,
-                     entry_price_ref, target_pct, stop_pct, dte_target, ticket_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     entry_price_ref, target_pct, stop_pct, dte_target, ticket_id,
+                     genome_version)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     run_date, symbol, strategy_id, track, json.dumps(regime), conviction_score,
                     archetype, is_winner, decision, direction, rejection_reason,
                     entry_price_ref, target_pct, stop_pct, dte_target, ticket_id,
+                    genome_version,
                 ),
             )
         conn.commit()
     except Exception as exc:
         log_system_event(conn, "WARNING", f"track_{track.lower()}",
                          f"log_decision_input insert failed for {strategy_id}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Strategy Mutator — shadow-mutation evaluation
+# ---------------------------------------------------------------------------
+
+def evaluate_shadow_mutation(
+    conn,
+    strategy_id: str,
+    track: str,
+    find_ticket_fn,
+    conviction_tickets: list,
+    current_regime: dict,
+    layer0: dict,
+    run_date,
+) -> None:
+    """
+    If mutation_agent.py has proposed a shadow-mutation candidate genome
+    version for this strategy, run the SAME candidate-matching function the
+    caller already used for its live/baseline evaluation, but against the
+    shadow genome's parameters instead. Logs to nwt_decision_inputs tagged
+    with genome_version, entirely separate from the baseline's own logging —
+    never produces a TRADE_PROPOSAL ticket, never touches sizing or risk.
+
+    find_ticket_fn must have the signature (conviction_tickets, genome, regime)
+    -> ticket | None, matching track_c/d/e.py's own matching functions.
+
+    This is how a shadow mutation accumulates the same would_have_won data a
+    live candidate does — shadow_decision_evaluator.py fills in
+    would_have_won/shadow_pnl_pct for these rows exactly like any other, and
+    mutation_agent.py's promotion pass groups by (strategy_id, genome_version)
+    to check the Learning Gate.
+    """
+    shadow_genome = get_shadow_genome(conn, strategy_id)
+    if not shadow_genome:
+        return
+
+    version = shadow_genome["version"]
+    ticket = find_ticket_fn(conviction_tickets, shadow_genome, current_regime)
+
+    if ticket is None:
+        log_decision_input(
+            conn, run_date=run_date, symbol=None, strategy_id=strategy_id,
+            track=track, regime=current_regime, conviction_score=0,
+            archetype=shadow_genome.get("archetype") or strategy_id, is_winner=False,
+            decision="SHADOW_MUTATION_NO_MATCH", genome_version=version,
+        )
+        return
+
+    symbol = ticket.get("symbol")
+    entry_price_ref = layer0.get("symbols", {}).get(symbol, {}).get("price") or None
+    dte_target = ticket.get("dte_target", shadow_genome.get("dte_min", 14))
+    dte_target = max(shadow_genome["dte_min"], min(shadow_genome["dte_max"], dte_target))
+
+    log_decision_input(
+        conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
+        track=track, regime=current_regime, conviction_score=ticket.get("conviction_score", 0),
+        archetype=shadow_genome.get("archetype") or strategy_id, is_winner=True,
+        decision="SHADOW_MUTATION", direction=ticket.get("direction", "long"),
+        entry_price_ref=entry_price_ref,
+        target_pct=float(shadow_genome["profit_target_pct"]),
+        stop_pct=-abs(float(shadow_genome["stop_loss_pct"])),
+        dte_target=dte_target, genome_version=version,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -46,6 +46,7 @@ logging.basicConfig(
 logger = logging.getLogger("master-strategist")
 
 # Local modules — import after .env is loaded
+from allocator import compute_dynamic_weights  # noqa: E402
 from market_internals import fetch_market_internals  # noqa: E402
 from regime_classifier import classify_regime  # noqa: E402
 
@@ -397,6 +398,7 @@ def compute_bot_permissions(
     exposure: dict,
     kill_switch: bool,
     vix: Optional[float],
+    starting_weights: Optional[dict] = None,
 ) -> tuple[dict, list[str]]:
     """
     Compute per-bot permission objects based on regime + exposure + kill switch.
@@ -409,6 +411,12 @@ def compute_bot_permissions(
     5. EU bot: reduced if inflation_concern
     6. AUS bot: reduced if regime is risk_off or recession_fear
 
+    starting_weights: Learning Layer D's allocator.compute_dynamic_weights()
+    output, if available — replaces BASELINE_WEIGHTS as the starting point
+    before any of the regime-driven adjustments below are applied. Falls
+    back to BASELINE_WEIGHTS (cold start, or allocator error) — explicit,
+    not an error, matching this codebase's convention.
+
     Returns (bot_permissions_dict, conflict_notes_list)
     """
     conflict_notes = []
@@ -416,8 +424,8 @@ def compute_bot_permissions(
     transition_risk = float(regime.get("transition_risk", 0.3))
     primary = regime.get("primary_regime", "neutral")
 
-    # Start from baseline weights
-    weights = dict(BASELINE_WEIGHTS)
+    # Start from allocator-tilted weights (Learning Layer D), or baseline
+    weights = dict(starting_weights) if starting_weights else dict(BASELINE_WEIGHTS)
     size_caps = {bot: 1.0 for bot in weights}
     statuses = {bot: "active" for bot in weights}
 
@@ -651,6 +659,23 @@ def log_to_postgres(
 # Write master-directives.json
 # ---------------------------------------------------------------------------
 
+def upsert_agent_state(conn: psycopg2.extensions.connection, agent: str, status: str, detail: dict) -> None:
+    """Self-contained (no cross-package import — master/ and nwt_agents/ stay independent stacks)."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_agent_state (agent, status, detail, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (agent) DO UPDATE SET status=%s, detail=%s, updated_at=NOW()
+                """,
+                (agent, status, json.dumps(detail, default=str), status, json.dumps(detail, default=str)),
+            )
+        conn.commit()
+    except Exception as exc:
+        logger.warning("Failed to write nwt_agent_state: %s", exc)
+
+
 def write_directives(directives: dict) -> None:
     """
     Write master-directives.json to the shared directory.
@@ -750,6 +775,14 @@ def main() -> int:
         vix = internals.get("vix")
         kill_switch, kill_reason = evaluate_kill_switch(vix, drawdown)
 
+        # --- Portfolio Allocator (Learning Layer D) ---
+        logger.info("Computing dynamic capital weights...")
+        try:
+            dynamic_weights, allocator_notes = compute_dynamic_weights(conn, regime, BASELINE_WEIGHTS)
+        except Exception as exc:
+            logger.warning("Allocator failed — falling back to baseline weights: %s", exc)
+            dynamic_weights, allocator_notes = dict(BASELINE_WEIGHTS), [f"Allocator error (using baseline): {exc}"]
+
         # --- Bot permissions ---
         logger.info("Computing bot permissions...")
         permissions, conflict_notes = compute_bot_permissions(
@@ -757,7 +790,9 @@ def main() -> int:
             exposure=exposure,
             kill_switch=kill_switch,
             vix=vix,
+            starting_weights=dynamic_weights,
         )
+        conflict_notes = allocator_notes + conflict_notes
 
         # --- Reasoning ---
         reasoning = build_reasoning(
@@ -811,6 +846,11 @@ def main() -> int:
                 "permissions": permissions,
             },
         )
+
+        upsert_agent_state(conn, "master-strategist", "ok", {
+            "regime": regime["primary_regime"], "kill_switch": kill_switch,
+            "dynamic_weights": dynamic_weights,
+        })
 
         logger.info("=== master-strategist complete ===")
         logger.info(summary)

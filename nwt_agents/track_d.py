@@ -22,6 +22,7 @@ import integrity_gate
 from shared_context import (
     check_no_trade_mode,
     compute_final_sizing,
+    evaluate_shadow_mutation,
     get_active_strategy_ids,
     get_db,
     get_strategy_genome,
@@ -130,6 +131,9 @@ def main() -> None:
                 logger.info("%s in shadow_mode — skipping live proposal", strategy_id)
                 log_inactivity(conn, strategy_id, "D", "SHADOW_MODE", regime)
                 continue
+
+            evaluate_shadow_mutation(conn, strategy_id, "D", find_best_directional_ticket,
+                                     conviction_tickets, regime, layer0, run_date)
 
             best_ticket = find_best_directional_ticket(conviction_tickets, genome, regime)
 
