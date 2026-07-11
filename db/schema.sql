@@ -1,3 +1,10 @@
+-- NWT Day-1 baseline schema.
+-- This file alone is NOT the current schema — apply every db/migrate_*.sql
+-- in filename/date order after this one. Tables this file omits entirely
+-- (nwt_system_flags, nwt_heartbeat, nwt_equity_curve, nwt_decision_inputs,
+-- nwt_triage_findings) are created by those migrations; run them before
+-- starting any agent.
+
 -- Core ticket tables (append-only enforced)
 CREATE TABLE IF NOT EXISTS nwt_tickets (
   ticket_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -17,9 +24,19 @@ CREATE TABLE IF NOT EXISTS nwt_ticket_decisions (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Append-only enforcement
-CREATE OR REPLACE RULE no_update_tickets AS ON UPDATE TO nwt_tickets DO INSTEAD NOTHING;
-CREATE OR REPLACE RULE no_delete_tickets AS ON DELETE TO nwt_tickets DO INSTEAD NOTHING;
+-- Append-only enforcement — loud (raises), not a silent no-op rule. An
+-- UPDATE/DELETE against nwt_tickets must fail visibly; a silently-swallowed
+-- mutation is worse than no enforcement at all because it hides the bug.
+CREATE OR REPLACE FUNCTION reject_ticket_mutation() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'nwt_tickets is append-only — insert into nwt_ticket_decisions instead';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS tickets_immutable ON nwt_tickets;
+CREATE TRIGGER tickets_immutable
+  BEFORE UPDATE OR DELETE ON nwt_tickets
+  FOR EACH ROW EXECUTE FUNCTION reject_ticket_mutation();
 
 -- Portfolio ledger (single source of truth — all bots, all tracks)
 CREATE TABLE IF NOT EXISTS nwt_portfolio_ledger (
@@ -94,8 +111,11 @@ CREATE TABLE IF NOT EXISTS nwt_strategy_decay (
 );
 
 -- Strategy genome (runtime rule — agents query this at startup)
+-- PK is (strategy_id, version) — versioning is how a mutation is proposed
+-- without destroying the baseline row; exactly one version per strategy_id
+-- may be active at a time (enforced by the partial unique index below).
 CREATE TABLE IF NOT EXISTS nwt_strategy_genome (
-  strategy_id TEXT PRIMARY KEY,
+  strategy_id TEXT NOT NULL,
   track TEXT NOT NULL,
   archetype TEXT,               -- strategy bucket — tracks fire max 1 proposal per archetype/day
   asset_universe TEXT[],
@@ -106,13 +126,16 @@ CREATE TABLE IF NOT EXISTS nwt_strategy_genome (
   stop_loss_pct NUMERIC,
   profit_target_pct NUMERIC,
   regime TEXT,
-  version INTEGER DEFAULT 1,
+  version INTEGER NOT NULL DEFAULT 1,
   active BOOLEAN DEFAULT TRUE,
   shadow_mode BOOLEAN DEFAULT FALSE,
-  trade_count_to_promote INTEGER DEFAULT 100,
+  parent_version INTEGER,       -- lineage for mutations
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  PRIMARY KEY (strategy_id, version)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_genome
+  ON nwt_strategy_genome (strategy_id) WHERE (active = TRUE);
 
 -- System event log (used by risk agent, integrity gate)
 CREATE TABLE IF NOT EXISTS nwt_system_log (

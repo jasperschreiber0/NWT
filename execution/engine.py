@@ -58,15 +58,40 @@ REQUIRED_FIELDS = {
 POLL_INTERVAL = 3
 POLL_MAX = 10
 ET_TZ = ZoneInfo("America/New_York")
+
+# Aggregate same-direction notional cap (long vs short across all bots/tracks).
+# Distinct from master/strategist.py's PER_BOT_WEIGHT_CEILING, which caps a
+# single bot's share of total capital — the two are complementary controls
+# with similar names, not the same control counted twice.
 DIRECTIONAL_CAP_PCT = 0.60
 
 # Synchronous risk backstop — mirrors risk_agent rules. The risk agent's
 # 5-minute sweep is authoritative, but its APPROVED decision can be minutes
 # stale by the time an order is placed; these flags are re-checked here, in
 # the order path, so no order reaches Alpaca after the state has turned.
-NEW_ENTRY_CUTOFF_UTC_HOUR = 19
-NEW_ENTRY_CUTOFF_UTC_MINUTE = 30
 TRACK_COOLOFF_HOURS = 24
+
+# Track A equity bot_source -> master-directives.json bot_permissions key.
+# The options stack (NWT_TRACK_C/D/E) has no bot_permissions entry — it's
+# governed by risk_agent's own rules instead, so it's intentionally absent.
+BOT_SOURCE_TO_PERMISSIONS_KEY = {
+    "US_BOT": "us",
+    "EU_BOT": "eu",
+    "AUS_BOT": "aus",
+    "CHINA_BOT": "china",
+}
+
+
+def _entry_cutoff_utc(now: datetime = None) -> datetime:
+    """
+    15:30 ET in UTC, fully DST-aware. A fixed UTC hour/minute constant is
+    only correct half the year (EDT) — in EST (winter) 15:30 ET is 20:30
+    UTC, an hour later, so a fixed constant silently vetoes valid,
+    already-approved trades for a third of the year.
+    """
+    et_now = (now or datetime.now(timezone.utc)).astimezone(ET_TZ)
+    cutoff = datetime(et_now.year, et_now.month, et_now.day, 15, 30, tzinfo=ET_TZ)
+    return cutoff.astimezone(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -168,11 +193,48 @@ def get_disabled_tracks(conn) -> set:
     return disabled
 
 
+def _check_bot_permissions(directives: dict, bot_source: str, sized_notional: float) -> tuple:
+    """
+    Re-verify master-directives.json's per-bot status/capital_weight/size_cap
+    for Track A equity bots, independent of whatever the executor already
+    claims. This is the last gate before Alpaca — it must not simply trust
+    an upstream "approved: true", because directives can change (or an
+    executor bug can slip through) in the minutes between ticket creation
+    and this run.
+    """
+    perm_key = BOT_SOURCE_TO_PERMISSIONS_KEY.get(bot_source)
+    if perm_key is None:
+        return False, ""  # options stack / unknown source — not governed by bot_permissions
+
+    perms = directives.get("bot_permissions", {}).get(perm_key, {})
+    status = perms.get("status", "paused")
+    if status not in ("active", "reduced"):
+        return True, f"Synchronous veto: bot_permissions.{perm_key}.status={status!r} (not active)"
+
+    capital_weight = float(perms.get("capital_weight", 0.0))
+    size_cap = float(perms.get("size_cap", 0.0))
+    if capital_weight <= 0 or size_cap <= 0:
+        return True, f"Synchronous veto: bot_permissions.{perm_key} capital_weight/size_cap is zero"
+
+    try:
+        equity = get_alpaca_account_equity()
+    except Exception:
+        equity = 97_000.0
+    max_notional = equity * capital_weight * size_cap
+    if sized_notional > max_notional * 1.05:  # small tolerance for rounding
+        return True, (
+            f"Synchronous veto: sized_notional {sized_notional:.0f} exceeds "
+            f"bot_permissions.{perm_key} cap {max_notional:.0f} "
+            f"(capital_weight={capital_weight}, size_cap={size_cap})"
+        )
+    return False, ""
+
+
 def synchronous_risk_veto(conn, payload: dict) -> tuple:
     """
     Final gate before an order for a NEW position reaches Alpaca.
-    Re-reads master-directives.json fresh and re-checks cooling-off and the
-    new-entry cutoff. Returns (vetoed: bool, reason: str).
+    Re-reads master-directives.json fresh and re-checks cooling-off, the
+    new-entry cutoff, and per-bot permissions. Returns (vetoed: bool, reason: str).
     Closes (FORCE_CLOSE) bypass this — liquidation is always allowed.
     """
     try:
@@ -184,19 +246,20 @@ def synchronous_risk_veto(conn, payload: dict) -> tuple:
         return True, "Synchronous veto: global kill switch active"
 
     bot_source = payload.get("bot_source", "")
+
+    vetoed, reason = _check_bot_permissions(directives, bot_source, float(payload.get("sized_notional", 0)))
+    if vetoed:
+        return True, reason
+
     if bot_source.startswith("NWT_TRACK_"):
         track = bot_source.replace("NWT_TRACK_", "")
         if track in get_disabled_tracks(conn):
             return True, f"Synchronous veto: track {track} in cooling-off period"
 
-    now_utc = datetime.now(timezone.utc)
-    if payload.get("asset_type") == "option" and (
-        now_utc.hour > NEW_ENTRY_CUTOFF_UTC_HOUR
-        or (now_utc.hour == NEW_ENTRY_CUTOFF_UTC_HOUR and now_utc.minute >= NEW_ENTRY_CUTOFF_UTC_MINUTE)
-    ):
+    if payload.get("asset_type") == "option" and datetime.now(timezone.utc) >= _entry_cutoff_utc():
         return True, (
             f"Synchronous veto: past new-entry cutoff "
-            f"{NEW_ENTRY_CUTOFF_UTC_HOUR}:{NEW_ENTRY_CUTOFF_UTC_MINUTE:02d} UTC"
+            f"{_entry_cutoff_utc().strftime('%H:%M')} UTC (15:30 ET)"
         )
 
     return False, ""
@@ -504,18 +567,29 @@ def run_equity_position_monitor(conn) -> None:
         stop_pct = -0.015
         target_pct = 0.025
         max_hold_days = 20
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT * FROM nwt_strategy_genome WHERE strategy_id = %s AND active = TRUE",
-                    (strategy_id,),
-                )
-                genome = cur.fetchone()
-            if genome:
-                stop_pct = -abs(float(genome["stop_loss_pct"]))
-                target_pct = float(genome["profit_target_pct"])
-        except Exception:
-            pass
+
+        # Prefer the per-trade stop_pct/target_pct the Brain/executor actually
+        # sent with this ticket (persisted on the ledger row at fill time) —
+        # these used to be accepted into the Brain->Execution payload and then
+        # silently discarded in favor of the genome/hardcoded default below.
+        ledger_stop = pos.get("stop_pct")
+        ledger_target = pos.get("target_pct")
+        if ledger_stop is not None and ledger_target is not None:
+            stop_pct = -abs(float(ledger_stop))
+            target_pct = float(ledger_target)
+        else:
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        "SELECT * FROM nwt_strategy_genome WHERE strategy_id = %s AND active = TRUE",
+                        (strategy_id,),
+                    )
+                    genome = cur.fetchone()
+                if genome:
+                    stop_pct = -abs(float(genome["stop_loss_pct"]))
+                    target_pct = float(genome["profit_target_pct"])
+            except Exception:
+                pass
 
         entry_time = pos.get("entry_time")
         if entry_time:
@@ -800,6 +874,8 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         "entry_bid": entry_bid,
         "entry_ask": entry_ask,
         "alpaca_order_id": alpaca_order_id,
+        "stop_pct": payload.get("stop_pct"),
+        "target_pct": payload.get("target_pct"),
     }
 
     try:

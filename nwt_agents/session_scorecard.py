@@ -109,7 +109,16 @@ def check_tracks_ran(conn, today) -> tuple:
 
 
 def check_activity_logged(conn, today) -> tuple:
-    """Proposals OR inactivity rows. 'No edge present' is a valid green outcome."""
+    """
+    Proposals OR inactivity rows. 'No edge present' is a valid green outcome.
+
+    Track A (equity) bots log inactivity to nwt_inactivity_log. Track C/D/E
+    (options) log inactivity as nwt_tickets rows with type='inactivity'
+    instead (shared_context.log_inactivity) — two different tables for the
+    same concept. A day where the options stack correctly logged nothing but
+    well-formed NO_EDGE/SHADOW_MODE inactivity used to score RED here because
+    only the equity-bot table was counted.
+    """
     proposals = _count(
         conn,
         """
@@ -119,7 +128,7 @@ def check_activity_logged(conn, today) -> tuple:
         """,
         (today,),
     )
-    inactivity = _count(
+    inactivity_equity = _count(
         conn,
         """
         SELECT COUNT(*) FROM nwt_inactivity_log
@@ -127,7 +136,22 @@ def check_activity_logged(conn, today) -> tuple:
         """,
         (today,),
     )
-    return (proposals + inactivity) > 0, {"proposals": proposals, "inactivity_rows": inactivity}
+    inactivity_options = _count(
+        conn,
+        """
+        SELECT COUNT(*) FROM nwt_tickets
+        WHERE type = 'inactivity'
+          AND (created_at AT TIME ZONE 'UTC')::date = %s
+        """,
+        (today,),
+    )
+    inactivity = inactivity_equity + inactivity_options
+    return (proposals + inactivity) > 0, {
+        "proposals": proposals,
+        "inactivity_rows": inactivity,
+        "inactivity_equity": inactivity_equity,
+        "inactivity_options": inactivity_options,
+    }
 
 
 def check_risk_agent_clear(conn, today) -> tuple:

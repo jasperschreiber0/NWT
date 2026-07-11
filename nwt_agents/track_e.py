@@ -26,6 +26,7 @@ import integrity_gate
 from shared_context import (
     check_no_trade_mode,
     compute_final_sizing,
+    evaluate_shadow_mutation,
     get_active_strategy_ids,
     get_db,
     get_strategy_genome,
@@ -36,6 +37,7 @@ from shared_context import (
     log_decision_input,
     log_inactivity,
     log_system_event,
+    regime_matches,
 )
 
 logging.basicConfig(
@@ -51,15 +53,6 @@ TRADE_PCT = 0.02
 # Track E entry threshold (higher than C/D)
 TRACK_E_MIN_CONVICTION_NORMALIZED = 0.60  # 6/10
 MIN_QUANT_EDGE_MAGNITUDE = 0.30
-
-
-def regime_matches(genome_regime: str, current_regime: dict) -> bool:
-    primary = current_regime.get("primary_regime", "").lower()
-    secondary = (current_regime.get("secondary_regime") or "").lower()
-    genome_r = (genome_regime or "").lower()
-    if genome_r in ("any", "", "all"):
-        return True
-    return genome_r == primary or genome_r == secondary
 
 
 def compute_quantitative_edge(layer0: dict, symbol: str, conviction_ticket: dict) -> dict:
@@ -213,6 +206,9 @@ def main() -> None:
                 log_inactivity(conn, strategy_id, "E", "SHADOW_MODE", regime)
                 continue
 
+            evaluate_shadow_mutation(conn, strategy_id, "E", find_best_ticket,
+                                     conviction_tickets, regime, layer0, run_date)
+
             best_ticket = find_best_ticket(conviction_tickets, genome, regime)
 
             if best_ticket is None:
@@ -286,15 +282,6 @@ def main() -> None:
                 "conviction_ticket_id": best_ticket.get("ticket_id"),
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
-
-            # Final guard: verify quantitative_edge is present in the proposal
-            if "quantitative_edge" not in proposal:
-                logger.error(
-                    "%s: quantitative_edge missing from proposal — auto-rejected (code bug)",
-                    strategy_id,
-                )
-                log_inactivity(conn, strategy_id, "E", "MISSING_QUANTITATIVE_EDGE_CODE_BUG", regime)
-                continue
 
             try:
                 ticket_id = insert_ticket(

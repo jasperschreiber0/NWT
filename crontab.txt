@@ -26,8 +26,14 @@ NWT_DIR=/home/northworld/trading/nwt_agents
 # Risk agent every 5 min, 13:00-20:00 UTC Mon-Fri
 */5 13-20 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 risk_agent.py >> /var/log/nwt/risk.log 2>&1
 
-# Execution agent every 5 min, 13:00-19:00 UTC Mon-Fri
-*/5 13-19 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 execution_agent.py >> /var/log/nwt/execution.log 2>&1
+# Execution agent every 5 min, 13:00-20:00 UTC Mon-Fri.
+# NOTE: was 13:00-19:00 — that window ends BEFORE the DST-aware 15:45 ET hard
+# close in winter (20:45 UTC in EST), so this agent's own options position
+# monitor (monitor_options_positions) couldn't reach the winter hard-close
+# time at all; coverage in that gap relied entirely on risk_agent.py's
+# independent force_close_past_hard_close path. Widened to match risk_agent
+# and execution_engine's own windows.
+*/5 13-20 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 execution_agent.py >> /var/log/nwt/execution.log 2>&1
 
 # Execution engine every 5 min, 13:00-20:00 UTC Mon-Fri
 */5 13-20 * * 1-5 cd /home/northworld/trading/execution && set -a && source .env && set +a && python3 engine.py >> /var/log/nwt/execution_engine.log 2>&1
@@ -39,6 +45,10 @@ NWT_DIR=/home/northworld/trading/nwt_agents
 0 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 learning_agent.py >> /var/log/nwt/learning.log 2>&1
 0 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 cost_agent.py >> /var/log/nwt/cost.log 2>&1
 
+# Strategy Mutator (Learning Layer C) — propose, 21:10 UTC Mon-Fri, after
+# learning_agent.py's decay computation. Never touches the active genome row.
+10 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 mutation_agent.py --propose >> /var/log/nwt/mutation_propose.log 2>&1
+
 # Session scorecard (green/red) — 21:15 UTC Mon-Fri, after learning agent
 15 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 session_scorecard.py >> /var/log/nwt/scorecard.log 2>&1
 
@@ -47,10 +57,22 @@ NWT_DIR=/home/northworld/trading/nwt_agents
 # zero-sized candidates whose dte_target window has elapsed.
 20 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 shadow_decision_evaluator.py >> /var/log/nwt/shadow_eval.log 2>&1
 
+# Strategy Mutator — promote, 21:22 UTC Mon-Fri, right after shadow eval has
+# had a chance to fill in the day's outcomes. Checks the Learning Gate
+# (100+ trades, 2+ regimes, improvement, no tail-risk degradation) before
+# flipping any genome version active; respects nwt_system_flags.mutation_frozen.
+22 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 mutation_agent.py --promote >> /var/log/nwt/mutation_promote.log 2>&1
+
 # Morning triage digest — 21:30 UTC Mon-Fri, after the scorecard.
 # Read-only: classifies overnight errors benign vs escalate, dedups recurring
 # faults by signature, emits one digest (Postgres + notifier). No trade authority.
 30 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 triage_agent.py >> /var/log/nwt/triage.log 2>&1
+
+# Track F scanner (research signal only, no order authority) — 12:00 UTC
+# Mon-Fri, before the conviction stack. SEC filings don't change intraday,
+# so once-daily is sufficient; runs early to stay well clear of the 13:00+
+# options pipeline's own EDGAR/Alpaca API usage.
+0 12 * * 1-5 cd $NWT_DIR/track_f && set -a && source ../.env && set +a && python3 scanner.py >> /var/log/nwt/track_f_scanner.log 2>&1
 
 # Recon nightly — 23:00 UTC Mon-Fri (after learning agent, before next session)
 0 23 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 recon_agent.py --nightly >> /var/log/nwt/recon.log 2>&1

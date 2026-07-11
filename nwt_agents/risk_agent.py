@@ -11,28 +11,25 @@ import json
 import logging
 import os
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import psycopg2
-import requests
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 
 load_dotenv(Path(__file__).parent / ".env")
 
 from shared_context import (
-    NEW_ENTRY_CUTOFF_UTC_HOUR,
-    NEW_ENTRY_CUTOFF_UTC_MINUTE,
     check_no_trade_mode,
+    fetch_vix_proxy,
     get_db,
     get_disabled_tracks,
     insert_decision,
     insert_ticket,
     load_master_directives,
     log_system_event,
-    past_new_entry_cutoff,
     set_no_trade_mode,
 )
 
@@ -59,6 +56,7 @@ CONSECUTIVE_LOSS_LIMIT = 4
 NET_DELTA_CAP = 0.70
 REGIME_CONFIDENCE_REDUCE = 0.40
 REGIME_TRANSITION_PAUSE = 0.60
+SIZING_REDUCTION_MULTIPLIER = 0.50  # Rules 3 & 7: "reduce all sizing 50%"
 HARD_CLOSE_UTC_HOUR = 19
 HARD_CLOSE_UTC_MINUTE = 45
 EXECUTION_STALE_MINUTES = 30
@@ -224,42 +222,15 @@ def fetch_vix_with_fallback(conn) -> tuple:
     """
     Returns (vix_value, source) or (None, 'unavailable').
     VIX=0 is treated as missing — never as a signal.
-    Fallback: ATM SPY ~30 DTE IV from Alpaca options chain.
+    Thin wrapper over shared_context.fetch_vix_proxy — the single VIX-proxy
+    implementation every agent uses, so layer0_builder.py's prescreener
+    filter and this kill switch never disagree about what "VIX" means.
     """
     try:
         directives = load_master_directives()
-        vix = directives.get("vix") or 0.0
-        if vix > 0:
-            return float(vix), "master_directives"
     except Exception:
-        pass
-
-    try:
-        today = date.today()
-        url = f"{ALPACA_BASE_URL}/v2/options/contracts"
-        params = {
-            "underlying_symbols": "SPY",
-            "expiration_date_gte": (today + timedelta(days=25)).isoformat(),
-            "expiration_date_lte": (today + timedelta(days=35)).isoformat(),
-            "type": "call",
-            "limit": 10,
-        }
-        resp = requests.get(url, headers=ALPACA_HEADERS, params=params, timeout=15)
-        resp.raise_for_status()
-        contracts = resp.json().get("option_contracts", [])
-        if contracts:
-            price_url = f"{ALPACA_DATA_URL}/v2/stocks/SPY/trades/latest"
-            pr = requests.get(price_url, headers=ALPACA_HEADERS, timeout=10)
-            pr.raise_for_status()
-            spy_price = float(pr.json()["trade"]["p"])
-            atm = min(contracts, key=lambda c: abs(float(c.get("strike_price", 0)) - spy_price))
-            iv = float(atm.get("implied_volatility") or 0)
-            if iv > 0:
-                return iv * 100, "spy_iv_proxy"
-    except Exception as exc:
-        logger.warning("VIX fallback computation failed: %s", exc)
-
-    return None, "unavailable"
+        directives = None
+    return fetch_vix_proxy(ALPACA_BASE_URL, ALPACA_DATA_URL, ALPACA_HEADERS, directives)
 
 
 def execution_engine_is_stale(conn) -> bool:
@@ -441,6 +412,7 @@ def evaluate_proposal(
     execution_stale: bool,
     api_anomaly: bool,
 ) -> tuple:
+    """Returns (decision, reasoning, sizing_multiplier | None)."""
     payload = ticket.get("payload") or {}
     regime = directives.get("regime", {})
     from_track = (payload.get("from_track") or "").upper()
@@ -454,70 +426,85 @@ def evaluate_proposal(
         return "VETOED", (
             f"Rule 0: Past new-entry cutoff {entry_cutoff.strftime('%H:%M')} UTC "
             f"(15:30 ET) — no new positions"
-        )
+        ), None
 
     # Rule 1: VIX > 40
     vix = directives.get("vix") or 0.0
     if vix > VIX_KILL_THRESHOLD:
         activate_global_kill_switch(conn, f"VIX={vix:.1f} > {VIX_KILL_THRESHOLD}")
-        return "VETOED", f"Rule 1: VIX={vix:.1f} > {VIX_KILL_THRESHOLD}"
+        return "VETOED", f"Rule 1: VIX={vix:.1f} > {VIX_KILL_THRESHOLD}", None
 
     # Rule 2: Drawdown > 8%
     if drawdown > DRAWDOWN_KILL_THRESHOLD:
         activate_global_kill_switch(conn, f"Drawdown={drawdown:.1%}")
-        return "VETOED", f"Rule 2: Drawdown={drawdown:.1%} > {DRAWDOWN_KILL_THRESHOLD:.0%}"
+        return "VETOED", f"Rule 2: Drawdown={drawdown:.1%} > {DRAWDOWN_KILL_THRESHOLD:.0%}", None
 
-    # Rule 3: Slippage expansion > 2x — flag but don't veto
+    sizing_multiplier = None
+
+    # Rule 3: Slippage expansion > 2x → don't veto, but actually cut sizing
+    # 50% (this used to only log a WARNING with no corresponding effect —
+    # CLAUDE.md's own escalation table specifies a real sizing cut here).
     if baseline_slippage > 0 and recent_slippage > SLIPPAGE_EXPANSION_FACTOR * baseline_slippage:
+        sizing_multiplier = SIZING_REDUCTION_MULTIPLIER
         log_system_event(conn, "WARNING", "risk_agent",
-                         f"Rule 3: Slippage expansion {recent_slippage:.4f} vs baseline {baseline_slippage:.4f}")
+                         f"Rule 3: Slippage expansion {recent_slippage:.4f} vs baseline "
+                         f"{baseline_slippage:.4f} — sizing_multiplier={SIZING_REDUCTION_MULTIPLIER}")
 
     # Rule 4: Consecutive losses >= 4 (same track)
     track_losses = consecutive_losses.get(from_track, 0)
     if from_track and track_losses >= CONSECUTIVE_LOSS_LIMIT:
         disable_track(conn, from_track, f"{track_losses} consecutive losses")
         disabled_tracks.add(from_track)
-        return "VETOED", f"Rule 4: Track {from_track} has {track_losses} consecutive losses — disabled"
+        return "VETOED", f"Rule 4: Track {from_track} has {track_losses} consecutive losses — disabled", None
 
     # Rule 5: Net delta > 0.7 → no new longs
     if net_delta > NET_DELTA_CAP and direction == "long":
-        return "VETOED", f"Rule 5: Net delta={net_delta:.2f} > {NET_DELTA_CAP} — no new longs"
+        return "VETOED", f"Rule 5: Net delta={net_delta:.2f} > {NET_DELTA_CAP} — no new longs", None
 
     # Rule 6: Net delta < -0.7 → no new shorts
     if net_delta < -NET_DELTA_CAP and direction == "short":
-        return "VETOED", f"Rule 6: Net delta={net_delta:.2f} < -{NET_DELTA_CAP} — no new shorts"
+        return "VETOED", f"Rule 6: Net delta={net_delta:.2f} < -{NET_DELTA_CAP} — no new shorts", None
 
-    # Rule 7: Regime confidence < 0.4 — log, don't veto (sizing handled by compute_final_sizing)
+    # Rule 7: Regime confidence < 0.4 → don't veto, but actually cut sizing 50%.
+    # This is a harder floor than compute_final_sizing's own confidence<0.5
+    # → ×0.7 proactive haircut (applied earlier, at proposal-build time);
+    # this is the Risk Agent's independent, stricter response to the
+    # specific confidence<0.4 condition its own escalation table names.
     confidence = regime.get("confidence", 1.0)
     if confidence < REGIME_CONFIDENCE_REDUCE:
+        sizing_multiplier = min(sizing_multiplier or 1.0, SIZING_REDUCTION_MULTIPLIER)
         log_system_event(conn, "WARNING", "risk_agent",
-                         f"Rule 7: Regime confidence={confidence:.2f} < {REGIME_CONFIDENCE_REDUCE} — sizing reduced")
+                         f"Rule 7: Regime confidence={confidence:.2f} < {REGIME_CONFIDENCE_REDUCE} "
+                         f"— sizing_multiplier={sizing_multiplier}")
 
     # Rule 8: Regime transition_risk > 0.6 → pause entries
     transition_risk = regime.get("transition_risk", 0.0)
     if transition_risk > REGIME_TRANSITION_PAUSE:
-        return "VETOED", f"Rule 8: Regime transition_risk={transition_risk:.2f} > {REGIME_TRANSITION_PAUSE}"
+        return "VETOED", f"Rule 8: Regime transition_risk={transition_risk:.2f} > {REGIME_TRANSITION_PAUSE}", None
 
     # Rule 9: API anomaly
     if api_anomaly:
-        return "VETOED", "Rule 9: Recent API anomaly — pausing execution"
+        return "VETOED", "Rule 9: Recent API anomaly — pausing execution", None
 
     # Rule 10: Spread widening > 3x (slippage as proxy)
     if baseline_slippage > 0 and recent_slippage > SPREAD_WIDENING_FACTOR * baseline_slippage:
         return "VETOED", (
             f"Rule 10: Spread widening — slippage={recent_slippage:.4f} "
             f"> {SPREAD_WIDENING_FACTOR}x baseline={baseline_slippage:.4f}"
-        )
+        ), None
 
     # Rule 11: Execution engine unresponsive
     if execution_stale:
-        return "VETOED", "Rule 11: Execution engine unresponsive — NO-TRADE MODE"
+        return "VETOED", "Rule 11: Execution engine unresponsive — NO-TRADE MODE", None
 
     # Rule 13: Track in cooling-off
     if from_track in disabled_tracks:
-        return "VETOED", f"Rule 13: Track {from_track} is in cooling-off — proposals rejected"
+        return "VETOED", f"Rule 13: Track {from_track} is in cooling-off — proposals rejected", None
 
-    return "APPROVED", "All 13 risk rules passed"
+    reasoning = "All 13 risk rules passed"
+    if sizing_multiplier is not None:
+        reasoning += f" (sizing_multiplier={sizing_multiplier})"
+    return "APPROVED", reasoning, sizing_multiplier
 
 
 # ---------------------------------------------------------------------------
@@ -604,8 +591,9 @@ def main() -> None:
             if halted:
                 decision = "VETOED"
                 reasoning = f"no_trade_mode is set: {halt_reason}"
+                sizing_multiplier = None
             else:
-                decision, reasoning = evaluate_proposal(
+                decision, reasoning, sizing_multiplier = evaluate_proposal(
                     conn=conn, ticket=ticket, directives=directives,
                     drawdown=drawdown, consecutive_losses=consecutive_losses,
                     disabled_tracks=disabled_tracks, baseline_slippage=baseline_slippage,
@@ -613,7 +601,7 @@ def main() -> None:
                     execution_stale=execution_stale, api_anomaly=api_anomaly,
                 )
 
-            insert_decision(conn, ticket_id, decision, reasoning, "RISK_AGENT")
+            insert_decision(conn, ticket_id, decision, reasoning, "RISK_AGENT", sizing_multiplier)
             payload = ticket.get("payload") or {}
 
             if decision == "APPROVED":

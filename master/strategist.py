@@ -46,6 +46,7 @@ logging.basicConfig(
 logger = logging.getLogger("master-strategist")
 
 # Local modules — import after .env is loaded
+from allocator import compute_dynamic_weights  # noqa: E402
 from market_internals import fetch_market_internals  # noqa: E402
 from regime_classifier import classify_regime  # noqa: E402
 
@@ -64,8 +65,11 @@ BASELINE_WEIGHTS = {
     "china": 0.15,   # $15k / $97k
 }
 
-# Maximum single-bot weight (sanity cap)
-MAX_WEIGHT = 0.65
+# Per-bot capital-weight ceiling (sanity cap on any single bot's share of
+# total capital). Distinct from execution/engine.py's DIRECTIONAL_CAP_PCT
+# (0.60), which caps aggregate same-direction notional across all bots —
+# the two are complementary controls, not the same "directional cap" twice.
+PER_BOT_WEIGHT_CEILING = 0.65
 
 # ---------------------------------------------------------------------------
 # Integrity Gate
@@ -156,6 +160,40 @@ def read_open_positions(conn: psycopg2.extensions.connection) -> list[dict]:
     except Exception as exc:
         logger.error("Failed to read nwt_portfolio_ledger: %s", exc)
         return []
+
+# ---------------------------------------------------------------------------
+# Regime history — feeds the "same regime 5+ sessions" persistence rule
+# ---------------------------------------------------------------------------
+
+def fetch_recent_regime_history(conn: psycopg2.extensions.connection, limit: int = 10) -> list[str]:
+    """Prior sessions' primary_regime values, most recent first."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT primary_regime FROM nwt_regime_history ORDER BY computed_at DESC LIMIT %s",
+                (limit,),
+            )
+            return [row[0] for row in cur.fetchall()]
+    except Exception as exc:
+        logger.warning("Could not read nwt_regime_history: %s", exc)
+        return []
+
+
+def record_regime_history(
+    conn: psycopg2.extensions.connection, regime: dict, spy_vs_5d_pct: Optional[float]
+) -> None:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_regime_history (primary_regime, confidence, transition_risk, spy_vs_5d_pct)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (regime["primary_regime"], regime["confidence"], regime["transition_risk"], spy_vs_5d_pct),
+            )
+        conn.commit()
+    except Exception as exc:
+        logger.warning("Could not write nwt_regime_history: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Net Delta / Vega estimation
@@ -360,6 +398,7 @@ def compute_bot_permissions(
     exposure: dict,
     kill_switch: bool,
     vix: Optional[float],
+    starting_weights: Optional[dict] = None,
 ) -> tuple[dict, list[str]]:
     """
     Compute per-bot permission objects based on regime + exposure + kill switch.
@@ -372,6 +411,12 @@ def compute_bot_permissions(
     5. EU bot: reduced if inflation_concern
     6. AUS bot: reduced if regime is risk_off or recession_fear
 
+    starting_weights: Learning Layer D's allocator.compute_dynamic_weights()
+    output, if available — replaces BASELINE_WEIGHTS as the starting point
+    before any of the regime-driven adjustments below are applied. Falls
+    back to BASELINE_WEIGHTS (cold start, or allocator error) — explicit,
+    not an error, matching this codebase's convention.
+
     Returns (bot_permissions_dict, conflict_notes_list)
     """
     conflict_notes = []
@@ -379,8 +424,8 @@ def compute_bot_permissions(
     transition_risk = float(regime.get("transition_risk", 0.3))
     primary = regime.get("primary_regime", "neutral")
 
-    # Start from baseline weights
-    weights = dict(BASELINE_WEIGHTS)
+    # Start from allocator-tilted weights (Learning Layer D), or baseline
+    weights = dict(starting_weights) if starting_weights else dict(BASELINE_WEIGHTS)
     size_caps = {bot: 1.0 for bot in weights}
     statuses = {bot: "active" for bot in weights}
 
@@ -473,7 +518,7 @@ def compute_bot_permissions(
         scale = min(1.0, 1.0 / total_weight) if total_weight > 1.0 else 1.0
         for bot in weights:
             if statuses[bot] != "paused":
-                weights[bot] = round(min(weights[bot] * scale, MAX_WEIGHT), 4)
+                weights[bot] = round(min(weights[bot] * scale, PER_BOT_WEIGHT_CEILING), 4)
 
     # Ensure paused bots have 0 weight
     for bot in weights:
@@ -614,6 +659,23 @@ def log_to_postgres(
 # Write master-directives.json
 # ---------------------------------------------------------------------------
 
+def upsert_agent_state(conn: psycopg2.extensions.connection, agent: str, status: str, detail: dict) -> None:
+    """Self-contained (no cross-package import — master/ and nwt_agents/ stay independent stacks)."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_agent_state (agent, status, detail, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (agent) DO UPDATE SET status=%s, detail=%s, updated_at=NOW()
+                """,
+                (agent, status, json.dumps(detail, default=str), status, json.dumps(detail, default=str)),
+            )
+        conn.commit()
+    except Exception as exc:
+        logger.warning("Failed to write nwt_agent_state: %s", exc)
+
+
 def write_directives(directives: dict) -> None:
     """
     Write master-directives.json to the shared directory.
@@ -705,11 +767,21 @@ def main() -> int:
 
         # --- Regime classification ---
         logger.info("Classifying regime...")
-        regime = classify_regime(internals, exposure)
+        regime_history = fetch_recent_regime_history(conn)
+        regime = classify_regime(internals, exposure, regime_history=regime_history)
+        record_regime_history(conn, regime, internals.get("spy_vs_5d_pct"))
 
         # --- Kill switch ---
         vix = internals.get("vix")
         kill_switch, kill_reason = evaluate_kill_switch(vix, drawdown)
+
+        # --- Portfolio Allocator (Learning Layer D) ---
+        logger.info("Computing dynamic capital weights...")
+        try:
+            dynamic_weights, allocator_notes = compute_dynamic_weights(conn, regime, BASELINE_WEIGHTS)
+        except Exception as exc:
+            logger.warning("Allocator failed — falling back to baseline weights: %s", exc)
+            dynamic_weights, allocator_notes = dict(BASELINE_WEIGHTS), [f"Allocator error (using baseline): {exc}"]
 
         # --- Bot permissions ---
         logger.info("Computing bot permissions...")
@@ -718,7 +790,9 @@ def main() -> int:
             exposure=exposure,
             kill_switch=kill_switch,
             vix=vix,
+            starting_weights=dynamic_weights,
         )
+        conflict_notes = allocator_notes + conflict_notes
 
         # --- Reasoning ---
         reasoning = build_reasoning(
@@ -772,6 +846,11 @@ def main() -> int:
                 "permissions": permissions,
             },
         )
+
+        upsert_agent_state(conn, "master-strategist", "ok", {
+            "regime": regime["primary_regime"], "kill_switch": kill_switch,
+            "dynamic_weights": dynamic_weights,
+        })
 
         logger.info("=== master-strategist complete ===")
         logger.info(summary)

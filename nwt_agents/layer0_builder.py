@@ -20,7 +20,14 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 import integrity_gate
-from shared_context import get_db, load_master_directives, log_inactivity, log_system_event
+from shared_context import (
+    check_no_trade_mode,
+    fetch_vix_proxy,
+    get_db,
+    load_master_directives,
+    log_inactivity,
+    log_system_event,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -126,21 +133,6 @@ def fetch_options_snapshot(symbol: str) -> dict:
         return {"iv": 0.0, "put_call_ratio": 1.0, "iv_skew": 0.0}
 
 
-def fetch_vix() -> float:
-    """Fetch VIX level. Returns 0.0 on failure (treat as missing, not signal)."""
-    try:
-        url = f"{ALPACA_DATA_URL}/v2/stocks/VIXY/trades/latest"
-        resp = requests.get(url, headers=ALPACA_HEADERS, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        price = float(data["trade"]["p"])
-        # VIXY ~= VIX/10 as a rough proxy; use raw price as indicator
-        return price
-    except Exception as exc:
-        logger.warning("VIX fetch failed (using 0.0 as missing): %s", exc)
-        return 0.0
-
-
 # ---------------------------------------------------------------------------
 # Technical indicators
 # ---------------------------------------------------------------------------
@@ -233,18 +225,37 @@ def main() -> None:
 
     conn = get_db()
 
+    all_strategy_ids = [f"C{i}" for i in range(1, 13)] + \
+                       [f"D{i}" for i in range(1, 13)] + \
+                       [f"E{i}" for i in range(1, 13)]
+    track_map = {**{f"C{i}": "C" for i in range(1, 13)},
+                 **{f"D{i}": "D" for i in range(1, 13)},
+                 **{f"E{i}": "E" for i in range(1, 13)}}
+
+    # no_trade_mode halts every trading agent, not just the kill switch — a
+    # session halted by recon/heartbeat (rather than the kill switch) used to
+    # still run the full conviction stack, burning Alpaca + Anthropic API
+    # cost for a session that could never trade anyway.
+    halted, halt_reason = check_no_trade_mode(conn)
+    if halted:
+        logger.warning("no_trade_mode SET — logging inactivity for all strategies and exiting: %s", halt_reason)
+        try:
+            directives = load_master_directives()
+        except FileNotFoundError:
+            directives = {}
+        regime = directives.get("regime", {})
+        for sid in all_strategy_ids:
+            log_inactivity(conn, sid, track_map[sid], "NO_TRADE_MODE", regime)
+        log_system_event(conn, "WARNING", "layer0_builder", f"no_trade_mode — layer0 skipped: {halt_reason}")
+        conn.close()
+        sys.exit(0)
+
     # Check global kill switch
     try:
         directives = load_master_directives()
         if directives.get("global_kill_switch", False):
             logger.warning("Global kill switch active — logging inactivity for all strategies and exiting")
             regime = directives.get("regime", {})
-            all_strategy_ids = [f"C{i}" for i in range(1, 13)] + \
-                               [f"D{i}" for i in range(1, 13)] + \
-                               [f"E{i}" for i in range(1, 13)]
-            track_map = {**{f"C{i}": "C" for i in range(1, 13)},
-                         **{f"D{i}": "D" for i in range(1, 13)},
-                         **{f"E{i}": "E" for i in range(1, 13)}}
             for sid in all_strategy_ids:
                 log_inactivity(conn, sid, track_map[sid], "GLOBAL_KILL_SWITCH", regime)
             log_system_event(conn, "WARNING", "layer0_builder", "Kill switch active — layer0 skipped")
@@ -256,9 +267,13 @@ def main() -> None:
 
     logger.info("Fetching market data for %d symbols", len(SYMBOLS))
 
-    # Fetch VIX
-    vix = fetch_vix()
-    logger.info("VIX: %.2f", vix)
+    # Fetch VIX proxy — shared_context.fetch_vix_proxy is the single source
+    # of truth every agent uses (see risk_agent.py); this used to fetch a
+    # raw VIXY ETF price directly, which structurally never exceeds the
+    # downstream vix>40 hard filter in prescreener.py.
+    vix_value, vix_source = fetch_vix_proxy(ALPACA_BASE_URL, ALPACA_DATA_URL, ALPACA_HEADERS, directives)
+    vix = vix_value if vix_value is not None else 0.0
+    logger.info("VIX: %.2f (source=%s)", vix, vix_source)
 
     # Fetch options snapshots for SPY and QQQ
     spy_snap = fetch_options_snapshot("SPY")

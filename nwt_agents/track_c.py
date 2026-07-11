@@ -24,6 +24,7 @@ import integrity_gate
 from shared_context import (
     check_no_trade_mode,
     compute_final_sizing,
+    evaluate_shadow_mutation,
     get_active_strategy_ids,
     get_db,
     get_strategy_genome,
@@ -34,6 +35,7 @@ from shared_context import (
     log_decision_input,
     log_inactivity,
     log_system_event,
+    regime_matches,
 )
 
 logging.basicConfig(
@@ -45,16 +47,6 @@ logger = logging.getLogger("track_c")
 
 ACCOUNT_SIZE = 97_000.0  # ~$97k equity
 TRADE_PCT = 0.02         # 2% per trade
-
-
-def regime_matches(genome_regime: str, current_regime: dict) -> bool:
-    """Check if genome's regime string matches the current primary or secondary regime."""
-    primary = current_regime.get("primary_regime", "").lower()
-    secondary = (current_regime.get("secondary_regime") or "").lower()
-    genome_r = (genome_regime or "").lower()
-    if genome_r in ("any", "", "all"):
-        return True
-    return genome_r == primary or genome_r == secondary
 
 
 def find_best_ticket(conviction_tickets: list, genome: dict, current_regime: dict) -> dict | None:
@@ -128,6 +120,12 @@ def main() -> None:
                 logger.info("%s in shadow_mode — skipping live proposal", strategy_id)
                 log_inactivity(conn, strategy_id, "C", "SHADOW_MODE", regime)
                 continue
+
+            # Mutation Layer C: evaluate any pending shadow-mutation candidate
+            # for this strategy against the same conviction tickets, entirely
+            # separate from the live proposal below.
+            evaluate_shadow_mutation(conn, strategy_id, "C", find_best_ticket,
+                                     conviction_tickets, regime, layer0, run_date)
 
             best_ticket = find_best_ticket(conviction_tickets, genome, regime)
 

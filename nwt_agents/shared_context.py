@@ -6,16 +6,32 @@ All agents must import from here — never duplicate these lookups.
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import psycopg2
+import requests
 from psycopg2.extras import RealDictCursor
 
-# Shared timing constants — single definition for risk agent AND execution path
-NEW_ENTRY_CUTOFF_UTC_HOUR = 19    # No new entries after 19:30 UTC (15:30 EDT)
-NEW_ENTRY_CUTOFF_UTC_MINUTE = 30
+# Shared timing constants
 TRACK_COOLOFF_HOURS = 24
+
+# New-entry cutoff is 15:30 ET, computed DST-aware below — never a fixed UTC
+# hour/minute. A fixed "19:30 UTC" constant is only correct during EDT
+# (summer); in EST (winter) 15:30 ET is 20:30 UTC, an hour later, so a fixed
+# constant silently vetoes valid, already-approved trades for a third of the
+# year. risk_agent.py's own Rule 0 already computes this correctly — this is
+# the same logic, exposed here so every other caller (pre_trade_veto included)
+# uses the one true implementation instead of a second, driftable copy.
+ET_TZ = ZoneInfo("America/New_York")
+
+
+def new_entry_cutoff_utc(now: datetime = None) -> datetime:
+    """15:30 ET in UTC, fully DST-aware, for the date `now` (or today) falls on."""
+    et_now = (now or datetime.now(timezone.utc)).astimezone(ET_TZ)
+    cutoff = datetime(et_now.year, et_now.month, et_now.day, 15, 30, tzinfo=ET_TZ)
+    return cutoff.astimezone(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -50,13 +66,6 @@ def load_conviction_tickets() -> list:
         return []
     with open(path) as f:
         return json.load(f)
-
-
-def load_conviction_summary() -> str:
-    path = _agents_dir() / "conviction_summary.txt"
-    if not path.exists():
-        return ""
-    return path.read_text()
 
 
 def load_layer0_data() -> dict:
@@ -101,6 +110,136 @@ def get_active_strategy_ids(conn, track: str) -> list:
             (track,),
         )
         return [row[0] for row in cur.fetchall()]
+
+
+def get_shadow_genome(conn, strategy_id: str) -> dict:
+    """
+    Return the pending shadow-mutation candidate version for a strategy_id,
+    if one exists (shadow_mode=TRUE, active=FALSE, highest version). Returns
+    {} if none — a strategy with no shadow candidate is the normal case.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT * FROM nwt_strategy_genome
+            WHERE strategy_id = %s AND shadow_mode = TRUE AND active = FALSE
+            ORDER BY version DESC LIMIT 1
+            """,
+            (strategy_id,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else {}
+
+
+def is_mutation_frozen(conn) -> bool:
+    """Risk Agent authority: freeze mutation promotion (never proposal)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM nwt_system_flags WHERE flag = 'mutation_frozen'")
+        row = cur.fetchone()
+    return bool(row and row[0])
+
+
+def set_mutation_frozen(conn, frozen: bool, reason: str, set_by: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_system_flags (flag, value, reason, set_by, updated_at)
+            VALUES ('mutation_frozen', %s, %s, %s, NOW())
+            ON CONFLICT (flag) DO UPDATE SET value=%s, reason=%s, set_by=%s, updated_at=NOW()
+            """,
+            (frozen, reason, set_by, frozen, reason, set_by),
+        )
+    conn.commit()
+
+
+def upsert_agent_state(conn, agent: str, status: str, detail: dict = None) -> None:
+    """Generic per-agent status row, surfaced by the dashboard's /api/performance."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_agent_state (agent, status, detail, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (agent) DO UPDATE SET status=%s, detail=%s, updated_at=NOW()
+                """,
+                (agent, status, json.dumps(detail) if detail is not None else None,
+                 status, json.dumps(detail) if detail is not None else None),
+            )
+        conn.commit()
+    except Exception:
+        pass  # status surface must never break the calling agent
+
+
+def regime_matches(genome_regime: str, current_regime: dict) -> bool:
+    """
+    Check if a genome row's regime string matches the current primary or
+    secondary regime. Single implementation — track_c/d/e.py each used to
+    carry an identical copy of this; a future fix to one and not the others
+    would silently fork regime-matching behavior across tracks.
+    """
+    primary = (current_regime.get("primary_regime") or "").lower()
+    secondary = (current_regime.get("secondary_regime") or "").lower()
+    genome_r = (genome_regime or "").lower()
+    if genome_r in ("any", "", "all"):
+        return True
+    return genome_r == primary or genome_r == secondary
+
+
+# ---------------------------------------------------------------------------
+# VIX proxy — single source of truth
+# ---------------------------------------------------------------------------
+
+def fetch_vix_proxy(alpaca_base_url: str, alpaca_data_url: str, alpaca_headers: dict,
+                     directives: dict = None) -> tuple:
+    """
+    Single implementation of a VIX-equivalent volatility reading, shared by
+    every agent that needs one. Returns (value, source) or (None, "unavailable").
+    VIX==0 is treated as missing, never as a signal.
+
+    Prefers master-directives.json's own `vix` field (set daily by Portfolio
+    Brain). Falls back to computing ATM SPY ~30 DTE implied volatility
+    directly from Alpaca's options chain when directives are stale/absent.
+
+    Deliberately never returns a raw VIXY (VIX futures ETF) price as if it
+    were the index: VIXY trades ~$12-18 in ordinary conditions because it
+    tracks front-month futures with contango roll decay, not spot VIX — a
+    caller comparing that price directly against a `> 40` kill-switch
+    threshold would find the check structurally unreachable. Two call sites
+    (layer0_builder.py's prescreener hard filter and risk_agent.py's kill
+    switch) used to compute two different, disagreeing "VIX" values; this
+    is the one both now share.
+    """
+    if directives:
+        vix = directives.get("vix") or 0.0
+        if vix > 0:
+            return float(vix), "master_directives"
+
+    try:
+        today = date.today()
+        url = f"{alpaca_base_url}/v2/options/contracts"
+        params = {
+            "underlying_symbols": "SPY",
+            "expiration_date_gte": (today + timedelta(days=25)).isoformat(),
+            "expiration_date_lte": (today + timedelta(days=35)).isoformat(),
+            "type": "call",
+            "limit": 10,
+        }
+        resp = requests.get(url, headers=alpaca_headers, params=params, timeout=15)
+        resp.raise_for_status()
+        contracts = resp.json().get("option_contracts", [])
+        if contracts:
+            price_url = f"{alpaca_data_url}/v2/stocks/SPY/trades/latest"
+            pr = requests.get(price_url, headers=alpaca_headers, timeout=10)
+            pr.raise_for_status()
+            spy_price = float(pr.json()["trade"]["p"])
+            atm = min(contracts, key=lambda c: abs(float(c.get("strike_price", 0)) - spy_price))
+            iv = float(atm.get("implied_volatility") or 0)
+            if iv > 0:
+                return iv * 100, "spy_iv_proxy"
+    except Exception:
+        pass
+
+    return None, "unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -212,10 +351,7 @@ def get_disabled_tracks(conn) -> set:
 
 def past_new_entry_cutoff(now_utc: datetime = None) -> bool:
     now_utc = now_utc or datetime.now(timezone.utc)
-    return (
-        now_utc.hour > NEW_ENTRY_CUTOFF_UTC_HOUR
-        or (now_utc.hour == NEW_ENTRY_CUTOFF_UTC_HOUR and now_utc.minute >= NEW_ENTRY_CUTOFF_UTC_MINUTE)
-    )
+    return now_utc >= new_entry_cutoff_utc(now_utc)
 
 
 def pre_trade_veto(conn, track: str) -> tuple:
@@ -240,7 +376,7 @@ def pre_trade_veto(conn, track: str) -> tuple:
     if past_new_entry_cutoff():
         return True, (
             f"pre_trade_veto: past new-entry cutoff "
-            f"{NEW_ENTRY_CUTOFF_UTC_HOUR}:{NEW_ENTRY_CUTOFF_UTC_MINUTE:02d} UTC"
+            f"{new_entry_cutoff_utc().strftime('%H:%M')} UTC (15:30 ET)"
         )
 
     return False, ""
@@ -313,6 +449,7 @@ def log_decision_input(
     stop_pct: float = None,
     dte_target: int = None,
     ticket_id: str = None,
+    genome_version: int = None,
 ) -> None:
     """
     INSERT one row into nwt_decision_inputs for a candidate that was eligible
@@ -321,6 +458,11 @@ def log_decision_input(
     stop_pct/dte_target are required for shadow_decision_evaluator.py to
     later compute would_have_won; leave them None if unavailable (e.g. no
     layer0 price data) rather than guessing.
+
+    genome_version ties a row to the specific genome version it was
+    evaluated against — set it when logging a Strategy Mutator shadow
+    evaluation (decision='SHADOW_MUTATION') so the promotion job can group
+    a mutation candidate's outcomes separately from its baseline's.
     """
     try:
         with conn.cursor() as cur:
@@ -329,19 +471,85 @@ def log_decision_input(
                 INSERT INTO nwt_decision_inputs
                     (run_date, symbol, strategy_id, track, regime, conviction_score,
                      archetype, is_winner, decision, direction, rejection_reason,
-                     entry_price_ref, target_pct, stop_pct, dte_target, ticket_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     entry_price_ref, target_pct, stop_pct, dte_target, ticket_id,
+                     genome_version)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     run_date, symbol, strategy_id, track, json.dumps(regime), conviction_score,
                     archetype, is_winner, decision, direction, rejection_reason,
                     entry_price_ref, target_pct, stop_pct, dte_target, ticket_id,
+                    genome_version,
                 ),
             )
         conn.commit()
     except Exception as exc:
         log_system_event(conn, "WARNING", f"track_{track.lower()}",
                          f"log_decision_input insert failed for {strategy_id}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Strategy Mutator — shadow-mutation evaluation
+# ---------------------------------------------------------------------------
+
+def evaluate_shadow_mutation(
+    conn,
+    strategy_id: str,
+    track: str,
+    find_ticket_fn,
+    conviction_tickets: list,
+    current_regime: dict,
+    layer0: dict,
+    run_date,
+) -> None:
+    """
+    If mutation_agent.py has proposed a shadow-mutation candidate genome
+    version for this strategy, run the SAME candidate-matching function the
+    caller already used for its live/baseline evaluation, but against the
+    shadow genome's parameters instead. Logs to nwt_decision_inputs tagged
+    with genome_version, entirely separate from the baseline's own logging —
+    never produces a TRADE_PROPOSAL ticket, never touches sizing or risk.
+
+    find_ticket_fn must have the signature (conviction_tickets, genome, regime)
+    -> ticket | None, matching track_c/d/e.py's own matching functions.
+
+    This is how a shadow mutation accumulates the same would_have_won data a
+    live candidate does — shadow_decision_evaluator.py fills in
+    would_have_won/shadow_pnl_pct for these rows exactly like any other, and
+    mutation_agent.py's promotion pass groups by (strategy_id, genome_version)
+    to check the Learning Gate.
+    """
+    shadow_genome = get_shadow_genome(conn, strategy_id)
+    if not shadow_genome:
+        return
+
+    version = shadow_genome["version"]
+    ticket = find_ticket_fn(conviction_tickets, shadow_genome, current_regime)
+
+    if ticket is None:
+        log_decision_input(
+            conn, run_date=run_date, symbol=None, strategy_id=strategy_id,
+            track=track, regime=current_regime, conviction_score=0,
+            archetype=shadow_genome.get("archetype") or strategy_id, is_winner=False,
+            decision="SHADOW_MUTATION_NO_MATCH", genome_version=version,
+        )
+        return
+
+    symbol = ticket.get("symbol")
+    entry_price_ref = layer0.get("symbols", {}).get(symbol, {}).get("price") or None
+    dte_target = ticket.get("dte_target", shadow_genome.get("dte_min", 14))
+    dte_target = max(shadow_genome["dte_min"], min(shadow_genome["dte_max"], dte_target))
+
+    log_decision_input(
+        conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
+        track=track, regime=current_regime, conviction_score=ticket.get("conviction_score", 0),
+        archetype=shadow_genome.get("archetype") or strategy_id, is_winner=True,
+        decision="SHADOW_MUTATION", direction=ticket.get("direction", "long"),
+        entry_price_ref=entry_price_ref,
+        target_pct=float(shadow_genome["profit_target_pct"]),
+        stop_pct=-abs(float(shadow_genome["stop_loss_pct"])),
+        dte_target=dte_target, genome_version=version,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -396,14 +604,23 @@ def insert_decision(
     decision: str,
     reasoning: str,
     decided_by: str,
+    sizing_multiplier: float = None,
 ) -> None:
-    """INSERT into nwt_ticket_decisions. NEVER UPDATE nwt_tickets."""
+    """
+    INSERT into nwt_ticket_decisions. NEVER UPDATE nwt_tickets.
+
+    sizing_multiplier: optional 0-1 factor (RISK_AGENT Rules 3/7 — slippage
+    expansion, regime confidence < 0.4). execution_agent.py reads this back
+    and multiplies sized_notional by it before submitting the order. This is
+    the actual sizing-reduction mechanism; Rules 3/7 logging a WARNING with
+    no corresponding effect was the original bug.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO nwt_ticket_decisions (ticket_id, decision, reasoning, decided_by)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO nwt_ticket_decisions (ticket_id, decision, reasoning, decided_by, sizing_multiplier)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            (ticket_id, decision, reasoning, decided_by),
+            (ticket_id, decision, reasoning, decided_by, sizing_multiplier),
         )
     conn.commit()

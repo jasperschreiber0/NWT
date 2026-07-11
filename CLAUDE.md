@@ -8,24 +8,30 @@
 
 ## Current Status
 
+> **NOTE** Rows below marked *(repo)* describe what's in this repository and can be verified by reading it. Rows marked *(server)* describe live infrastructure state this repo cannot see — re-verify those with the Session Startup Checklist below before trusting them; they were last confirmed on the date shown and may be stale.
+
 | Check | Status | Date |
 |---|---|---|
-| VPS online | Intact | 2026-05-18 |
-| Alpaca keys | Same (PA3844MEHFIO) | 2026-05-18 |
-| Anthropic API key | Rotated (new key) | 2026-05-18 |
-| Discord webhook | Dead — not being replaced yet | 2026-05-18 |
-| Postgres nwt_agents DB | Wiped | 2026-05-18 |
-| /home/northworld/trading/ | Wiped — full rebuild in progress | 2026-05-18 |
-| PM2 stack | Not yet deployed | 2026-05-18 |
-| nwt_agents cron | Not yet deployed | 2026-05-18 |
-| Phase 0 schema migration | Pending deploy | 2026-06-10 |
-| recon_agent.py | Built | 2026-06-10 |
-| no_trade_mode wiring | Built | 2026-06-10 |
-| Heartbeat (engine↔risk) | Built | 2026-06-10 |
-| Directional cap (60%) | Built | 2026-06-10 |
-| Exit lifecycle (equity monitor + options close) | Built | 2026-06-10 |
-| Inactivity ticket taxonomy | Built | 2026-06-10 |
-| Server hardening | Pending | 2026-06-10 |
+| VPS online *(server)* | Last confirmed intact | 2026-05-18 |
+| Alpaca keys *(server)* | Last confirmed same (PA3844MEHFIO) | 2026-05-18 |
+| Anthropic API key *(server)* | Last rotated | 2026-05-18 |
+| Discord webhook | Dead, not replaced — Telegram (`nwt_agents/notifier.py`) is the live alerting channel instead | 2026-07-11 |
+| Postgres nwt_agents DB *(server)* | Last confirmed state: wiped for rebuild | 2026-05-18 |
+| PM2 stack *(repo)* | `ecosystem.config.cjs` defines all Track A bots + dashboard, `time_zone: 'UTC'` explicit on every app | 2026-07-11 |
+| nwt_agents cron *(repo)* | `crontab.txt` defines the full conviction stack + risk/execution/learning/recon schedule, `SHELL=/bin/bash` first line, confirmed UTC | 2026-07-11 |
+| db/schema.sql + migrate_*.sql *(repo)* | Present; apply in filename/date order — schema.sql alone is the Day-1 baseline only | 2026-07-11 |
+| recon_agent.py *(repo)* | Built; `--gate` now auto-runs cold-start import first; `--clear-if-clean` added for human-acknowledged recovery | 2026-07-11 |
+| no_trade_mode wiring *(repo)* | Built; `clear_no_trade_mode()` now reachable via `recon_agent.py --clear-if-clean` | 2026-07-11 |
+| Heartbeat (engine↔risk) *(repo)* | Built, end-to-end wired (`execution/engine.py` writes, `risk_agent.py`/`integrity_gate.py` read) | 2026-07-11 |
+| Directional cap (60%) *(repo)* | Built in `execution/engine.py` (`DIRECTIONAL_CAP_PCT`); distinct from `master/strategist.py`'s `PER_BOT_WEIGHT_CEILING` (0.65) — see Stack 3 | 2026-07-11 |
+| Risk Agent sizing-reduction rules (3, 7) *(repo)* | Built — `sizing_multiplier` on `nwt_ticket_decisions`, applied by `execution_agent.py`; used to only log a warning | 2026-07-11 |
+| Exit lifecycle (equity monitor + options close) *(repo)* | Built; equity monitor now prefers the ticket's own `stop_pct`/`target_pct` (persisted on the ledger row) over genome/hardcoded defaults | 2026-07-11 |
+| Inactivity ticket taxonomy *(repo)* | Built; session scorecard now counts both Track A's `nwt_inactivity_log` and Track C/D/E's `nwt_tickets(type='inactivity')` | 2026-07-11 |
+| Same-regime 5+ sessions rule *(repo)* | Built — `nwt_regime_history` + `regime_classifier.py`'s session-persistence check | 2026-07-11 |
+| Learning Layer C — Strategy Mutator *(repo)* | Built — `nwt_agents/mutation_agent.py` (propose + promote), genome versioning + Learning Gate enforced | 2026-07-11 |
+| Learning Layer D — Portfolio Allocator *(repo)* | Built — `master/allocator.py`, wired into `strategist.py`'s `compute_bot_permissions` | 2026-07-11 |
+| Track F scanner *(repo)* | Built as a research signal surface (no order authority) — see Stack 6 | 2026-07-11 |
+| Server hardening *(server)* | Not verified in this pass — re-run the deploy steps in Server Hardening below and confirm with `sshd -T` | 2026-05-18 |
 
 ---
 
@@ -86,7 +92,7 @@ This system is a **learning and attribution engine first**, trading engine secon
 | Shared dir | /home/northworld/trading/shared/ |
 | Entity | Builda AI ABN 41 615 978 808 |
 | Broker | Alpaca Paper — PA3844MEHFIO (~$97k equity, ~$83k options BP) |
-| Alerting | Postgres logging only (Discord dead until further notice) |
+| Alerting | Postgres logging (all agents) + Telegram (`nwt_agents/notifier.py` — kill switch, no_trade_mode, heartbeat loss, recon critical, daily digest). Discord dead, not replaced by Discord. |
 
 ---
 
@@ -178,6 +184,8 @@ Process manager: PM2 — all processes must be in this file to survive reboot.
 
 ### PM2 Schedule (UTC)
 
+> **NOTE** Server timezone is confirmed UTC via `timedatectl` (see `crontab.txt`'s own header comment). `ecosystem.config.cjs` sets `time_zone: 'UTC'` explicitly on every app so this can't silently drift again — this file previously assumed AEST (UTC+10) for PM2's `cron_restart` while `crontab.txt` used literal UTC for the same server, meaning every job below could have been firing ~10 hours off depending on which assumption was actually correct. If in doubt, re-verify with `timedatectl` before trusting either file.
+
 | PM2 Name | Schedule (UTC) | Path |
 |---|---|---|
 | master-strategist | 21:30 (after US close) | master/ |
@@ -188,10 +196,9 @@ Process manager: PM2 — all processes must be in this file to survive reboot.
 | us-nightly | 10:30 | us/ |
 | us-trader | 18:05 (14:05 ET ORB) | us/ |
 | perf-tracker | 00:00 | performance/ |
-| china-strategist | event-triggered* | china/ |
-| china-executor | event-triggered* | china/ |
+| nwt-dashboard | always-on (FastAPI, port 8080) | dashboard/ |
 
-*China bot is event-triggered, not fixed-time cron. Fires after ADR liquidity confirmation post US open. Do not hardcode a UTC time.
+China bot (`china-strategist`, `china-executor`) is **not** a PM2 app — it is event-triggered (fires after ADR liquidity confirmation post US open), so it runs from `crontab.txt`'s polling window (`0,30 14-18 * * 1-5` UTC) instead of PM2's `cron_restart`. Do not add PM2 entries for it: crontab already supervises it, and a second supervisor running the same scripts would trip the Startup Integrity Gate's duplicate-runner check.
 
 ### Bot Isolation Rules
 
@@ -390,13 +397,25 @@ Runs separately from PM2 via crontab.
 
 | Time UTC | What fires |
 |---|---|
+| 12:00 | Track F scanner (research signal only, no order authority) |
 | 13:00-13:45 | Conviction stack (layer0 -> prescreener -> engine -> summary) |
 | 14:00 | Track C + D decide |
 | 14:30 | Track E decides |
-| 13:00-21:00 | Risk Agent every 5min |
-| 13:00-21:00 | Execution Agent every 5min |
-| 13:00-21:00 | Snapshot writer every 15min |
+| 14:00-18:00 (every 30min) | China strategist + executor (event-triggered, self-gates on ADR liquidity) |
+| 13:00-20:00 | Risk Agent every 5min |
+| 13:00-20:00 | Execution Agent every 5min |
+| 13:00-20:00 | Execution Engine every 5min |
+| 13:00-20:00 | Snapshot writer every 15min |
 | 21:00 | Learning Agent + cost agent |
+| 21:10 | Strategy Mutator — propose (`mutation_agent.py --propose`) |
+| 21:15 | Session scorecard (green/red) |
+| 21:20 | Shadow decision evaluator |
+| 21:22 | Strategy Mutator — promote (`mutation_agent.py --promote`) |
+| 21:30 | Morning triage digest (read-only, no trade authority) |
+| 22:30 | DB backup (local dump, 7-day rotation) |
+| 23:00 | Recon nightly (`recon_agent.py --nightly`) |
+
+See `crontab.txt` for the authoritative, current schedule — this table is kept in sync with it, but the file is the source of truth.
 
 > **CRITICAL** `SHELL=/bin/bash` must be the first line of crontab. `source` is bash-only — silently fails under `/bin/sh`. This caused 373 dead tickets in the prior deployment.
 > Verify: `crontab -l | head -1`
@@ -450,6 +469,27 @@ if not genome:
 ```
 
 > **CRITICAL** Hardcoded parameters = learning system does not exist.
+
+---
+
+## Stack 6 — Track F (Thematic Bottleneck Scanner)
+
+Path: `/home/northworld/trading/nwt_agents/track_f/`
+Runs: `scanner.py` daily 12:00 UTC Mon-Fri, before the conviction stack.
+
+> **NOTE — scope** Track F is a **research signal surface, not a 7th trading track.** It has no order authority, no genome, no sizing/risk/isolation rules — none are defined anywhere in this document. It scores tickers, surfaces candidates for human review through the dashboard's approve/reject workflow, and stops there. Giving it order authority would be a deliberate, separate product decision requiring its own capital allocation, sizing, and risk rules — not assumed here.
+
+**What it does:**
+1. Scores each ticker in `themes.py`'s `CONFIRMED_THEMES` (ai_power, ai_networking, ai_cooling, nuclear, robotics, copper_constraint) against recent (30-day) SEC EDGAR filings, using the exact composite scoring method `track_f/validate_historical.py` already backtested against 4 known historical winners (NVDA/VRT/PWR/CCJ — 3/4 scored ≥60 before their moves; CCJ is a documented EDGAR EFTS limitation for Canadian foreign private issuers, not a method failure).
+2. Writes one `nwt_bottleneck_scores` row per (ticker, theme) per run, with momentum vs. the trailing 3 scans.
+3. A ticker scoring ≥60 (`BOTTLENECK_SCORE_CANDIDATE_THRESHOLD`) gets a `nwt_track_f_candidates` row (status='pending') for human review.
+4. Separately scans `CANDIDATE_THEMES` — speculative, not-yet-confirmed themes, scored the same way. If a candidate theme's aggregate momentum crosses a threshold, upserts `nwt_emerging_themes` (status='pending'). Approving one there does **not** edit `CONFIRMED_THEMES` in code — it only means the dashboard's theme-exposure endpoint starts counting that theme's tickers toward the 15% cap.
+
+**What's live vs. curated** in the composite score (`compute_bottleneck_score`'s four inputs):
+- `theme_momentum`, `constraint_severity`: computed live from EDGAR's current full-text search — identical method to the backtest.
+- `revenue_leverage`, `attention_gap`, `smart_money_score`, `crowding_penalty`: curated per-ticker in `themes.py` (`TICKER_APPROXIMATIONS`, defaulting conservatively), **not live**. Live institutional-flow (13F/Form 4) and analyst-coverage data are a real Phase-2 extension, not fabricated in v1.
+
+**Dashboard integration:** `/api/track-f/theme-exposure` derives theme→ticker membership from `nwt_bottleneck_scores` joined against `nwt_emerging_themes` (excluding non-approved candidate themes) — not a hardcoded dict, so an approval actually changes what counts toward the cap.
 
 ---
 
@@ -510,19 +550,25 @@ Factor-based decomposition only. No narrative.
 - WRONG: "market was volatile"
 - RIGHT: "vega exposure +42% correlated with loss cluster in IV>50 regime"
 
-### Two Deferred Layers
+### Layer C — Strategy Mutator
 
-**Layer C — Strategy Mutator (shadow from 30 trades, promote after 100+)**
-
-Bounded mutations only: adjust DTE range, tighten IV filter, change entry threshold, adjust stop loss, reduce frequency per regime.
+Built: `nwt_agents/mutation_agent.py`. Shadow from 30 trades, promote after 100+ — bounded mutations only: tighten entry_threshold, tighten iv_filter_max, tighten stop_loss_pct (DTE-range and per-regime-frequency mutations are not yet implemented — see the file's own docstring for why).
 
 > ⚠ Mutation floor is 100+ trades per strategy bucket, across multiple volatility regimes, with frozen baselines and shadow-mode testing first. 30 trades is enough to observe, not enough to mutate. Promoting changes on 30 trades risks learning random variance, regime chasing, and overfitting to transient volatility structures.
 
 Shadow mode means: the mutated strategy runs alongside the baseline, its hypothetical outcomes recorded, but no capital is allocated to it until it passes the learning gate.
 
-**Layer D — Portfolio Allocator (after meaningful trade history per bot)**
+**How it actually works:**
+- `mutation_agent.py --propose` (21:10 UTC): for an active Track C/D strategy with `nwt_strategy_decay.decay_flag` set (or `win_loss_ratio_trend='compressing'`) and 30+ trades, inserts ONE new genome row — version `+1`, `active=FALSE`, `shadow_mode=TRUE`, `parent_version` set — with exactly one parameter changed. Never touches the active row. At most one pending shadow candidate per strategy; 14-day cooldown between proposals.
+- Track C/D (not E — every E strategy is already globally `shadow_mode=TRUE`) run a second, cheap evaluation pass each day against any pending shadow candidate's parameters, logged to `nwt_decision_inputs` tagged with `genome_version` (`shared_context.evaluate_shadow_mutation`). `shadow_decision_evaluator.py` fills in `would_have_won`/`shadow_pnl_pct` for these exactly like any other candidate.
+- `mutation_agent.py --promote` (21:22 UTC): for each pending shadow candidate, checks the Learning Gate below against its accumulated sample. Promotes (flips `active`), rejects-and-retires (gate's sample is complete but doesn't clear it), or waits (still gathering data) — logged to `nwt_mutation_log`, append-only. A promotion also writes an `nwt_tickets` row (`type='strategy_mutation_promoted'`) for the system-wide audit trail.
+- Respects `nwt_system_flags.mutation_frozen` — the Risk Agent's "freeze mutation promotion" authority. Freezing blocks promotion only, never proposal.
 
-Learns which bot works in which regime. Answers "where should capital go?" — NOT "what should we trade?"
+### Layer D — Portfolio Allocator
+
+Built: `master/allocator.py`, called from `master/strategist.py`. Learns which bot works in which regime. Answers "where should capital go?" — NOT "what should we trade?"
+
+Not a separate service — `compute_dynamic_weights()` replaces the hardcoded `BASELINE_WEIGHTS` dict as `compute_bot_permissions()`'s starting point. A bot only gets tilted away from baseline once it clears 15 closed trades (joined `nwt_trade_outcomes` → `nwt_portfolio_ledger` via `position_id`); the tilt is a bounded z-score across bots (±25% of baseline weight, one outlier bot can't dominate), conditioned on today's regime once a bot has 8+ trades in that specific regime, falling back to the bot's overall performance otherwise. Cold start (no history) returns baseline weights unchanged — explicit, not an error. Every run's inputs/outputs are logged to `nwt_allocator_history` for audit.
 
 ### The Learning Gate
 

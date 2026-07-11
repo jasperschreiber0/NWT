@@ -24,11 +24,16 @@ def insert_position(conn, data: dict) -> str:
         bot_source, asset, asset_type
     Optional keys:
         strategy_id, direction, delta_exposure, notional_risk, qty, entry_price,
-        entry_time, entry_bid, entry_ask, alpaca_order_id
+        entry_time, entry_bid, entry_ask, alpaca_order_id, stop_pct, target_pct
 
     qty is the actual filled contract/share count from Alpaca — recon_agent.py
     sums it per symbol to reconcile against Alpaca's live position, so it must
     reflect the real fill, not row count or a pre-fill estimate.
+
+    stop_pct/target_pct persist the per-trade exit parameters the ticket
+    actually carried (Brain->Execution contract fields) so the equity
+    position monitor can use them instead of falling back to a genome/
+    hardcoded default.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -36,8 +41,8 @@ def insert_position(conn, data: dict) -> str:
             INSERT INTO nwt_portfolio_ledger
                 (bot_source, strategy_id, asset, asset_type, direction, delta_exposure,
                  notional_risk, qty, entry_price, entry_time, entry_bid, entry_ask,
-                 alpaca_order_id, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
+                 alpaca_order_id, stop_pct, target_pct, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
             RETURNING position_id
             """,
             (
@@ -54,6 +59,8 @@ def insert_position(conn, data: dict) -> str:
                 data.get("entry_bid"),
                 data.get("entry_ask"),
                 data.get("alpaca_order_id"),
+                data.get("stop_pct"),
+                data.get("target_pct"),
             ),
         )
         position_id = cur.fetchone()[0]
@@ -116,19 +123,6 @@ def get_open_positions(conn, bot_source: Optional[str] = None) -> list:
             )
         rows = cur.fetchall()
     return [dict(r) for r in rows]
-
-
-def get_position_by_order_id(conn, alpaca_order_id: str) -> Optional[dict]:
-    """
-    Return the ledger row matching a given Alpaca order ID, or None.
-    """
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            "SELECT * FROM nwt_portfolio_ledger WHERE alpaca_order_id = %s",
-            (alpaca_order_id,),
-        )
-        row = cur.fetchone()
-    return dict(row) if row else None
 
 
 def log_system_event(

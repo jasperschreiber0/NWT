@@ -64,7 +64,7 @@ def fetch_approved_proposals(conn) -> list:
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT t.*
+            SELECT t.*, d.sizing_multiplier
             FROM nwt_tickets t
             INNER JOIN nwt_ticket_decisions d ON d.ticket_id = t.ticket_id
             WHERE t.to_agent = 'RISK_AGENT'
@@ -346,6 +346,21 @@ def main() -> None:
             direction = payload.get("direction", "long")
             strategy_id = payload.get("strategy_id", "")
             sized_notional = float(payload.get("sized_notional", 0))
+
+            # Apply RISK_AGENT's sizing_multiplier (Rules 3/7 — slippage
+            # expansion, regime confidence < 0.4) if it set one. This is the
+            # actual sizing reduction those rules are supposed to cause; the
+            # rules used to only log a WARNING with no downstream effect.
+            sizing_multiplier = ticket.get("sizing_multiplier")
+            if sizing_multiplier is not None and float(sizing_multiplier) < 1.0:
+                sizing_multiplier = float(sizing_multiplier)
+                original_notional = sized_notional
+                sized_notional = round(sized_notional * sizing_multiplier, 2)
+                logger.info(
+                    "Ticket %s: sizing_multiplier=%.2f applied — sized_notional %.2f -> %.2f",
+                    ticket_id, sizing_multiplier, original_notional, sized_notional,
+                )
+
             dte_min = int(payload.get("dte_min", 7))
             dte_max = int(payload.get("dte_max", 21))
             strike_preference = payload.get("strike_preference", "ATM")

@@ -33,6 +33,10 @@ VALID_REGIMES = {
     "neutral",
 }
 
+# "Same regime 5+ sessions must cite price evidence or reclassify to neutral"
+CONSECUTIVE_SESSION_LIMIT = 5
+_PRICE_EVIDENCE_THRESHOLD = 0.005  # 0.5% — matches the classifier's own smallest signal band
+
 # ---------------------------------------------------------------------------
 # Signal definitions
 # Each signal function returns (regime_vote: str, strength: float 0..1)
@@ -225,12 +229,56 @@ def _secondary_regime(
 
 
 # ---------------------------------------------------------------------------
+# Session-persistence rule
+# ---------------------------------------------------------------------------
+
+def _has_price_evidence(primary: str, spy_vs_5d_pct: Optional[float]) -> bool:
+    """
+    Minimal test for "cite price evidence": does SPY's own 5-day move still
+    support this regime label? risk_on needs SPY meaningfully up; risk_off/
+    recession_fear/fragile_liquidity need SPY meaningfully down. Regimes
+    without a clear price-direction implication (neutral, geopolitical_stress,
+    inflation_concern) always pass — there's no single price fact that could
+    contradict them the way a flat/rising SPY contradicts "risk_off".
+    """
+    if primary == "risk_on":
+        return spy_vs_5d_pct is not None and spy_vs_5d_pct > _PRICE_EVIDENCE_THRESHOLD
+    if primary in ("risk_off", "recession_fear", "fragile_liquidity"):
+        return spy_vs_5d_pct is not None and spy_vs_5d_pct < -_PRICE_EVIDENCE_THRESHOLD
+    return True
+
+
+def _apply_session_persistence_rule(
+    primary: str, regime_history: list[str], spy_vs_5d_pct: Optional[float]
+) -> tuple[str, Optional[str]]:
+    """
+    CRITICAL RULE: same primary_regime held for 5+ consecutive prior sessions
+    must cite fresh price evidence or be reclassified to neutral.
+    `regime_history` is prior sessions' primary_regime values, most recent first.
+    Returns (possibly-overridden primary, override_note | None).
+    """
+    if len(regime_history) < CONSECUTIVE_SESSION_LIMIT:
+        return primary, None
+    if not all(h == primary for h in regime_history[:CONSECUTIVE_SESSION_LIMIT]):
+        return primary, None
+    if _has_price_evidence(primary, spy_vs_5d_pct):
+        return primary, None
+    note = (
+        f"Regime '{primary}' held for {CONSECUTIVE_SESSION_LIMIT}+ consecutive sessions "
+        f"without fresh price evidence (spy_vs_5d_pct={spy_vs_5d_pct}) — reclassified to neutral"
+    )
+    logger.warning(note)
+    return "neutral", note
+
+
+# ---------------------------------------------------------------------------
 # Public interface
 # ---------------------------------------------------------------------------
 
 def classify_regime(
     internals: dict,
     exposure: dict,
+    regime_history: Optional[list[str]] = None,
 ) -> dict:
     """
     Classify market regime from market internals and portfolio exposure.
@@ -241,6 +289,10 @@ def classify_regime(
         Output of market_internals.fetch_market_internals()
     exposure : dict
         Must contain at minimum: net_delta_estimate (float | None)
+    regime_history : list[str], optional
+        Prior sessions' primary_regime values, most recent first — feeds the
+        "same regime 5+ sessions" rule. Omitted/empty = rule cannot fire yet
+        (e.g. cold start).
 
     Returns
     -------
@@ -250,6 +302,7 @@ def classify_regime(
         secondary_regime : str | None
         transition_risk  : float (0..1)
     """
+    regime_history = regime_history or []
     vix = internals.get("vix")
     spy_vs_5d_pct = internals.get("spy_vs_5d_pct")
 
@@ -294,6 +347,12 @@ def classify_regime(
 
     confidence = _compute_confidence(votes, primary)
     transition_risk = _compute_transition_risk(votes, primary)
+
+    # --- CRITICAL RULE: same regime 5+ sessions must cite price evidence ---
+    primary, persistence_note = _apply_session_persistence_rule(primary, regime_history, spy_vs_5d_pct)
+    if persistence_note:
+        confidence = min(confidence, 0.5)
+        transition_risk = max(transition_risk, 0.5)
 
     secondary = None
     if confidence < 0.80:

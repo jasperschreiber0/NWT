@@ -29,14 +29,12 @@ TOKEN  = os.environ["NWT_DASHBOARD_TOKEN"]
 SHARED = Path("/home/northworld/trading/shared")
 PERF   = Path("/home/northworld/trading/performance")
 
-THEME_TICKERS = {
-    "ai_power":          ["ETN", "PWR", "VRT", "POWL", "EMR"],
-    "ai_networking":     ["ANET", "AVGO", "CSCO"],
-    "ai_cooling":        ["VRT", "TT", "GNRC"],
-    "nuclear":           ["CCJ", "NNE", "LEU"],
-    "robotics":          ["TDY", "ISRG", "ONTO"],
-    "copper_constraint": ["FCX", "SCCO", "WIRE"],
-}
+# Theme/ticker membership used to live here as a hardcoded dict, duplicating
+# nwt_agents/track_f/themes.py's CONFIRMED_THEMES with no way for the two to
+# stay in sync. Now derived live from what the scanner has actually scored
+# (see theme_exposure() below) — a confirmed theme's tickers count
+# automatically; a candidate (speculative) theme's tickers only count once a
+# human approves it via nwt_emerging_themes.
 
 app = FastAPI(docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -216,23 +214,39 @@ def track_f_pending(_: None = Depends(require_auth)):
         conn.close()
 
 
+def _track_f_update(sql: str, theme: str) -> dict:
+    """
+    Track F has no production scanner yet — nwt_emerging_themes does not
+    exist in any schema/migration file. Rather than a raw 500 (UndefinedTable)
+    when someone clicks Approve/Reject on the dashboard's "not yet deployed"
+    tab, return a clear, typed error the frontend can show.
+    """
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (theme,))
+        conn.commit()
+        return {"ok": True, "theme": theme}
+    except psycopg2.errors.UndefinedTable:
+        conn.rollback()
+        raise HTTPException(
+            status_code=501,
+            detail="Track F is not deployed yet — nwt_emerging_themes does not exist.",
+        )
+    finally:
+        conn.close()
+
+
 @app.post("/api/track-f/approve")
 async def track_f_approve(request: Request, _: None = Depends(require_auth)):
     body  = await request.json()
     theme = body.get("candidate_theme")
     if not theme:
         raise HTTPException(status_code=400, detail="candidate_theme required")
-    conn = db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE nwt_emerging_themes SET status='approved', approved_at=NOW() WHERE candidate_theme=%s AND status='pending'",
-                (theme,)
-            )
-        conn.commit()
-        return {"ok": True, "theme": theme}
-    finally:
-        conn.close()
+    return _track_f_update(
+        "UPDATE nwt_emerging_themes SET status='approved', approved_at=NOW() WHERE candidate_theme=%s AND status='pending'",
+        theme,
+    )
 
 
 @app.post("/api/track-f/reject")
@@ -241,17 +255,10 @@ async def track_f_reject(request: Request, _: None = Depends(require_auth)):
     theme = body.get("candidate_theme")
     if not theme:
         raise HTTPException(status_code=400, detail="candidate_theme required")
-    conn = db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE nwt_emerging_themes SET status='rejected' WHERE candidate_theme=%s AND status='pending'",
-                (theme,)
-            )
-        conn.commit()
-        return {"ok": True, "theme": theme}
-    finally:
-        conn.close()
+    return _track_f_update(
+        "UPDATE nwt_emerging_themes SET status='rejected' WHERE candidate_theme=%s AND status='pending'",
+        theme,
+    )
 
 
 @app.get("/api/track-f/candidates")
@@ -268,8 +275,24 @@ def track_f_theme_exposure(_: None = Depends(require_auth)):
     conn = db_conn()
     try:
         positions = q(conn, "SELECT asset, notional_risk FROM nwt_portfolio_ledger WHERE status='open'")
+        # Theme membership from what the scanner has actually scored: a
+        # confirmed theme's (theme, ticker) pairs are always included; a
+        # candidate (speculative) theme's pairs only count once a human has
+        # approved it in nwt_emerging_themes — pending/rejected candidate
+        # themes are excluded so they can't inflate exposure before review.
+        theme_rows = q_grace(conn, """
+            SELECT DISTINCT b.theme, b.ticker FROM nwt_bottleneck_scores b
+            WHERE NOT EXISTS (
+                SELECT 1 FROM nwt_emerging_themes e
+                WHERE e.candidate_theme = b.theme AND e.status != 'approved'
+            )
+        """)
     finally:
         conn.close()
+
+    theme_tickers: dict = {}
+    for row in theme_rows:
+        theme_tickers.setdefault(row["theme"], []).append(row["ticker"])
 
     total = sum(float(p.get("notional_risk") or 0) for p in positions)
     ticker_notional: dict = {}
@@ -277,7 +300,7 @@ def track_f_theme_exposure(_: None = Depends(require_auth)):
         ticker_notional[p["asset"]] = ticker_notional.get(p["asset"], 0) + float(p.get("notional_risk") or 0)
 
     exposures: dict = {}
-    for theme, tickers in THEME_TICKERS.items():
+    for theme, tickers in theme_tickers.items():
         notional = sum(ticker_notional.get(t, 0) for t in tickers)
         exposures[theme] = {
             "pct":      round(notional / total, 4) if total else 0,
