@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS nwt_portfolio_ledger (
   realized_slippage NUMERIC,
   status TEXT DEFAULT 'open',
   alpaca_order_id TEXT,
+  spread_group_id UUID,         -- ties legs of one multi-leg structure together
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 

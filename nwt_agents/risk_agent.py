@@ -528,7 +528,13 @@ def evaluate_proposal(
 # ---------------------------------------------------------------------------
 
 def force_close_past_hard_close(conn, positions: list) -> None:
+    """
+    Short legs first: if a spread's legs are both past hard close, covering
+    the short leg before the long leg means a later close failing never
+    leaves a naked short outstanding.
+    """
     hard_close_utc = _hard_close_utc()
+    positions = sorted(positions, key=lambda p: 0 if p.get("direction") == "short" else 1)
     for pos in positions:
         position_id = str(pos.get("position_id", ""))
         asset = pos.get("asset", "")

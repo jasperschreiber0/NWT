@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -447,35 +448,68 @@ def place_equity_order(payload: dict) -> dict:
 
 
 def place_options_order(payload: dict) -> dict:
-    option_symbol = payload["option_symbol"]
+    """
+    Single-leg option entries are ALWAYS buy-to-open — a bearish thesis buys
+    a put, it never sells a call. Sell-to-open is only reachable inside a
+    multi-leg (defined-risk) structure (payload["legs"]), submitted as one
+    Alpaca mleg order — this is the only path that can hold a short leg, and
+    it is always paired with a long leg that bounds the risk.
+    """
     qty = int(payload.get("qty", 1))
     time_in_force = payload["time_in_force"]
-    direction = payload["direction"]
-    side = "buy" if direction in ("long", "buy") else "sell"
+    legs = payload.get("legs") or []
 
+    if legs:
+        order_body = {
+            "order_class": "mleg",
+            "qty": str(qty),
+            "type": "market",
+            "time_in_force": time_in_force,
+            "legs": [
+                {
+                    "symbol": leg["option_symbol"],
+                    "ratio_qty": "1",
+                    "side": leg["side"],
+                    "position_intent": f"{leg['side']}_to_open",
+                }
+                for leg in legs
+            ],
+        }
+        logger.info("Placing mleg options order: %d legs x%d (%s)",
+                    len(legs), qty, ", ".join(f"{l['side']} {l['option_symbol']}" for l in legs))
+        return alpaca_post("/orders", order_body)
+
+    option_symbol = payload["option_symbol"]
     order_body = {
         "symbol": option_symbol,
         "qty": str(qty),
-        "side": side,
+        "side": "buy",
         "type": "market",
         "time_in_force": time_in_force,
         "order_class": "simple",
     }
-    logger.info("Placing options order: %s %s x%d", side, option_symbol, qty)
+    logger.info("Placing options order: buy %s x%d", option_symbol, qty)
     return alpaca_post("/orders", order_body)
 
 
-def place_close_order(symbol: str, qty: int, asset_type: str) -> dict:
+def place_close_order(symbol: str, qty: int, asset_type: str, side: str = "sell") -> dict:
+    """
+    side defaults to "sell" (closing a long position — true for equity and
+    every single-leg option position). A short option leg (only reachable
+    inside a multi-leg spread) must be closed with side="buy" instead —
+    callers closing a specific ledger position must pass the side that
+    matches that position's own direction, not assume "sell".
+    """
     order_body = {
         "symbol": symbol,
         "qty": str(qty),
-        "side": "sell",
+        "side": side,
         "type": "market",
         "time_in_force": "day",
     }
     if asset_type == "option":
         order_body["order_class"] = "simple"
-    logger.info("Placing close order: %s x%d", symbol, qty)
+    logger.info("Placing close order: %s %s x%d", side, symbol, qty)
     return alpaca_post("/orders", order_body)
 
 
@@ -650,7 +684,13 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
 # ---------------------------------------------------------------------------
 
 def process_close_ticket(conn, ticket: dict) -> None:
-    """Handle CLOSE_REQUEST tickets via market sell."""
+    """
+    Handle CLOSE_REQUEST tickets. The close side must match the position's
+    own direction — a long position (every single-leg option, or the long
+    leg of a spread) is closed by selling; a short leg (only reachable
+    inside a spread) is closed by buying it back. Look up the ledger
+    position first so this can never default to "sell" against a short.
+    """
     ticket_id = str(ticket["ticket_id"])
     payload = ticket.get("payload") or {}
     symbol = payload.get("option_symbol") or payload.get("symbol", "")
@@ -659,8 +699,18 @@ def process_close_ticket(conn, ticket: dict) -> None:
     asset_type = payload.get("asset_type", "option")
     qty = int(payload.get("qty", 1))
 
+    pos_direction = payload.get("direction", "long")
+    if position_id:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT direction FROM nwt_portfolio_ledger WHERE position_id = %s",
+                        (position_id,))
+            row = cur.fetchone()
+        if row and row.get("direction"):
+            pos_direction = row["direction"]
+    close_side = "buy" if pos_direction == "short" else "sell"
+
     try:
-        order = place_close_order(symbol, qty, asset_type)
+        order = place_close_order(symbol, qty, asset_type, side=close_side)
         filled = poll_order_until_filled(order["id"])
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
@@ -777,6 +827,71 @@ def process_force_close(conn, ticket: dict) -> None:
 # Trade ticket processing
 # ---------------------------------------------------------------------------
 
+def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
+                               filled_order: dict, alpaca_order_id: str) -> str:
+    """
+    One ledger row PER LEG of a filled mleg order, tied by spread_group_id.
+    Recon matches Alpaca positions per contract, so legs must be individual
+    rows; the monitor values/closes the structure as a unit via the group id.
+    Returns the spread_group_id.
+    """
+    qty = int(payload.get("qty", 1))
+    spread_group_id = str(uuid.uuid4())
+    filled_legs = {l.get("symbol"): l for l in (filled_order.get("legs") or [])}
+    position_ids = []
+
+    for leg in payload["legs"]:
+        leg_symbol = leg["option_symbol"]
+        fl = filled_legs.get(leg_symbol, {})
+        leg_fill = fl.get("filled_avg_price")
+        leg_fill = float(leg_fill) if leg_fill else None
+
+        leg_bid, leg_ask = get_latest_quote(leg_symbol, "option")
+        if leg_fill is None:
+            # Leg fill missing from the order response — fall back to quote mid
+            if leg_bid and leg_ask:
+                leg_fill = (leg_bid + leg_ask) / 2.0
+            else:
+                leg_fill = 0.0
+
+        side = leg["side"]
+        leg_direction = "long" if side == "buy" else "short"
+        base_delta = 0.5 if leg.get("option_type", "call") == "call" else -0.5
+        delta_exposure = base_delta if leg_direction == "long" else -base_delta
+
+        ledger_data = {
+            "bot_source": payload["bot_source"],
+            "strategy_id": payload.get("strategy_id"),
+            "asset": leg_symbol,
+            "asset_type": "option",
+            "direction": leg_direction,
+            "delta_exposure": delta_exposure,
+            "notional_risk": abs(leg_fill) * 100 * qty,
+            "qty": qty,
+            "entry_price": leg_fill,
+            "entry_time": datetime.now(timezone.utc),
+            "entry_bid": leg_bid,
+            "entry_ask": leg_ask,
+            "alpaca_order_id": alpaca_order_id,
+            "stop_pct": payload.get("stop_pct"),
+            "target_pct": payload.get("target_pct"),
+            "spread_group_id": spread_group_id,
+        }
+        position_ids.append(insert_position(conn, ledger_data))
+
+    reasoning = (f"mleg filled — {len(position_ids)} legs, "
+                 f"spread_group_id={spread_group_id}, alpaca_order_id={alpaca_order_id}")
+    insert_decision(conn, ticket_id, "EXECUTED", reasoning)
+    log_system_event(conn, "INFO", "execution_engine",
+                     f"Executed spread {payload.get('strategy_type', '')} on {payload.get('symbol', '')}",
+                     {"ticket_id": ticket_id, "spread_group_id": spread_group_id,
+                      "position_ids": position_ids, "alpaca_order_id": alpaca_order_id,
+                      "strategy_id": payload.get("strategy_id")})
+    logger.info("Ticket %s EXECUTED (spread): group=%s legs=%d",
+                ticket_id, spread_group_id, len(position_ids))
+    return spread_group_id
+
+
 def process_ticket(conn, ticket: dict, directives: dict) -> None:
     ticket_id = str(ticket["ticket_id"])
     payload = ticket.get("payload") or {}
@@ -818,6 +933,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
 
     asset_type = payload["asset_type"]
     symbol = payload["symbol"]
+    legs = payload.get("legs") or []
     expected_price = None
     entry_bid = entry_ask = None
 
@@ -827,10 +943,11 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
             order = place_equity_order(payload)
             expected_price = get_current_price(symbol)
         elif asset_type == "option":
-            option_symbol = payload.get("option_symbol", symbol)
-            entry_bid, entry_ask = get_latest_quote(option_symbol, "option")
-            if entry_bid and entry_ask:
-                expected_price = (entry_bid + entry_ask) / 2.0
+            if not legs:
+                option_symbol = payload.get("option_symbol", symbol)
+                entry_bid, entry_ask = get_latest_quote(option_symbol, "option")
+                if entry_bid and entry_ask:
+                    expected_price = (entry_bid + entry_ask) / 2.0
             order = place_options_order(payload)
         else:
             reason = f"Unknown asset_type: {asset_type}"
@@ -857,11 +974,22 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     fill_price_str = filled_order.get("filled_avg_price")
     fill_price = float(fill_price_str) if fill_price_str else None
 
-    if fill_status != "filled" or fill_price is None:
+    # mleg orders report per-leg fills; the top-level price is the net debit/
+    # credit and may legitimately be absent — status alone decides for spreads
+    if fill_status != "filled" or (fill_price is None and not legs):
         reason = f"Order did not fill — final status={fill_status}"
         insert_decision(conn, ticket_id, "FAILED", reason)
         log_system_event(conn, "WARNING", "execution_engine", reason,
                          {"ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id})
+        return
+
+    if asset_type == "option" and legs:
+        try:
+            insert_spread_ledger_rows(conn, ticket_id, payload, filled_order, alpaca_order_id)
+        except Exception as exc:
+            reason = f"Ledger insert failed: {exc}"
+            insert_decision(conn, ticket_id, "FAILED", reason)
+            log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
         return
 
     filled_qty_str = filled_order.get("filled_qty")
@@ -870,16 +998,26 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     slippage = (abs(fill_price - expected_price) / expected_price
                 if expected_price and expected_price > 0 else 0.0)
 
-    delta_exposure = 1.0 if direction == "long" else -1.0
     if asset_type == "option":
-        delta_exposure = payload.get("delta_exposure", 0.5 * delta_exposure)
+        # Single-leg options are always bought (long premium) — engine.py's
+        # place_options_order never sells outside a multi-leg order. The
+        # ledger direction is the INSTRUMENT direction (drives close side
+        # and PnL sign), not the market thesis: a long put is a bearish
+        # position we nonetheless own, and sell to close. delta_exposure
+        # carries the thesis sign via option_type instead.
+        ledger_direction = "long"
+        base_delta = 0.5 if payload.get("option_type", "call") == "call" else -0.5
+        delta_exposure = payload.get("delta_exposure", base_delta)
+    else:
+        ledger_direction = direction
+        delta_exposure = 1.0 if direction == "long" else -1.0
 
     ledger_data = {
         "bot_source": payload["bot_source"],
         "strategy_id": payload.get("strategy_id"),
         "asset": payload.get("option_symbol", symbol) if asset_type == "option" else symbol,
         "asset_type": asset_type,
-        "direction": direction,
+        "direction": ledger_direction,
         "delta_exposure": delta_exposure,
         "notional_risk": sized_notional,
         "qty": filled_qty,

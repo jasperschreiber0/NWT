@@ -26,6 +26,7 @@
 | Directional cap (60%) *(repo)* | Built in `execution/engine.py` (`DIRECTIONAL_CAP_PCT`); distinct from `master/strategist.py`'s `PER_BOT_WEIGHT_CEILING` (0.65) — see Stack 3 | 2026-07-11 |
 | Risk Agent sizing-reduction rules (3, 7) *(repo)* | Built — `sizing_multiplier` on `nwt_ticket_decisions`, applied by `execution_agent.py`; used to only log a warning | 2026-07-11 |
 | Exit lifecycle (equity monitor + options close) *(repo)* | Built; equity monitor now prefers the ticket's own `stop_pct`/`target_pct` (persisted on the ledger row) over genome/hardcoded defaults | 2026-07-11 |
+| Defined-risk options execution *(repo)* | Built — `bull_call_spread`/`bear_put_spread`/`iron_condor` resolve real multi-leg Alpaca `mleg` orders (`nwt_agents/execution_agent.py::resolve_spread_legs`); single-leg entries (`long_call`/`long_put`/`vix_calls`) are always buy-to-open. Closes a prior gap where any bearish single-leg ticket placed a naked sell-to-open. Ledger keeps one row per leg, tied by `spread_group_id`. See Stack 5. | 2026-07-12 |
 | Inactivity ticket taxonomy *(repo)* | Built; session scorecard now counts both Track A's `nwt_inactivity_log` and Track C/D/E's `nwt_tickets(type='inactivity')` | 2026-07-11 |
 | Same-regime 5+ sessions rule *(repo)* | Built — `nwt_regime_history` + `regime_classifier.py`'s session-persistence check | 2026-07-11 |
 | Learning Layer C — Strategy Mutator *(repo)* | Built — `nwt_agents/mutation_agent.py` (propose + promote), genome versioning + Learning Gate enforced | 2026-07-11 |
@@ -894,6 +895,7 @@ All model env vars overridable via `nwt_agents/.env`
 | Cold start | System assumes zero exposure until ledger populates — explicit, not an error |
 | Regime is now an object | regime_at_entry/exit are JSONB — not plain text strings. Any agent reading regime as a string is non-compliant. |
 | Mutation shadow mode | No strategy mutation may be promoted without shadow-mode results. Observing from 30 trades, promoting after 100+. |
+| Single-leg options are always buy-to-open | `execution/engine.py::place_options_order` never sells outside a `legs`-bearing mleg payload. A short leg is only reachable inside `bull_call_spread`/`bear_put_spread`/`iron_condor`, always paired with a long leg. Any code path that derives order side from `direction` for a single-leg option ticket is reintroducing the naked-short bug — closing a leg must also look up its own ledger `direction`, never assume "sell". |
 
 ---
 

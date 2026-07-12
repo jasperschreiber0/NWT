@@ -62,7 +62,15 @@ DEFAULT_SPREAD_PCT = {
 def fetch_unprocessed_closed_positions(conn) -> list:
     """
     Return closed positions NOT yet in nwt_trade_outcomes.
-    Matches on alpaca_order_id or position_id.
+
+    Matches on position_id — the mandatory, unambiguous FK (CLAUDE.md's own
+    documented gotcha: "fuzzy symbol/time attribution is a bug"). The old
+    entry_time+symbol+direction match false-positives whenever two rows
+    share those three fields — two unrelated same-day, same-direction
+    trades on the same symbol collide and one silently never gets an
+    outcome row written. Legacy rows written before position_id existed
+    (OR branch) still match the old fuzzy way, once, so they aren't
+    reprocessed either.
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
@@ -74,11 +82,11 @@ def fetch_unprocessed_closed_positions(conn) -> list:
               AND pl.alpaca_order_id IS NOT NULL
               AND NOT EXISTS (
                   SELECT 1 FROM nwt_trade_outcomes to_
-                  -- Match on strategy_id via original ticket lookup
-                  -- We use alpaca_order_id as the join bridge via nwt_tickets payload
-                  WHERE to_.entry_time = pl.entry_time
-                    AND to_.symbol = pl.asset
-                    AND to_.direction = pl.direction
+                  WHERE to_.position_id = pl.position_id
+                     OR (to_.position_id IS NULL
+                         AND to_.entry_time = pl.entry_time
+                         AND to_.symbol = pl.asset
+                         AND to_.direction = pl.direction)
               )
             ORDER BY pl.exit_time ASC
             """
@@ -461,7 +469,7 @@ def main() -> None:
                     cur.execute(
                         """
                         INSERT INTO nwt_trade_outcomes
-                            (strategy_id, archetype, symbol, direction,
+                            (position_id, strategy_id, archetype, symbol, direction,
                              entry_price, entry_time, exit_price, exit_time,
                              pnl, pnl_pct,
                              pnl_adjusted, pnl_adjusted_pct,
@@ -475,7 +483,7 @@ def main() -> None:
                              expected_move_capture, realized_move_capture,
                              closed_at)
                         VALUES
-                            (%s, %s, %s, %s,
+                            (%s, %s, %s, %s, %s,
                              %s, %s, %s, %s,
                              %s, %s,
                              %s, %s,
@@ -490,6 +498,7 @@ def main() -> None:
                              %s)
                         """,
                         (
+                            position_id,
                             strategy_id,
                             archetype,
                             asset,

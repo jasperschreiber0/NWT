@@ -190,6 +190,139 @@ def compute_qty_from_notional(sized_notional: float, option_price: float) -> int
 
 
 # ---------------------------------------------------------------------------
+# Multi-leg (defined-risk) structures
+#
+# conviction_engine.py's LLM prompt constrains strategy_type to exactly:
+# long_call, long_put, bull_call_spread, bear_put_spread, iron_condor,
+# vix_calls — the same six matching CLAUDE.md's Options Strategy Rules
+# table. There is no "short premium" strategy_type; the three spread types
+# below are the only ones with a short leg, and each short leg is always
+# paired with a long leg that bounds the risk.
+# ---------------------------------------------------------------------------
+
+SPREAD_STRATEGIES = {"bull_call_spread", "bear_put_spread", "iron_condor"}
+
+
+def _fetch_chain(symbol: str, option_type: str, dte_min: int, dte_max: int) -> list:
+    today = date.today()
+    url = f"{ALPACA_BASE_URL}/v2/options/contracts"
+    params = {
+        "underlying_symbols": symbol,
+        "expiration_date_gte": (today + timedelta(days=dte_min)).isoformat(),
+        "expiration_date_lte": (today + timedelta(days=dte_max)).isoformat(),
+        "type": option_type,
+        "limit": 200,
+    }
+    resp = requests.get(url, headers=ALPACA_HEADERS, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("option_contracts", []) if isinstance(data, dict) else data
+
+
+def _get_spot(symbol: str) -> float | None:
+    try:
+        url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/trades/latest"
+        resp = requests.get(url, headers=ALPACA_HEADERS, timeout=15)
+        resp.raise_for_status()
+        return float(resp.json()["trade"]["p"])
+    except Exception:
+        return None
+
+
+def _leg(contract: dict, side: str, option_type: str) -> dict:
+    return {
+        "option_symbol": contract.get("symbol") or contract.get("id"),
+        "side": side,
+        "option_type": option_type,
+        "strike_price": float(contract.get("strike_price", 0)),
+        "expiration_date": contract.get("expiration_date"),
+    }
+
+
+def resolve_spread_legs(symbol: str, strategy_type: str,
+                        dte_min: int, dte_max: int) -> list | None:
+    """
+    Resolve the legs of a defined-risk structure. All legs share one expiry.
+    Verticals: buy ATM, sell the next strike further OTM.
+    Iron condor: sell first-OTM call+put, buy the next strike beyond each.
+    Returns a list of leg dicts, or None if the structure cannot be built.
+    """
+    spot = _get_spot(symbol)
+    if not spot or spot <= 0:
+        logger.warning("No spot price for %s — cannot build %s", symbol, strategy_type)
+        return None
+
+    try:
+        if strategy_type in ("bull_call_spread", "bear_put_spread"):
+            option_type = "call" if strategy_type == "bull_call_spread" else "put"
+            contracts = _fetch_chain(symbol, option_type, dte_min, dte_max)
+            if not contracts:
+                return None
+            atm = min(contracts, key=lambda c: abs(float(c.get("strike_price", 0)) - spot))
+            expiry = atm.get("expiration_date")
+            same_exp = sorted(
+                (c for c in contracts if c.get("expiration_date") == expiry),
+                key=lambda c: float(c.get("strike_price", 0)),
+            )
+            atm_strike = float(atm.get("strike_price", 0))
+            if option_type == "call":
+                further = [c for c in same_exp if float(c["strike_price"]) > atm_strike]
+                short = further[0] if further else None
+            else:
+                further = [c for c in same_exp if float(c["strike_price"]) < atm_strike]
+                short = further[-1] if further else None
+            if short is None:
+                return None
+            return [_leg(atm, "buy", option_type), _leg(short, "sell", option_type)]
+
+        if strategy_type == "iron_condor":
+            calls = _fetch_chain(symbol, "call", dte_min, dte_max)
+            puts = _fetch_chain(symbol, "put", dte_min, dte_max)
+            if not calls or not puts:
+                return None
+            atm_call = min(calls, key=lambda c: abs(float(c.get("strike_price", 0)) - spot))
+            expiry = atm_call.get("expiration_date")
+            exp_calls = sorted((c for c in calls if c.get("expiration_date") == expiry),
+                               key=lambda c: float(c["strike_price"]))
+            exp_puts = sorted((c for c in puts if c.get("expiration_date") == expiry),
+                              key=lambda c: float(c["strike_price"]))
+            calls_above = [c for c in exp_calls if float(c["strike_price"]) > spot]
+            puts_below = [c for c in exp_puts if float(c["strike_price"]) < spot]
+            if len(calls_above) < 2 or len(puts_below) < 2:
+                return None
+            short_call, long_call = calls_above[0], calls_above[1]
+            short_put, long_put = puts_below[-1], puts_below[-2]
+            return [
+                _leg(short_call, "sell", "call"),
+                _leg(long_call, "buy", "call"),
+                _leg(short_put, "sell", "put"),
+                _leg(long_put, "buy", "put"),
+            ]
+
+    except Exception as exc:
+        logger.error("Failed to resolve %s legs for %s: %s", strategy_type, symbol, exc)
+        return None
+
+    return None
+
+
+def size_spread_qty(legs: list, sized_notional: float) -> int:
+    """
+    Number of spreads from the net debit. Credit structures (net <= 0, e.g.
+    iron condor) and unpriceable legs get 1 spread — never guess a multiple.
+    """
+    net = 0.0
+    for leg in legs:
+        price = _get_option_price(leg["option_symbol"])
+        if not price or price <= 0:
+            return 1
+        net += price if leg["side"] == "buy" else -price
+    if net <= 0:
+        return 1
+    return max(int(sized_notional / (net * 100)), 1)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -214,12 +347,111 @@ def _get_option_price(option_symbol: str) -> float | None:
         return None
 
 
+def _position_qty(pos: dict) -> int:
+    entry_price = float(pos.get("entry_price") or 0)
+    notional = float(pos.get("notional_risk") or 0)
+    return max(int(round(notional / (entry_price * 100))) if entry_price > 0 else 1, 1)
+
+
+def _has_pending_close(conn, position_id: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM nwt_tickets
+            WHERE type IN ('CLOSE_REQUEST', 'FORCE_CLOSE')
+              AND payload->>'position_id' = %s
+              AND created_at > NOW() - INTERVAL '2 hours'
+            """,
+            (position_id,),
+        )
+        return cur.fetchone()[0] > 0
+
+
+def _emit_close_request(conn, pos: dict, exit_reason: str) -> None:
+    """
+    direction is the position's OWN ledger direction (long/short) — the
+    engine's process_close_ticket looks this up again from the ledger before
+    choosing buy-vs-sell to close, but carrying it here too keeps the ticket
+    payload self-describing.
+    """
+    position_id = str(pos["position_id"])
+    symbol = pos.get("asset", "")
+    try:
+        insert_ticket(
+            conn,
+            from_agent="NWT_EXECUTION_AGENT",
+            to_agent="EXECUTION_ENGINE",
+            type_="CLOSE_REQUEST",
+            payload={
+                "approved": True,
+                "bot_source": pos.get("bot_source", "NWT_EXECUTION_AGENT"),
+                "symbol": symbol,
+                "option_symbol": symbol,
+                "direction": pos.get("direction", "long"),
+                "strategy_id": pos.get("strategy_id") or pos.get("bot_source", "CLOSE"),
+                "sized_notional": float(pos.get("notional_risk") or 0),
+                "qty": _position_qty(pos),
+                "asset_type": "option",
+                "time_in_force": "day",
+                "exit_reason": exit_reason,
+                "position_id": position_id,
+            },
+        )
+        logger.info("Close request for %s position_id=%s reason=%s",
+                    symbol, position_id, exit_reason)
+    except Exception as exc:
+        logger.error("Failed to insert close request for %s: %s", position_id, exc)
+
+
+def _spread_exit_reason(legs: list, past_hard_close: bool) -> str | None:
+    """
+    Value the structure as a unit: V = sum(sign x price), long +, short -.
+    PnL per spread = V_now - V_entry, scaled by |V_entry| (premium at risk) —
+    target/stop at +/-50%, works for both debit and credit structures.
+
+    DTE<=1 gates hard close exactly like single-leg positions: all legs
+    share one expiry (resolve_spread_legs), so any leg's DTE represents the
+    whole group. If DTE>1, hard-close is skipped and the price check below
+    still applies — hard close only forces closed what expires imminently.
+    Missing leg prices return None (no exit) rather than a guess.
+    """
+    dte = option_dte(legs[0].get("asset", "")) if legs else None
+    if past_hard_close and dte is not None and dte <= 1:
+        return "hard_close"
+
+    v_entry = 0.0
+    v_now = 0.0
+    for leg in legs:
+        entry_price = float(leg.get("entry_price") or 0)
+        if entry_price <= 0:
+            return None
+        price = _get_option_price(leg.get("asset", ""))
+        if price is None:
+            return None
+        sign = 1.0 if leg.get("direction") == "long" else -1.0
+        v_entry += sign * entry_price
+        v_now += sign * price
+
+    premium_at_risk = abs(v_entry)
+    if premium_at_risk <= 0:
+        return None
+
+    pnl_frac = (v_now - v_entry) / premium_at_risk
+    if pnl_frac >= 0.50:
+        return "target"
+    if pnl_frac <= -0.50:
+        return "stop"
+    return None
+
+
 def monitor_options_positions(conn) -> None:
     """
     Check all open options positions:
     - 50% profit target → submit CLOSE_REQUEST
     - 50% stop loss → submit CLOSE_REQUEST
     - Past 15:45 ET hard close AND DTE<=1 → submit CLOSE_REQUEST
+    Legs sharing a spread_group_id are valued and closed as ONE unit (short
+    legs first, so a partial failure never leaves a naked short outstanding).
     Deduplicates: skips positions that already have a pending CLOSE_REQUEST.
 
     Hard close only force-closes positions expiring today/tomorrow. Without
@@ -231,8 +463,7 @@ def monitor_options_positions(conn) -> None:
     than being guessed at.
     """
     now_utc = datetime.now(timezone.utc)
-    hard_close = _hard_close_utc()
-    past_hard_close = now_utc >= hard_close
+    past_hard_close = now_utc >= _hard_close_utc()
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
@@ -243,26 +474,22 @@ def monitor_options_positions(conn) -> None:
     if not positions:
         return
 
+    singles = []
+    groups: dict[str, list] = {}
     for pos in positions:
+        gid = pos.get("spread_group_id")
+        if gid:
+            groups.setdefault(str(gid), []).append(pos)
+        else:
+            singles.append(pos)
+
+    for pos in singles:
         position_id = str(pos["position_id"])
         symbol = pos.get("asset", "")
         entry_price = float(pos.get("entry_price") or 0)
-        notional = float(pos.get("notional_risk") or 0)
-        qty = max(int(round(notional / (entry_price * 100))) if entry_price > 0 else 1, 1)
 
-        # Check if a close ticket already exists for this position
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT COUNT(*) FROM nwt_tickets
-                WHERE type IN ('CLOSE_REQUEST', 'FORCE_CLOSE')
-                  AND payload->>'position_id' = %s
-                  AND created_at > NOW() - INTERVAL '2 hours'
-                """,
-                (position_id,),
-            )
-            if cur.fetchone()[0] > 0:
-                continue  # Already have a pending close
+        if _has_pending_close(conn, position_id):
+            continue
 
         exit_reason = None
         dte = option_dte(symbol)
@@ -281,31 +508,22 @@ def monitor_options_positions(conn) -> None:
                     exit_reason = "stop"
 
         if exit_reason:
-            try:
-                insert_ticket(
-                    conn,
-                    from_agent="NWT_EXECUTION_AGENT",
-                    to_agent="EXECUTION_ENGINE",
-                    type_="CLOSE_REQUEST",
-                    payload={
-                        "approved": True,
-                        "bot_source": pos.get("bot_source", "NWT_EXECUTION_AGENT"),
-                        "symbol": symbol,
-                        "option_symbol": symbol,
-                        "direction": "close",
-                        "strategy_id": pos.get("bot_source", "CLOSE"),
-                        "sized_notional": notional,
-                        "qty": qty,
-                        "asset_type": "option",
-                        "time_in_force": "day",
-                        "exit_reason": exit_reason,
-                        "position_id": position_id,
-                    },
-                )
-                logger.info("Close request for %s position_id=%s reason=%s",
-                            symbol, position_id, exit_reason)
-            except Exception as exc:
-                logger.error("Failed to insert close request for %s: %s", position_id, exc)
+            _emit_close_request(conn, pos, exit_reason)
+
+    for gid, legs in groups.items():
+        if any(_has_pending_close(conn, str(leg["position_id"])) for leg in legs):
+            continue
+
+        exit_reason = _spread_exit_reason(legs, past_hard_close)
+        if not exit_reason:
+            continue
+
+        # Short legs first: covering the short before selling the long means
+        # there is never a naked-short interval if a later close fails
+        for leg in sorted(legs, key=lambda l: 0 if l.get("direction") == "short" else 1):
+            _emit_close_request(conn, leg, exit_reason)
+        logger.info("Spread close requested: group=%s legs=%d reason=%s",
+                    gid, len(legs), exit_reason)
 
 
 def main() -> None:
@@ -395,57 +613,78 @@ def main() -> None:
                 failed_count += 1
                 continue
 
-            # Resolve specific option contract
-            contract = resolve_option_contract(
-                symbol=symbol,
-                direction=direction,
-                strategy_type=strategy_type,
-                dte_min=dte_min,
-                dte_max=dte_max,
-                strike_preference=strike_preference,
-            )
-
-            if contract is None:
-                reason = f"Could not resolve option contract for {symbol} {strategy_type}"
-                logger.error("Ticket %s: %s", ticket_id, reason)
-                insert_decision(conn, ticket_id, "FAILED", reason, "NWT_EXECUTION_AGENT")
-                log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
-                failed_count += 1
-                continue
-
-            option_symbol = contract["option_symbol"]
-            option_price = _get_option_price(option_symbol)
-            if option_price and option_price > 0:
-                qty = compute_qty_from_notional(sized_notional, option_price)
-            else:
-                logger.warning(
-                    "Ticket %s: could not fetch live price for %s — falling back to "
-                    "conservative $200/contract estimate", ticket_id, option_symbol,
-                )
-                qty = max(int(sized_notional / 200), 1)
-
-            # Build execution payload for the Execution Engine
+            # Base execution payload; leg/contract fields filled in per branch below.
+            # direction is the market thesis, carried through for attribution —
+            # the engine derives actual order sides itself (single-leg always
+            # buys; only a spread's short leg can sell, always paired with a
+            # long leg that bounds the risk).
             execution_payload = {
                 "approved": True,
                 "bot_source": bot_source,
                 "symbol": symbol,
-                "option_symbol": option_symbol,
                 "direction": direction,
                 "strategy_id": strategy_id,
                 "archetype": payload.get("archetype", ""),
                 "sized_notional": sized_notional,
-                "qty": qty,
                 "asset_type": "option",
                 "time_in_force": "day",
                 "stop_pct": stop_pct,
                 "target_pct": target_pct,
-                "strike_price": contract["strike_price"],
-                "expiration_date": contract["expiration_date"],
-                "option_type": contract["option_type"],
                 "strategy_type": strategy_type,
                 "regime_at_decision": regime,
                 "source_proposal_ticket_id": ticket_id,
             }
+
+            if strategy_type in SPREAD_STRATEGIES:
+                # Defined-risk structure — resolve all legs, submit as one mleg order
+                legs = resolve_spread_legs(symbol, strategy_type, dte_min, dte_max)
+                if not legs:
+                    reason = f"Could not resolve {strategy_type} legs for {symbol}"
+                    logger.error("Ticket %s: %s", ticket_id, reason)
+                    insert_decision(conn, ticket_id, "FAILED", reason, "NWT_EXECUTION_AGENT")
+                    log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
+                    failed_count += 1
+                    continue
+                execution_payload["legs"] = legs
+                execution_payload["qty"] = size_spread_qty(legs, sized_notional)
+                option_symbol = "/".join(l["option_symbol"] for l in legs)
+            else:
+                # Single-leg — always long premium (engine buys to open)
+                contract = resolve_option_contract(
+                    symbol=symbol,
+                    direction=direction,
+                    strategy_type=strategy_type,
+                    dte_min=dte_min,
+                    dte_max=dte_max,
+                    strike_preference=strike_preference,
+                )
+
+                if contract is None:
+                    reason = f"Could not resolve option contract for {symbol} {strategy_type}"
+                    logger.error("Ticket %s: %s", ticket_id, reason)
+                    insert_decision(conn, ticket_id, "FAILED", reason, "NWT_EXECUTION_AGENT")
+                    log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
+                    failed_count += 1
+                    continue
+
+                option_symbol = contract["option_symbol"]
+                option_price = _get_option_price(option_symbol)
+                if option_price and option_price > 0:
+                    qty = compute_qty_from_notional(sized_notional, option_price)
+                else:
+                    logger.warning(
+                        "Ticket %s: could not fetch live price for %s — falling back to "
+                        "conservative $200/contract estimate", ticket_id, option_symbol,
+                    )
+                    qty = max(int(sized_notional / 200), 1)
+
+                execution_payload.update({
+                    "option_symbol": option_symbol,
+                    "qty": qty,
+                    "strike_price": contract["strike_price"],
+                    "expiration_date": contract["expiration_date"],
+                    "option_type": contract["option_type"],
+                })
 
             try:
                 exec_ticket_id = insert_ticket(
