@@ -108,7 +108,30 @@ def find_original_ticket(conn, alpaca_order_id: str, asset: str) -> Optional[dic
             (alpaca_order_id, asset, asset),
         )
         row = cur.fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    ticket = dict(row)
+    # TRADE_REQUEST tickets whose originating TRADE_PROPOSAL predates the
+    # regime_at_decision field (or otherwise omitted it) leave regime_at_entry
+    # empty on every downstream nwt_trade_outcomes row — silently violating
+    # the "regime_at_entry is always a full JSONB object" invariant above.
+    # Follow source_proposal_ticket_id back to the TRADE_PROPOSAL to recover it.
+    payload = ticket.get("payload") or {}
+    if ticket.get("type") == "TRADE_REQUEST" and not payload.get("regime_at_decision"):
+        source_id = payload.get("source_proposal_ticket_id")
+        if source_id:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM nwt_tickets WHERE ticket_id = %s",
+                    (source_id,),
+                )
+                proposal_row = cur.fetchone()
+            if proposal_row:
+                proposal_payload = dict(proposal_row).get("payload") or {}
+                regime = proposal_payload.get("regime_at_decision")
+                if regime:
+                    ticket["payload"] = {**payload, "regime_at_decision": regime}
+    return ticket
 
 
 def _half_spread(price: float, bid, ask, asset_type: str) -> tuple:
