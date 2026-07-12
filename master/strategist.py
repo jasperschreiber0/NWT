@@ -707,7 +707,11 @@ def main() -> int:
     api_key = os.environ.get("ALPACA_API_KEY")
     secret_key = os.environ.get("ALPACA_SECRET_KEY")
     base_url = (os.environ.get("ALPACA_BASE_URL") or "").rstrip("/")
+    if base_url.lower().endswith("/v2"):
+        base_url = base_url[:-len("/v2")]
     data_url = (os.environ.get("ALPACA_DATA_URL") or "").rstrip("/")
+    if data_url.lower().endswith("/v2"):
+        data_url = data_url[:-len("/v2")]
 
     missing = [
         k for k, v in {

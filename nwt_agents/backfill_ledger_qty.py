@@ -21,7 +21,7 @@ from psycopg2.extras import RealDictCursor
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from shared_context import get_db
+from shared_context import clean_alpaca_base_url, get_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("backfill_ledger_qty")
 
-ALPACA_BASE_URL = os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+ALPACA_BASE_URL = clean_alpaca_base_url(os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets"))
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID": os.environ.get("NWT_ALPACA_KEY_ID", ""),
     "APCA-API-SECRET-KEY": os.environ.get("NWT_ALPACA_SECRET_KEY", ""),

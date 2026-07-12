@@ -26,11 +26,13 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from shared_context import (
     check_no_trade_mode,
+    clean_alpaca_base_url,
     get_db,
     insert_decision,
     insert_ticket,
     load_master_directives,
     log_system_event,
+    option_dte,
     pre_trade_veto,
 )
 
@@ -41,8 +43,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("execution_agent")
 
-ALPACA_BASE_URL = os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-ALPACA_DATA_URL = os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+ALPACA_BASE_URL = clean_alpaca_base_url(os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets"))
+ALPACA_DATA_URL = clean_alpaca_base_url(os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets"))
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID": os.environ.get("NWT_ALPACA_KEY_ID", ""),
     "APCA-API-SECRET-KEY": os.environ.get("NWT_ALPACA_SECRET_KEY", ""),
@@ -217,8 +219,16 @@ def monitor_options_positions(conn) -> None:
     Check all open options positions:
     - 50% profit target → submit CLOSE_REQUEST
     - 50% stop loss → submit CLOSE_REQUEST
-    - Past 15:45 ET hard close → submit CLOSE_REQUEST
+    - Past 15:45 ET hard close AND DTE<=1 → submit CLOSE_REQUEST
     Deduplicates: skips positions that already have a pending CLOSE_REQUEST.
+
+    Hard close only force-closes positions expiring today/tomorrow. Without
+    the DTE<=1 guard, a 7-21 DTE spread opened this morning gets force-closed
+    at 15:45 ET the same day, guaranteeing a loss regardless of direction —
+    it never gets the multi-day move it was sized for. Positions with DTE>1
+    survive overnight and are managed by stop/target only. Symbols that
+    can't be parsed for DTE fall through to the price-based check rather
+    than being guessed at.
     """
     now_utc = datetime.now(timezone.utc)
     hard_close = _hard_close_utc()
@@ -255,8 +265,9 @@ def monitor_options_positions(conn) -> None:
                 continue  # Already have a pending close
 
         exit_reason = None
+        dte = option_dte(symbol)
 
-        if past_hard_close:
+        if past_hard_close and dte is not None and dte <= 1:
             exit_reason = "hard_close"
         elif entry_price > 0:
             current_price = _get_option_price(symbol)

@@ -28,7 +28,10 @@ from psycopg2.extras import RealDictCursor
 from ledger import close_position, get_open_positions, insert_position, log_system_event
 
 _here = Path(__file__).parent
-load_dotenv(_here / ".env")
+# override=True: the PM2-inherited ambient environment must never shadow this
+# service's own .env (same root cause as the Track A bot 401 outage — a stale
+# ambient ALPACA_DATA_URL silently beat every bot's correct .env value).
+load_dotenv(_here / ".env", override=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,8 +40,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("execution_engine")
 
-ALPACA_BASE_URL = os.environ["ALPACA_BASE_URL"].rstrip("/")
-ALPACA_DATA_URL = os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+
+def _clean_alpaca_base_url(url: str) -> str:
+    # Strip trailing slash AND a trailing /v2 (CLAUDE.md gotcha: every call
+    # site appends its own /v2/... path, so a misconfigured env var causes a
+    # silent double /v2/v2/ -> 404 on every request).
+    url = (url or "").rstrip("/")
+    if url.lower().endswith("/v2"):
+        url = url[:-len("/v2")]
+    return url
+
+
+ALPACA_BASE_URL = _clean_alpaca_base_url(os.environ["ALPACA_BASE_URL"])
+ALPACA_DATA_URL = _clean_alpaca_base_url(os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets"))
 ALPACA_KEY = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET = os.environ["ALPACA_SECRET_KEY"]
 NWT_DB_DSN = os.environ["NWT_DB_DSN"]

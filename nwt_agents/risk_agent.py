@@ -23,6 +23,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from shared_context import (
     check_no_trade_mode,
+    clean_alpaca_base_url,
     fetch_vix_proxy,
     get_db,
     get_disabled_tracks,
@@ -30,6 +31,7 @@ from shared_context import (
     insert_ticket,
     load_master_directives,
     log_system_event,
+    option_dte,
     set_no_trade_mode,
 )
 
@@ -40,8 +42,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("risk_agent")
 
-ALPACA_BASE_URL = os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-ALPACA_DATA_URL = os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+ALPACA_BASE_URL = clean_alpaca_base_url(os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets"))
+ALPACA_DATA_URL = clean_alpaca_base_url(os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets"))
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID": os.environ.get("NWT_ALPACA_KEY_ID", ""),
     "APCA-API-SECRET-KEY": os.environ.get("NWT_ALPACA_SECRET_KEY", ""),
@@ -271,6 +273,15 @@ def execution_engine_is_stale(conn) -> bool:
 
 
 def get_positions_past_hard_close(conn) -> list:
+    """
+    Positions to force-close at 15:45 ET hard close. Only DTE<=1 — a 7-21
+    DTE spread opened this morning must not be force-closed the same day
+    (guarantees a loss regardless of direction, before it gets the
+    multi-day move it was sized for). Positions with unparseable symbols
+    fail closed (still force-closed) since risk_agent is the authoritarian
+    component and an unknown-expiry option is the riskier thing to hold
+    overnight.
+    """
     hard_close = _hard_close_utc()
     if datetime.now(timezone.utc) < hard_close:
         return []
@@ -278,8 +289,13 @@ def get_positions_past_hard_close(conn) -> list:
         cur.execute(
             "SELECT * FROM nwt_portfolio_ledger WHERE status='open' AND asset_type='option'"
         )
-        rows = cur.fetchall()
-    return [dict(r) for r in rows]
+        rows = [dict(r) for r in cur.fetchall()]
+    result = []
+    for r in rows:
+        dte = option_dte(r.get("asset", ""))
+        if dte is None or dte <= 1:
+            result.append(r)
+    return result
 
 
 def get_api_anomaly(conn) -> bool:

@@ -22,6 +22,7 @@ load_dotenv(Path(__file__).parent / ".env")
 import integrity_gate
 from shared_context import (
     check_no_trade_mode,
+    clean_alpaca_base_url,
     fetch_vix_proxy,
     get_db,
     load_master_directives,
@@ -37,8 +38,8 @@ logging.basicConfig(
 logger = logging.getLogger("layer0_builder")
 
 AGENTS_DIR = Path(os.environ.get("NWT_AGENTS_DIR", Path(__file__).parent))
-ALPACA_DATA_URL = os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-ALPACA_BASE_URL = os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+ALPACA_DATA_URL = clean_alpaca_base_url(os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets"))
+ALPACA_BASE_URL = clean_alpaca_base_url(os.environ.get("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets"))
 
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID": os.environ["NWT_ALPACA_KEY_ID"],
@@ -76,14 +77,19 @@ def fetch_options_snapshot(symbol: str) -> dict:
     """
     Fetch options snapshot for a symbol.
     Returns dict with iv, put_call_ratio, spy_iv_skew approximation.
+
+    Lives on the DATA API (v1beta1/options/snapshots) — the trading API's
+    /v2/options/contracts returns contract specs only, with no live
+    implied_volatility, which previously forced a close_price (a dollar
+    premium, not a vol) fallback: a $15.50 contract was stored as
+    iv=15.5=1550%, tripping the iv>0.80 hard filter and eliminating
+    symbols before Haiku ever saw them.
     """
-    url = f"{ALPACA_BASE_URL}/v2/options/contracts"
-    # Get near-term (7-30 DTE) contracts
+    url = f"{ALPACA_DATA_URL}/v1beta1/options/snapshots/{symbol}"
     today = date.today()
     exp_min = (today + timedelta(days=7)).isoformat()
     exp_max = (today + timedelta(days=30)).isoformat()
     params = {
-        "underlying_symbols": symbol,
         "expiration_date_gte": exp_min,
         "expiration_date_lte": exp_max,
         "limit": 50,
@@ -92,24 +98,30 @@ def fetch_options_snapshot(symbol: str) -> dict:
         resp = requests.get(url, headers=ALPACA_HEADERS, params=params, timeout=20)
         resp.raise_for_status()
         data = resp.json()
-        contracts = data.get("option_contracts", []) if isinstance(data, dict) else data
-        if not contracts:
+        contracts = data.get("snapshots") or data
+        if not contracts or not isinstance(contracts, dict):
             return {"iv": 0.0, "put_call_ratio": 1.0, "iv_skew": 0.0}
 
-        # Compute average IV from contracts that have implied_volatility
+        # Compute average IV from contracts that have live greeks/IV. No
+        # close_price/premium fallback — missing IV stays missing, never a
+        # substitute number.
         ivs_call = []
         ivs_put = []
-        for c in contracts:
-            iv = c.get("implied_volatility") or c.get("close_price")  # fallback
+        for contract_key, c in contracts.items():
+            if not isinstance(c, dict):
+                continue
+            greeks = c.get("greeks") or {}
+            iv = greeks.get("iv") or c.get("impliedVolatility")
             if iv is None:
                 continue
             try:
                 iv_float = float(iv)
                 if iv_float > 0:
-                    if c.get("type") == "call":
-                        ivs_call.append(iv_float)
-                    elif c.get("type") == "put":
+                    upper_key = contract_key.upper()
+                    if "P" in upper_key[len(symbol):]:
                         ivs_put.append(iv_float)
+                    elif "C" in upper_key[len(symbol):]:
+                        ivs_call.append(iv_float)
             except (TypeError, ValueError):
                 continue
 

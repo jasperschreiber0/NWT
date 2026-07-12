@@ -64,18 +64,36 @@ def _get_bars(
 
 
 def _get_options_snapshot(
-    base_url: str,
+    data_url: str,
     api_key: str,
     secret_key: str,
     symbol: str = "SPY",
+    spot: Optional[float] = None,
 ) -> Optional[dict]:
     """
-    Fetch options snapshot for a symbol.
+    Fetch the options chain snapshot for an underlying.
+    Lives on the DATA API (v1beta1), not the trading API — the trading host
+    404s this path (the previous /v2/options/snapshots on base_url never
+    returned data for that reason).
+
+    Without filters the endpoint returns the first 100 contracts sorted by
+    OCC symbol — i.e. today's expiry, which carries no greeks/IV and is
+    useless for the VIX proxy and put/call skew. When spot is known, ask
+    the server for the window we actually consume: 10-60 DTE, strike within
+    5% of spot.
     Returns raw snapshot dict or None on failure.
     """
-    url = f"{base_url}/v2/options/snapshots"
+    url = f"{data_url}/v1beta1/options/snapshots/{symbol}"
     headers = _alpaca_headers(api_key, secret_key)
-    params = {"symbols": symbol}
+    params = {"limit": 100}
+    if spot:
+        today = datetime.now(timezone.utc).date()
+        params.update({
+            "expiration_date_gte": (today + timedelta(days=10)).isoformat(),
+            "expiration_date_lte": (today + timedelta(days=60)).isoformat(),
+            "strike_price_gte": round(spot * 0.95, 2),
+            "strike_price_lte": round(spot * 1.05, 2),
+        })
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         resp.raise_for_status()
@@ -89,19 +107,51 @@ def _get_options_snapshot(
 # VIX
 # ---------------------------------------------------------------------------
 
-def _extract_vix(bars_map: dict) -> Optional[float]:
+def _vix_proxy_from_snapshot(snapshot: Optional[dict], spy_price: Optional[float]) -> Optional[float]:
     """
-    Return most-recent VIX close.
-    Returns None if VIX data is missing or zero (zero = bad feed, not signal).
+    VIX approximation: mean implied vol of near-the-money SPY options
+    (strike within 5% of spot, 10-60 DTE) x 100.
+
+    VIXY's share price must never be used here — it is an ETF dollar price
+    (reverse splits, roll decay), not an index level, and comparing it to
+    the VIX>40 kill-switch threshold produces false global halts whenever
+    the ETF trades above $40. Missing data returns None — never a
+    substitute number.
     """
-    vix_bars = bars_map.get("VIXY") or bars_map.get("VIX")
-    if not vix_bars:
+    if not snapshot or not spy_price:
         return None
-    last = vix_bars[-1]
-    val = last.get("c") or last.get("close")
-    if val is None or val == 0:
+    contracts = snapshot.get("snapshots") or snapshot
+    if not isinstance(contracts, dict):
         return None
-    return float(val)
+
+    today = datetime.now(timezone.utc).date()
+    ivs = []
+    for contract_key, contract_data in contracts.items():
+        if not isinstance(contract_data, dict):
+            continue
+        greeks = contract_data.get("greeks") or {}
+        iv = greeks.get("iv") or contract_data.get("impliedVolatility")
+        if not iv or float(iv) <= 0:
+            continue
+        # OCC symbol: ROOT + YYMMDD + C/P + strike*1000 (8 digits)
+        key = contract_key.upper().strip()
+        if len(key) < 15:
+            continue
+        try:
+            strike = int(key[-8:]) / 1000.0
+            expiry = datetime.strptime(key[-15:-9], "%y%m%d").date()
+        except ValueError:
+            continue
+        dte = (expiry - today).days
+        if not 10 <= dte <= 60:
+            continue
+        if abs(strike - spy_price) / spy_price > 0.05:
+            continue
+        ivs.append(float(iv))
+
+    if not ivs:
+        return None
+    return round(statistics.mean(ivs) * 100.0, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +366,7 @@ def fetch_market_internals(
     }
 
     # All symbols needed for one batch call
-    equity_symbols = ["SPY", "QQQ", "VIXY", "UUP"] + SECTOR_ETFS
+    equity_symbols = ["SPY", "QQQ", "UUP"] + SECTOR_ETFS
     bars_map = _get_bars(
         data_url=alpaca_data_url,
         api_key=alpaca_api_key,
@@ -324,11 +374,6 @@ def fetch_market_internals(
         symbols=equity_symbols,
         limit=12,  # 10 trading days + buffer
     )
-
-    # VIX via VIXY proxy (VIX futures ETF — tradeable on Alpaca paper)
-    result["vix"] = _extract_vix(bars_map)
-    if result["vix"] is None:
-        logger.info("VIX data missing or zero — treating as None")
 
     # DXY direction via UUP proxy
     result["dxy_trend"] = _extract_dxy_trend(bars_map)
@@ -346,14 +391,22 @@ def fetch_market_internals(
     # Breadth score
     result["breadth_score"] = _breadth_score(bars_map)
 
-    # Put/call skew from options snapshot
+    # Options chain snapshot feeds both put/call skew and the VIX proxy —
+    # spot-filtered so the server returns near-the-money 10-60 DTE contracts
+    # instead of today's expiry
     snapshot = _get_options_snapshot(
-        base_url=alpaca_base_url,
+        data_url=alpaca_data_url,
         api_key=alpaca_api_key,
         secret_key=alpaca_secret_key,
         symbol="SPY",
+        spot=result["spy_price"],
     )
     result["put_call_skew"] = _put_call_skew(snapshot)
+
+    # VIX approximation from SPY ATM IV (never VIXY share price)
+    result["vix"] = _vix_proxy_from_snapshot(snapshot, result["spy_price"])
+    if result["vix"] is None:
+        logger.info("VIX proxy unavailable (no usable ATM SPY IV) — treating as None")
 
     # Sector dispersion
     result["sector_dispersion"] = _sector_dispersion(bars_map)

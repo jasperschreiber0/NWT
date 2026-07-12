@@ -33,7 +33,13 @@ def _alpaca_headers() -> dict:
 
 
 def _alpaca_base() -> str:
-    return os.environ["NWT_ALPACA_BASE_URL"].rstrip("/")
+    # Strip trailing slash AND a trailing /v2 (CLAUDE.md gotcha: every call
+    # site appends its own /v2/... path, so a misconfigured env var causes a
+    # silent double /v2/v2/ -> 404 on every request this gate makes).
+    url = os.environ["NWT_ALPACA_BASE_URL"].rstrip("/")
+    if url.lower().endswith("/v2"):
+        url = url[:-len("/v2")]
+    return url
 
 
 def _log_critical(message: str, payload: dict = None) -> None:

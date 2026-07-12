@@ -34,6 +34,38 @@ def new_entry_cutoff_utc(now: datetime = None) -> datetime:
     return cutoff.astimezone(timezone.utc)
 
 
+def option_dte(option_symbol: str) -> int | None:
+    """
+    Days to expiry, parsed from the OCC symbol (ROOT + YYMMDD + C/P + strike*1000).
+    Returns None if the symbol can't be parsed.
+    """
+    key = (option_symbol or "").upper().strip()
+    if len(key) < 15:
+        return None
+    try:
+        expiry = datetime.strptime(key[-15:-9], "%y%m%d").date()
+    except ValueError:
+        return None
+    today = datetime.now(ET_TZ).date()
+    return (expiry - today).days
+
+
+def clean_alpaca_base_url(url: str) -> str:
+    """
+    Strip a trailing slash AND a trailing /v2, if present.
+
+    CLAUDE.md's own documented gotcha: NWT_ALPACA_BASE_URL / NWT_ALPACA_DATA_URL
+    must not carry a trailing /v2 — every call site appends its own /v2/...
+    path, so a misconfigured env var causes a silent double /v2/v2/ -> 404 on
+    every request. Every module reading these env vars must route through
+    this instead of a bare .rstrip("/").
+    """
+    url = (url or "").rstrip("/")
+    if url.lower().endswith("/v2"):
+        url = url[:-len("/v2")]
+    return url
+
+
 # ---------------------------------------------------------------------------
 # DB
 # ---------------------------------------------------------------------------
@@ -55,7 +87,21 @@ def _agents_dir() -> Path:
 
 
 def load_master_directives() -> dict:
+    """
+    shared/master-directives.json is live runtime state, gitignored so a
+    stash/checkout/reset on the server can never silently revert it (this is
+    exactly how the 2026-06-29/07-01 kill-switch outage happened — the file
+    used to be tracked, carrying a cold-start placeholder with
+    global_kill_switch=true, and a stash reverted live state back to it for
+    three sessions). A fresh checkout therefore has no live file at all —
+    bootstrap it once from the committed .example template. Never overwrites
+    an existing file.
+    """
     path = _shared_dir() / "master-directives.json"
+    if not path.exists():
+        example = _shared_dir() / "master-directives.json.example"
+        if example.exists():
+            path.write_text(example.read_text())
     with open(path) as f:
         return json.load(f)
 

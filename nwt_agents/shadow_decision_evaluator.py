@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from shared_context import get_db, log_system_event
+from shared_context import clean_alpaca_base_url, get_db, log_system_event
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("shadow_decision_evaluator")
 
-ALPACA_DATA_URL = os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+ALPACA_DATA_URL = clean_alpaca_base_url(os.environ.get("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets"))
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID": os.environ["NWT_ALPACA_KEY_ID"],
     "APCA-API-SECRET-KEY": os.environ["NWT_ALPACA_SECRET_KEY"],

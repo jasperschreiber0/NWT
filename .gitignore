@@ -3,3 +3,16 @@ __pycache__/
 *.pyo
 .env
 *.log
+
+# Live runtime state, not fixtures. Never track these: a git stash/checkout/
+# reset on the server would silently revert live state (e.g. the kill
+# switch) to whatever was last committed — this is exactly how the
+# 2026-06-29/07-01 silent kill-switch outage happened (144 inactivity
+# tickets, three sessions, zero alarms, because the tracked placeholder had
+# global_kill_switch=true). Keep the .example file as the cold-start
+# template; deploy.sh recreates missing runtime files, never overwrites
+# existing ones.
+shared/*.json
+!shared/master-directives.json.example
+performance/trades.json
+performance/summary.json

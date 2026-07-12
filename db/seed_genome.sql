@@ -1,5 +1,9 @@
 -- Seed all strategy genomes: Track C (C1-C12), Track D (D1-D12), Track E (E1-E12)
--- INSERT ... ON CONFLICT DO NOTHING for idempotency
+-- INSERT ... ON CONFLICT DO NOTHING (bare, no column target) for idempotency.
+-- Must stay bare: migrate_phase0.sql makes the PK (strategy_id, version) and
+-- adds a PARTIAL unique index on strategy_id WHERE active — a target of
+-- ON CONFLICT (strategy_id) matches neither, so re-running this file after
+-- phase0 raises "no unique or exclusion constraint matching".
 --
 -- ARCHETYPES: attribution and daily proposal dedup pool at archetype level.
 -- 36 strategy_ids cannot reach meaningful per-strategy sample sizes in 60 days;
@@ -40,7 +44,7 @@ VALUES
   ('C11', 'C', 'C-SHORT-PREMIUM-DIRECTIONAL', ARRAY['SPY'], 7, 21, 0.80, 0.50, 0.50, 0.50, 'fragile_liquidity', 1, TRUE, FALSE, 100),
   -- C12: Bull put spread — inflation_concern, SPY+QQQ
   ('C12', 'C', 'C-SHORT-PREMIUM-DIRECTIONAL', ARRAY['SPY', 'QQQ'], 7, 21, 0.80, 0.50, 0.50, 0.50, 'inflation_concern', 1, TRUE, FALSE, 100)
-ON CONFLICT (strategy_id) DO NOTHING;
+ON CONFLICT DO NOTHING;
 
 -- ============================================================
 -- TRACK D — Aggressive Directional
@@ -76,7 +80,7 @@ VALUES
   ('D11', 'D', 'D-SPREAD-DIRECTIONAL', ARRAY['NVDA', 'TSLA'], 21, 45, 0.80, 0.55, 0.50, 1.00, 'risk_off', 1, TRUE, FALSE, 100),
   -- D12: Long calls — neutral (breakout from consolidation), SPY+QQQ
   ('D12', 'D', 'D-LONG-DIRECTIONAL', ARRAY['SPY', 'QQQ'], 21, 45, 0.80, 0.55, 0.50, 1.00, 'neutral', 1, TRUE, FALSE, 100)
-ON CONFLICT (strategy_id) DO NOTHING;
+ON CONFLICT DO NOTHING;
 
 -- ============================================================
 -- TRACK E — Vol Desk / Stat-Arb — SHADOW MODE
@@ -116,7 +120,7 @@ VALUES
   ('E11', 'E', 'E-VOL-DESK', ARRAY['SPY', 'NVDA', 'AAPL', 'MSFT'], 7, 30, 0.80, 0.60, 0.50, 0.75, 'any', 1, TRUE, TRUE, 100),
   -- E12: Tail hedge — geopolitical_stress + recession_fear, SPY puts + VIX calls
   ('E12', 'E', 'E-VOL-DESK', ARRAY['SPY', 'VIX'], 7, 30, 0.80, 0.60, 0.50, 0.75, 'geopolitical_stress', 1, TRUE, TRUE, 100)
-ON CONFLICT (strategy_id) DO NOTHING;
+ON CONFLICT DO NOTHING;
 
 -- ============================================================
 -- TRACK A — Signal Bots (equity only, no options)
@@ -145,4 +149,4 @@ VALUES
   -- CHINA-POL-001: Policy/Event — China Bot (1d to 3wk holds)
   ('CHINA-POL-001', 'A', 'CHINA-POL-001', ARRAY['FXI', 'KWEB', 'MCHI', 'BABA', 'TCEHY'], NULL, NULL, NULL, 0.50, 0.025, 0.050, 'any', 1, TRUE, FALSE, 100)
 
-ON CONFLICT (strategy_id) DO NOTHING;
+ON CONFLICT DO NOTHING;
