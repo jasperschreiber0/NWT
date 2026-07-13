@@ -66,6 +66,8 @@ SPREAD_WIDENING_FACTOR = 3.0
 HEARTBEAT_STALE_MINUTES = 5
 ACCOUNT_SIZE = 97_000.0
 INTRADAY_LOSS_LIMIT = -0.015 * ACCOUNT_SIZE
+FORCE_CLOSE_RETRY_COOLDOWN_MINUTES = 15  # 3 risk_agent cycles between re-attempts
+FORCE_CLOSE_ESCALATE_AFTER = 3  # failed attempts before raising CRITICAL for a human
 
 
 # ---------------------------------------------------------------------------
@@ -527,17 +529,71 @@ def evaluate_proposal(
 # Hard close enforcement (Rule 12)
 # ---------------------------------------------------------------------------
 
+def _recent_force_close_attempts(conn, position_id: str, minutes: int = 120) -> list:
+    """
+    (decision, created_at) for FORCE_CLOSE tickets on this position in the
+    last `minutes`, most recent first. A ticket with no decision yet (still
+    in flight with the execution engine) shows up with decision=None.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT d.decision, t.created_at FROM nwt_tickets t
+            LEFT JOIN nwt_ticket_decisions d ON d.ticket_id = t.ticket_id
+            WHERE t.type = 'FORCE_CLOSE'
+              AND t.payload->>'position_id' = %s
+              AND t.created_at > NOW() - (%s * INTERVAL '1 minute')
+            ORDER BY t.created_at DESC
+            """,
+            (position_id, minutes),
+        )
+        return cur.fetchall()
+
+
 def force_close_past_hard_close(conn, positions: list) -> None:
     """
     Short legs first: if a spread's legs are both past hard close, covering
     the short leg before the long leg means a later close failing never
     leaves a naked short outstanding.
+
+    Every FORCE_CLOSE attempt is deduped against recent attempts for the
+    same position_id — this rule fires every 5-minute risk_agent cycle, and
+    without a cooldown a position whose close keeps failing (e.g. Alpaca
+    422s because a prior close order is still working) gets a brand new
+    ticket every single cycle forever, spamming identical failures instead
+    of giving the in-flight attempt time to resolve. After
+    FORCE_CLOSE_ESCALATE_AFTER failed attempts, log CRITICAL once so a
+    human notices the position isn't actually closing — retrying silently
+    forever is exactly the "continues operating while degraded" failure
+    mode this component exists to prevent.
     """
     hard_close_utc = _hard_close_utc()
     positions = sorted(positions, key=lambda p: 0 if p.get("direction") == "short" else 1)
     for pos in positions:
         position_id = str(pos.get("position_id", ""))
         asset = pos.get("asset", "")
+
+        attempts = _recent_force_close_attempts(conn, position_id)
+        if attempts:
+            last_attempt_at = attempts[0][1]
+            cooldown_until = last_attempt_at + timedelta(minutes=FORCE_CLOSE_RETRY_COOLDOWN_MINUTES)
+            if datetime.now(timezone.utc) < cooldown_until:
+                logger.info(
+                    "Rule 12: skipping %s (position_id=%s) — last FORCE_CLOSE attempt %s "
+                    "still within %s-minute cooldown",
+                    asset, position_id, last_attempt_at.isoformat(), FORCE_CLOSE_RETRY_COOLDOWN_MINUTES,
+                )
+                continue
+
+            failed_attempts = [a for a in attempts if a[0] == "FAILED"]
+            if len(failed_attempts) >= FORCE_CLOSE_ESCALATE_AFTER:
+                log_system_event(
+                    conn, "CRITICAL", "risk_agent",
+                    f"Rule 12: FORCE_CLOSE has failed {len(failed_attempts)}x for {asset} "
+                    f"(position_id={position_id}) — still open past hard close, needs manual intervention",
+                    {"position_id": position_id, "asset": asset, "failed_attempts": len(failed_attempts)},
+                )
+
         logger.warning("Rule 12: Force close %s (position_id=%s) — past hard close %s UTC",
                        asset, position_id, hard_close_utc.strftime("%H:%M"))
         try:
