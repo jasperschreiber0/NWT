@@ -316,7 +316,7 @@ def fetch_pending_tickets(conn) -> list:
             WHERE t.to_agent = 'EXECUTION_ENGINE'
               AND t.type = 'TRADE_REQUEST'
               AND t.from_agent IN (
-                  'EU_EXECUTOR', 'ASX_EXECUTOR', 'CHINA_EXECUTOR', 'NWT_EXECUTION_AGENT'
+                  'EU_EXECUTOR', 'AUS_EXECUTOR', 'CHINA_EXECUTOR', 'NWT_EXECUTION_AGENT'
               )
               AND NOT EXISTS (
                   SELECT 1 FROM nwt_ticket_decisions d
