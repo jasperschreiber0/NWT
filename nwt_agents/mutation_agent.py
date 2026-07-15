@@ -44,6 +44,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from shared_context import (
     check_no_trade_mode,
+    count_distinct_trades,
     get_db,
     insert_ticket,
     is_mutation_frozen,
@@ -106,9 +107,13 @@ def fetch_latest_decay(conn, strategy_id: str) -> dict:
 
 
 def count_trade_outcomes(conn, strategy_id: str) -> int:
-    with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM nwt_trade_outcomes WHERE strategy_id = %s", (strategy_id,))
-        return cur.fetchone()[0]
+    """
+    Count of real trades (not raw nwt_trade_outcomes rows — a multi-leg
+    spread writes one row per leg, so a raw COUNT(*) clears
+    MIN_TRADES_TO_OBSERVE on far fewer actual trades than intended for
+    spread-heavy strategies). See shared_context.count_distinct_trades.
+    """
+    return count_distinct_trades(conn, strategy_id=strategy_id)
 
 
 def recently_proposed(conn, strategy_id: str) -> bool:

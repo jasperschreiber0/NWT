@@ -29,6 +29,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from shared_context import (
     get_db,
+    get_distinct_trade_pnls,
     load_layer0_data,
     load_master_directives,
     log_system_event,
@@ -265,21 +266,22 @@ def compute_strategy_decay(conn, key: str, key_column: str = "strategy_id") -> N
     key_column='archetype', pooled across the archetype bucket — the only
     granularity with enough samples to mean anything in the first window.
     Uses pnl_adjusted (spread-haircut) when available; raw pnl as fallback.
+    Trades are collapsed from raw nwt_trade_outcomes rows (one per leg) into
+    one row per real trade via get_distinct_trade_pnls — otherwise a
+    multi-leg strategy's win/loss ratio and expectancy are computed over leg
+    count, not trade count (one losing iron condor looks like 4 losses).
     """
     if key_column not in ("strategy_id", "archetype"):
         raise ValueError(f"Invalid decay key column: {key_column}")
-    with conn.cursor() as cur:
-        cur.execute(
-            f"SELECT COALESCE(pnl_adjusted, pnl), closed_at FROM nwt_trade_outcomes "
-            f"WHERE {key_column} = %s ORDER BY closed_at ASC",
-            (key,),
-        )
-        rows = cur.fetchall()
+    if key_column == "strategy_id":
+        trades = get_distinct_trade_pnls(conn, strategy_id=key, order="ASC")
+    else:
+        trades = get_distinct_trade_pnls(conn, archetype=key, order="ASC")
 
-    if len(rows) < 5:
+    if len(trades) < 5:
         return  # Not enough data
 
-    pnls = [float(r[0]) for r in rows if r[0] is not None]
+    pnls = [pnl for pnl, _closed_at in trades if pnl is not None]
 
     baseline_expectancy = float(np.mean(pnls)) if pnls else 0.0
     rolling_20 = pnls[-20:] if len(pnls) >= 20 else pnls

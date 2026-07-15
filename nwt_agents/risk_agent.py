@@ -27,6 +27,7 @@ from shared_context import (
     fetch_vix_proxy,
     get_db,
     get_disabled_tracks,
+    get_distinct_trade_pnls,
     insert_decision,
     insert_ticket,
     load_master_directives,
@@ -163,19 +164,15 @@ def get_current_drawdown(conn) -> float:
 
 
 def get_consecutive_losses_by_track(conn) -> dict:
+    """
+    Last 4 real trades per track (multi-leg spreads collapsed to one trade
+    via get_distinct_trade_pnls — see shared_context.py), most recent first.
+    A single losing 4-leg iron condor must count as 1 loss, not 4.
+    """
     result = {}
     for track in ("C", "D", "E"):
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT pnl FROM nwt_trade_outcomes
-                WHERE strategy_id LIKE %s
-                ORDER BY closed_at DESC LIMIT 4
-                """,
-                (f"{track}%",),
-            )
-            rows = cur.fetchall()
-        losses = sum(1 for r in rows if r[0] is not None and float(r[0]) < 0)
+        trades = get_distinct_trade_pnls(conn, strategy_prefix=track, order="DESC", limit=4)
+        losses = sum(1 for pnl, _closed_at in trades if pnl is not None and pnl < 0)
         result[track] = losses
     return result
 

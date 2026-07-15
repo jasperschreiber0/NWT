@@ -20,7 +20,7 @@ from psycopg2.extras import RealDictCursor
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from shared_context import get_db, log_system_event
+from shared_context import get_db, get_distinct_trade_pnls, log_system_event
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,22 +138,16 @@ def fetch_cumulative_costs(conn) -> dict:
 
 
 def fetch_daily_trade_stats(conn) -> dict:
-    """Query today's closed trades, PnL, and risk agent decisions from Postgres."""
+    """
+    Query today's closed trades, PnL, and risk agent decisions from Postgres.
+    trades_closed counts real trades (get_distinct_trade_pnls collapses
+    multi-leg spread outcome rows to one per trade) — a raw row COUNT(*)
+    would report a 4-leg iron condor as 4 trades closed in the digest.
+    """
     today_start = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-              COUNT(*) AS trades_closed,
-              COALESCE(SUM(pnl_adjusted), SUM(pnl), 0) AS pnl_today
-            FROM nwt_trade_outcomes
-            WHERE closed_at >= %s
-            """,
-            (today_start,),
-        )
-        row = cur.fetchone()
-    trades_closed = int(row[0] or 0)
-    pnl_today = float(row[1] or 0)
+    trades = get_distinct_trade_pnls(conn, closed_after=today_start)
+    trades_closed = len(trades)
+    pnl_today = sum(pnl for pnl, _closed_at in trades if pnl is not None)
 
     with conn.cursor() as cur:
         cur.execute(

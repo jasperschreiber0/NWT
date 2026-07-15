@@ -113,16 +113,38 @@ def portfolio(_: None = Depends(require_auth)):
         conn.close()
 
 
+# nwt_trade_outcomes is one row per LEG, not per trade — a multi-leg spread
+# (bull_call_spread/bear_put_spread/iron_condor) writes 2-4 rows for what is
+# actually one trade, tied together via nwt_portfolio_ledger.spread_group_id.
+# Every performance stat below must be computed over this trade-level CTE
+# (COALESCE(spread_group_id, position_id, id) as the trade identity), never
+# over raw nwt_trade_outcomes rows, or a single losing iron condor reports
+# as 4 losing trades and trade-count gates (e.g. the 60-trade Phase 1
+# threshold below) clear on far fewer real trades than intended.
+_DISTINCT_TRADES_CTE = """
+    WITH trades AS (
+        SELECT
+            COALESCE(pl.spread_group_id, to_.position_id, to_.id) AS trade_key,
+            MAX(to_.strategy_id) AS strategy_id,
+            SUM(COALESCE(to_.pnl_adjusted, to_.pnl)) AS pnl
+        FROM nwt_trade_outcomes to_
+        LEFT JOIN nwt_portfolio_ledger pl ON pl.position_id = to_.position_id
+        WHERE to_.closed_at IS NOT NULL
+        GROUP BY trade_key
+    )
+"""
+
+
 @app.get("/api/performance")
 def performance(_: None = Depends(require_auth)):
     conn = db_conn()
     try:
         summary        = read_json(PERF / "summary.json")
         agent_state    = q_grace(conn, "SELECT * FROM nwt_agent_state ORDER BY updated_at DESC")
-        trade_outcomes = q_grace(conn, """
+        trade_outcomes = q_grace(conn, _DISTINCT_TRADES_CTE + """
             SELECT strategy_id, SUM(pnl) AS total_pnl, COUNT(*) AS trades,
                    AVG(CASE WHEN pnl > 0 THEN 1.0 ELSE 0.0 END) AS win_rate
-            FROM nwt_trade_outcomes GROUP BY strategy_id
+            FROM trades GROUP BY strategy_id
         """)
         equity_raw = q_grace(conn, """
             SELECT exit_time, pnl FROM nwt_trade_outcomes
@@ -138,7 +160,7 @@ def performance(_: None = Depends(require_auth)):
                 "cumulative_pnl": round(cumulative, 2),
             })
 
-        all_trades = q_grace(conn, "SELECT pnl FROM nwt_trade_outcomes")
+        all_trades = q_grace(conn, _DISTINCT_TRADES_CTE + "SELECT pnl FROM trades")
         wins   = [t for t in all_trades if (t.get("pnl") or 0) > 0]
         losses = [t for t in all_trades if (t.get("pnl") or 0) < 0]
         win_rate      = len(wins) / len(all_trades) if all_trades else 0

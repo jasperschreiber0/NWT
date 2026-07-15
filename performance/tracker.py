@@ -19,14 +19,24 @@ def get_db():
 
 
 def compute_summary(conn):
+    # nwt_trade_outcomes is one row per LEG, not per trade — a multi-leg
+    # spread (bull_call_spread/bear_put_spread/iron_condor) writes 2-4 rows
+    # for what is actually one trade, tied together via
+    # nwt_portfolio_ledger.spread_group_id. Collapse to one row per real
+    # trade (COALESCE(spread_group_id, position_id, id) as the trade
+    # identity) before computing win_rate/profit_factor/total_trades, or a
+    # single losing iron condor reports as 4 losing trades.
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
-            SELECT strategy_id, pnl, pnl_pct, direction, symbol,
-                   regime_at_entry, iv_at_entry, dte_at_entry,
-                   entry_timing_score, exit_timing_score,
-                   slippage_adjusted_efficiency
-            FROM nwt_trade_outcomes
-            WHERE closed_at IS NOT NULL
+            SELECT
+                COALESCE(pl.spread_group_id, to_.position_id, to_.id) AS trade_key,
+                MAX(to_.strategy_id) AS strategy_id,
+                SUM(COALESCE(to_.pnl_adjusted, to_.pnl)) AS pnl,
+                MAX(to_.closed_at) AS closed_at
+            FROM nwt_trade_outcomes to_
+            LEFT JOIN nwt_portfolio_ledger pl ON pl.position_id = to_.position_id
+            WHERE to_.closed_at IS NOT NULL
+            GROUP BY trade_key
             ORDER BY closed_at
         """)
         trades = cur.fetchall()

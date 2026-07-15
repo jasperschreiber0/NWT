@@ -599,6 +599,96 @@ def evaluate_shadow_mutation(
 
 
 # ---------------------------------------------------------------------------
+# Trade aggregation — nwt_trade_outcomes is one row per LEG, not per TRADE.
+# Multi-leg spreads (bull_call_spread, bear_put_spread, iron_condor) write
+# one outcome row per leg (execution/engine.py::resolve_spread_legs), tied
+# together via nwt_portfolio_ledger.spread_group_id. Any caller that treats
+# a raw outcome row as one trade over-counts: a single losing 4-leg iron
+# condor looks like 4 losing trades, and a spread-heavy strategy clears a
+# trade-count gate (mutation "30 to observe", learning-gate style checks) on
+# far fewer real trades than the gate intends. Every caller needing "how
+# many trades" or "this trade's combined PnL" must go through here — never
+# query nwt_trade_outcomes directly for those.
+# ---------------------------------------------------------------------------
+
+def get_distinct_trade_pnls(
+    conn,
+    strategy_id: str = None,
+    strategy_prefix: str = None,
+    archetype: str = None,
+    closed_after: datetime = None,
+    order: str = "ASC",
+    limit: int = None,
+) -> list:
+    """
+    One row per real trade. A trade's identity is
+    COALESCE(spread_group_id, position_id, id): single-leg trades key on
+    position_id; multi-leg spreads key on the shared spread_group_id; the
+    final id fallback covers legacy rows written before position_id existed
+    (same fallback fetch_unprocessed_closed_positions already relies on —
+    each such row was already being treated as its own trade, so this is not
+    a behavior change for them).
+
+    pnl is COALESCE(pnl_adjusted, pnl) summed across the trade's legs — None
+    only when every leg in the trade has no pnl recorded, matching the prior
+    per-row "exclude if no pnl data" behavior instead of silently reporting
+    a fabricated $0 trade.
+
+    Filters — pass at most one of strategy_id (exact) / strategy_prefix
+    (LIKE '<prefix>%', e.g. 'C' for every Track C strategy) / archetype
+    (exact). closed_after further restricts to trades whose last leg closed
+    on/after that timestamp (e.g. "trades closed today").
+
+    Returns [(pnl_or_None, closed_at), ...] ordered by closed_at.
+    """
+    if sum(x is not None for x in (strategy_id, strategy_prefix, archetype)) > 1:
+        raise ValueError("pass at most one of strategy_id / strategy_prefix / archetype")
+    if order not in ("ASC", "DESC"):
+        raise ValueError("order must be ASC or DESC")
+
+    clauses = []
+    params: list = []
+    if strategy_id is not None:
+        clauses.append("to_.strategy_id = %s")
+        params.append(strategy_id)
+    elif strategy_prefix is not None:
+        clauses.append("to_.strategy_id LIKE %s")
+        params.append(f"{strategy_prefix}%")
+    elif archetype is not None:
+        clauses.append("to_.archetype = %s")
+        params.append(archetype)
+    if closed_after is not None:
+        clauses.append("to_.closed_at >= %s")
+        params.append(closed_after)
+    filter_sql = ("AND " + " AND ".join(clauses)) if clauses else ""
+
+    limit_sql = "LIMIT %s" if limit is not None else ""
+    if limit is not None:
+        params.append(limit)
+
+    query = f"""
+        SELECT SUM(COALESCE(to_.pnl_adjusted, to_.pnl)) AS pnl,
+               MAX(to_.closed_at) AS closed_at
+        FROM nwt_trade_outcomes to_
+        LEFT JOIN nwt_portfolio_ledger pl ON pl.position_id = to_.position_id
+        WHERE to_.closed_at IS NOT NULL
+          {filter_sql}
+        GROUP BY COALESCE(pl.spread_group_id, to_.position_id, to_.id)
+        ORDER BY closed_at {order}
+        {limit_sql}
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+    return [(float(r[0]) if r[0] is not None else None, r[1]) for r in rows]
+
+
+def count_distinct_trades(conn, strategy_id: str = None, strategy_prefix: str = None) -> int:
+    """Count of real trades (multi-leg spreads collapsed to one), for trade-count gates/thresholds."""
+    return len(get_distinct_trade_pnls(conn, strategy_id=strategy_id, strategy_prefix=strategy_prefix))
+
+
+# ---------------------------------------------------------------------------
 # System log
 # ---------------------------------------------------------------------------
 
