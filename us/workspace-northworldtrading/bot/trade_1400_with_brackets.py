@@ -24,6 +24,7 @@ from alpaca.data import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Bootstrap — resolve paths relative to this file so the script works from any cwd
@@ -58,9 +59,27 @@ SYMBOL_THRESHOLDS = {
 }
 MAX_SCORE = 5  # 5 scoring components per symbol
 
-# ORB window: 9:30–10:00 ET = 14:30–15:00 UTC
-ORB_START_UTC = 14 * 60 + 30   # minutes since midnight UTC
-ORB_END_UTC   = 15 * 60 + 0
+# ORB window: the first 30 minutes of the US session (9:30–10:00 ET),
+# computed DST-aware from America/New_York. This used to be a hardcoded
+# "14:30–15:00 UTC", which is only 9:30 ET in WINTER (EST) — every day of
+# EDT the window silently pointed at 10:30–11:00 ET, so the "opening range"
+# (and session VWAP, which starts from the same timestamp) was computed
+# from the wrong hour for a third of the year.
+ET_TZ = ZoneInfo("America/New_York")
+
+
+def market_open_utc(now: datetime | None = None) -> datetime:
+    """Today's 9:30 ET expressed in UTC, DST-aware."""
+    et_now = (now or datetime.now(timezone.utc)).astimezone(ET_TZ)
+    open_et = datetime(et_now.year, et_now.month, et_now.day, 9, 30, tzinfo=ET_TZ)
+    return open_et.astimezone(timezone.utc)
+
+
+def orb_window_utc_minutes(now: datetime | None = None) -> tuple[int, int]:
+    """(start, end) of the ORB window as minutes-since-midnight-UTC, for today."""
+    open_utc = market_open_utc(now)
+    start = open_utc.hour * 60 + open_utc.minute
+    return start, start + 30
 
 # Lookback for average volume (trading days)
 AVG_VOL_DAYS = 20
@@ -156,14 +175,13 @@ def log_inactivity(conn, reason: str, regime: dict) -> None:
 # ---------------------------------------------------------------------------
 def fetch_intraday_bars(client: StockHistoricalDataClient, symbols: list[str]) -> dict:
     """
-    Fetch 1-minute bars from market open (14:30 UTC) to now.
+    Fetch 1-minute bars from market open (9:30 ET, DST-aware) to now.
     Returns dict of symbol -> DataFrame sorted by timestamp ascending.
     """
     _enforce_isolation("price")  # always passes; documents intent
 
-    today = datetime.now(timezone.utc).date()
-    # Market open: 14:30 UTC today
-    market_open = datetime(today.year, today.month, today.day, 14, 30, tzinfo=timezone.utc)
+    # Market open: 9:30 ET today, DST-aware — never a fixed UTC hour
+    market_open = market_open_utc()
     now = datetime.now(timezone.utc)
 
     req = StockBarsRequest(
@@ -493,7 +511,8 @@ def main() -> None:
                         symbol, len(bars) if bars is not None else 0)
             continue
 
-        orb_high, orb_low = compute_orb(bars, ORB_START_UTC, ORB_END_UTC)
+        orb_start_utc_min, orb_end_utc_min = orb_window_utc_minutes()
+        orb_high, orb_low = compute_orb(bars, orb_start_utc_min, orb_end_utc_min)
         if orb_high is None:
             log.warning("%s: ORB window had insufficient data — skipping", symbol)
             continue

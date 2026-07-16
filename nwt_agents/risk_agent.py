@@ -235,15 +235,22 @@ def fetch_vix_with_fallback(conn) -> tuple:
 
 
 def execution_engine_is_stale(conn) -> bool:
-    if _is_market_hours():
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT last_beat FROM nwt_heartbeat WHERE service = 'execution_engine'"
-            )
-            row = cur.fetchone()
-        if row:
-            age = (datetime.now(timezone.utc) - row[0].replace(tzinfo=timezone.utc)).total_seconds()
-            return age > HEARTBEAT_STALE_MINUTES * 60
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT last_beat FROM nwt_heartbeat WHERE service = 'execution_engine'"
+        )
+        row = cur.fetchone()
+    if row:
+        age = (datetime.now(timezone.utc) - row[0].replace(tzinfo=timezone.utc)).total_seconds()
+        if age <= HEARTBEAT_STALE_MINUTES * 60:
+            # Engine is alive. A fresh heartbeat short-circuits the
+            # pending-ticket heuristic below, because the engine now
+            # legitimately defers entry tickets (no decision written) while
+            # the market is closed — old pending tickets with no recent
+            # decisions is the NORMAL pre-open state, not unresponsiveness.
+            return False
+        if _is_market_hours():
+            return True
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=EXECUTION_STALE_MINUTES)
     with conn.cursor() as cur:
         cur.execute(

@@ -135,6 +135,7 @@ def main() -> None:
     for candidate in candidates:
         try:
             confidence = float(candidate.get("confidence", 0.5))
+            expected_payoff = candidate.get("expected_payoff", {})
 
             # sized_notional = base_capital * capital_weight * size_cap * confidence
             sized_notional = EU_CAPITAL_BASE * capital_weight * size_cap * confidence
@@ -149,7 +150,7 @@ def main() -> None:
                 "confidence": confidence,
                 "strategy_id": candidate["strategy_id"],
                 "signal_quality": candidate.get("signal_quality", {}),
-                "expected_payoff": candidate.get("expected_payoff", {}),
+                "expected_payoff": expected_payoff,
                 "rationale": candidate.get("rationale", ""),
                 "generated_at": candidate.get("generated_at"),
                 # Sizing fields (added by executor)
@@ -159,6 +160,8 @@ def main() -> None:
                 "capital_weight": capital_weight,
                 "size_cap": size_cap,
                 "time_in_force": "gtc",  # EU: multi-day, GTC required
+                "stop_pct": expected_payoff.get("stop_pct"),
+                "target_pct": expected_payoff.get("target_pct"),
                 "regime_at_submission": regime,
                 "submitted_at": datetime.now(timezone.utc).isoformat(),
             }

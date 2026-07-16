@@ -78,6 +78,15 @@ module.exports = {
       watch: false
     },
     {
+      name: 'us-executor',
+      script: 'us/executor.py',
+      interpreter: 'python3',
+      cron_restart: '10 18 * * 1-5',  // 18:10 UTC Mon-Fri (5 min after us-trader signals)
+      time_zone: 'UTC',
+      autorestart: false,
+      watch: false
+    },
+    {
       name: 'perf-tracker',
       script: 'performance/tracker.py',
       interpreter: 'python3',

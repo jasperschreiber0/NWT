@@ -20,7 +20,9 @@
 | PM2 stack *(repo)* | `ecosystem.config.cjs` defines all Track A bots + dashboard, `time_zone: 'UTC'` explicit on every app | 2026-07-11 |
 | nwt_agents cron *(repo)* | `crontab.txt` defines the full conviction stack + risk/execution/learning/recon schedule, `SHELL=/bin/bash` first line, confirmed UTC | 2026-07-11 |
 | db/schema.sql + migrate_*.sql *(repo)* | Present; apply in filename/date order — schema.sql alone is the Day-1 baseline only | 2026-07-11 |
-| recon_agent.py *(repo)* | Built; `--gate` now auto-runs cold-start import first; `--clear-if-clean` added for human-acknowledged recovery | 2026-07-11 |
+| recon_agent.py *(repo)* | Built; `--gate` now auto-runs cold-start import first; `--clear-if-clean` added for human-acknowledged recovery; `--adopt-untracked` added for non-empty-ledger recovery (2026-07-16 incident class); cold-start import now writes `qty` (omitting it re-triggered qty_mismatch on the imported rows) | 2026-07-16 |
+| In-flight order tracking *(repo)* | Built — `nwt_inflight_orders` + `execution/engine.py::resolve_inflight_orders`. The engine never abandons a submitted order: unfilled-after-poll → `SUBMITTED` decision + in-flight row, resolved on later cycles (root cause of the 2026-07-16 BHP/EWA/RIO untracked-position halt and the 422 close-retry loop). Entries are also deferred (no decision) while the market is closed. | 2026-07-16 |
+| US executor *(repo)* | Built — `us/executor.py` (18:10 UTC, PM2). Previously `us-candidates.json` dead-ended: no component converted US signals into TRADE_REQUEST tickets, so the largest allocation never traded. | 2026-07-16 |
 | no_trade_mode wiring *(repo)* | Built; `clear_no_trade_mode()` now reachable via `recon_agent.py --clear-if-clean` | 2026-07-11 |
 | Heartbeat (engine↔risk) *(repo)* | Built, end-to-end wired (`execution/engine.py` writes, `risk_agent.py`/`integrity_gate.py` read) | 2026-07-11 |
 | Directional cap (60%) *(repo)* | Built in `execution/engine.py` (`DIRECTIONAL_CAP_PCT`); distinct from `master/strategist.py`'s `PER_BOT_WEIGHT_CEILING` (0.65) — see Stack 3 | 2026-07-11 |
@@ -196,6 +198,7 @@ Process manager: PM2 — all processes must be in this file to survive reboot.
 | ukeu-executor | 10:00 | ukeu/ |
 | us-nightly | 10:30 | us/ |
 | us-trader | 18:05 (14:05 ET ORB) | us/ |
+| us-executor | 18:10 (converts us-candidates.json → TRADE_REQUEST tickets) | us/ |
 | perf-tracker | 00:00 | performance/ |
 | nwt-dashboard | always-on (FastAPI, port 8080) | dashboard/ |
 
@@ -665,9 +668,15 @@ Clean recon writes a ticket type='recon_ok' (so absence of recon is itself detec
 ## no_trade_mode
 
 Stored in `nwt_system_flags` table (flag='no_trade_mode'). When TRUE:
-- Every trading agent (Track C/D/E, execution_agent, execution_engine) checks at run start and exits immediately.
+- Every trading agent (Track C/D/E, execution_agent) checks at run start and exits immediately.
+- The Execution Engine runs a **close-only cycle**: it still resolves in-flight orders (fills of orders it already placed — risk accounting, not new trading) and executes FORCE_CLOSE/CLOSE_REQUEST tickets (the Risk Agent's liquidation authority must stay executable — an expiring option must not ride into expiry because the system is halted). It places NO new entries and skips the position monitor.
 - Only humans (or a clean recon gate after human acknowledgement) clear it.
 - Set by: recon_agent (critical mismatch), risk_agent (kill switch, heartbeat lost).
+
+**Recovery runbook (untracked-position halt):**
+1. `python3 recon_agent.py --adopt-untracked` — imports `in_alpaca_not_ledger` positions as UNATTRIBUTED (human-invoked only; cold-start import only handles an EMPTY ledger).
+2. `python3 recon_agent.py --clear-if-clean` — re-runs recon and lifts no_trade_mode only if it passes.
+3. Attribute/close the UNATTRIBUTED rows manually as appropriate.
 
 ---
 
@@ -880,7 +889,10 @@ All model env vars overridable via `nwt_agents/.env`
 | ORB timing | Fire at 18:05 UTC not 18:00 — SIP data not ready at exactly 14:00 ET |
 | AEST vs UTC | Server is UTC, all cron times are UTC |
 | Append-only tickets | UPDATE/DELETE on nwt_tickets raises an exception (trigger-enforced) — always INSERT to nwt_ticket_decisions |
-| no_trade_mode flag | Checked by every trading agent at run start — TRUE means halt immediately, no exceptions |
+| no_trade_mode flag | Checked by every trading agent at run start — TRUE means no NEW positions, no exceptions. The Execution Engine alone still runs its close-only cycle (in-flight resolution + FORCE_CLOSE/CLOSE_REQUEST) so liquidations stay executable while halted |
+| Submitted orders are never abandoned | An order that exists at Alpaca must end as EXECUTED, FAILED (verified dead), or a `nwt_inflight_orders` row. Marking a ticket FAILED while its order still works is the untracked-position bug (2026-07-16) — never reintroduce a poll-timeout → FAILED path |
+| Entries defer while market closed | The engine checks Alpaca's /v2/clock before placing new entries and leaves tickets pending (no decision). Track A executors run hours before the US open — their tickets are picked up at the first open-market cycle |
+| US ORB window is ET-derived | 9:30–10:00 ET via zoneinfo, never a fixed UTC constant — a hardcoded 14:30 UTC window pointed at 10:30 ET all summer (EDT) |
 | 15:45 ET hard close | Computed from ET with DST awareness (zoneinfo), never a fixed UTC time |
 | Genome PK is (strategy_id, version) | Query uses AND active=TRUE — one active version per strategy enforced by partial unique index |
 | nwt_trade_outcomes.position_id | Mandatory on every new row — fuzzy symbol/time attribution is a bug |

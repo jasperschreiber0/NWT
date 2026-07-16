@@ -217,25 +217,7 @@ def cold_start_import(conn) -> None:
 
     imported = 0
     for p in alpaca_positions:
-        sym = p.get("symbol", "")
-        qty = float(p.get("qty", 0))
-        side = "long" if qty > 0 else "short"
-        avg_entry = float(p.get("avg_entry_price", 0))
-        asset_class = p.get("asset_class", "us_equity")
-        asset_type = "option" if asset_class == "us_option" else "equity"
-
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO nwt_portfolio_ledger
-                  (bot_source, asset, asset_type, direction, notional_risk,
-                   entry_price, entry_time, status)
-                VALUES ('UNATTRIBUTED', %s, %s, %s, %s, %s, NOW(), 'open')
-                """,
-                (sym, asset_type, side, abs(qty) * avg_entry, avg_entry),
-            )
-        conn.commit()
-        logger.info("Imported UNATTRIBUTED: %s %s qty=%.0f", side, sym, abs(qty))
+        _import_alpaca_position(conn, p)
         imported += 1
 
     insert_ticket(conn, "RECON_AGENT", "SYSTEM", "cold_start_import", {
@@ -244,6 +226,82 @@ def cold_start_import(conn) -> None:
         "note": "entry_time=now (flagged: actual entry time unknown)",
     })
     logger.info("Cold start import complete: %d positions as UNATTRIBUTED", imported)
+
+
+def _import_alpaca_position(conn, p: dict) -> None:
+    """
+    Insert one live Alpaca position into the ledger as UNATTRIBUTED.
+    qty is written from Alpaca's real position qty — omitting it (the
+    original cold-start bug) left qty=NULL, which the very next recon's
+    options qty check reads as ledger_qty=0 and flags as a brand-new
+    CRITICAL qty_mismatch against the row we just imported.
+    """
+    sym = p.get("symbol", "")
+    qty = float(p.get("qty", 0))
+    side = "long" if qty > 0 else "short"
+    avg_entry = float(p.get("avg_entry_price", 0))
+    asset_class = p.get("asset_class", "us_equity")
+    asset_type = "option" if asset_class == "us_option" else "equity"
+    multiplier = 100 if asset_type == "option" else 1
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_portfolio_ledger
+              (bot_source, asset, asset_type, direction, notional_risk,
+               qty, entry_price, entry_time, status)
+            VALUES ('UNATTRIBUTED', %s, %s, %s, %s, %s, %s, NOW(), 'open')
+            """,
+            (sym, asset_type, side, abs(qty) * avg_entry * multiplier,
+             abs(qty), avg_entry),
+        )
+    conn.commit()
+    logger.info("Imported UNATTRIBUTED: %s %s qty=%.0f", side, sym, abs(qty))
+
+
+# ---------------------------------------------------------------------------
+# Adopt untracked (human-invoked recovery)
+# ---------------------------------------------------------------------------
+
+def adopt_untracked(conn) -> int:
+    """
+    HUMAN-INVOKED ONLY. Import every in_alpaca_not_ledger position into the
+    ledger as UNATTRIBUTED. This is the recovery path for the case cold-start
+    import cannot touch: the ledger is NOT empty, but Alpaca holds positions
+    the ledger never heard about (e.g. orders the engine placed and lost
+    track of before in-flight tracking existed — the 2026-07-16 BHP/EWA/RIO
+    incident). After adopting, run --clear-if-clean to verify recon passes
+    and lift no_trade_mode.
+
+    Never touches symbols the ledger already tracks — a qty_mismatch is a
+    different problem (fix the tracked row's qty, don't add a second row).
+    """
+    try:
+        alpaca_positions = fetch_alpaca_positions()
+    except Exception as exc:
+        logger.error("adopt_untracked: Alpaca fetch failed: %s", exc)
+        sys.exit(1)
+
+    ledger_symbols = {row["asset"] for row in fetch_ledger_open(conn)}
+    untracked = [p for p in alpaca_positions if p.get("symbol", "") not in ledger_symbols]
+
+    if not untracked:
+        logger.info("adopt_untracked: no untracked positions — nothing to adopt")
+        return 0
+
+    for p in untracked:
+        _import_alpaca_position(conn, p)
+
+    insert_ticket(conn, "RECON_AGENT", "SYSTEM", "untracked_adopted", {
+        "adopted": len(untracked),
+        "symbols": [p.get("symbol") for p in untracked],
+        "note": "human-invoked --adopt-untracked; entry_time=now (actual entry time unknown)",
+    })
+    log_system_event(conn, "WARNING", "recon_agent",
+                     f"Adopted {len(untracked)} untracked Alpaca positions as UNATTRIBUTED",
+                     {"symbols": [p.get("symbol") for p in untracked]})
+    logger.info("adopt_untracked: %d positions adopted as UNATTRIBUTED", len(untracked))
+    return len(untracked)
 
 
 # ---------------------------------------------------------------------------
@@ -261,12 +319,18 @@ def main() -> None:
                        help="Human-invoked only: run recon, and if clean, clear no_trade_mode. "
                             "This is the 'clean recon gate after human acknowledgement' CLAUDE.md "
                             "describes — it never runs on its own schedule, only when a human runs it.")
+    group.add_argument("--adopt-untracked", action="store_true", dest="adopt_untracked",
+                       help="Human-invoked only: import in_alpaca_not_ledger positions into the "
+                            "ledger as UNATTRIBUTED (non-empty-ledger recovery — cold start only "
+                            "handles an EMPTY ledger). Follow with --clear-if-clean.")
     args = parser.parse_args()
 
     conn = get_db()
     try:
         if args.cold_start:
             cold_start_import(conn)
+        elif args.adopt_untracked:
+            adopt_untracked(conn)
         elif args.gate:
             # Cold start is an import, not an assumption: if the ledger is
             # empty, reconcile it against Alpaca's live positions before

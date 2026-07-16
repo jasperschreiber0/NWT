@@ -1,11 +1,17 @@
 """
-China Policy/Event Bot — Executor (event-triggered, runs after strategist)
-Reads china-candidates.json, computes sizing from directives, writes trade
-requests to nwt_tickets. Does NOT place orders.
+US Flow Bot — Executor (18:10 UTC, 5 minutes after the ORB signal generator)
+Reads us-candidates.json, computes sizing from directives, writes trade
+requests to nwt_tickets. Does NOT place orders — that is the Execution
+Engine's role.
 
-Capital base: $15,000 allocated to China bot.
-time_in_force: 'day' for intraday holds, 'gtc' for multi-day (1d-3wk range).
-Uses 'gtc' as default since hold period can extend to 3 weeks.
+This closes the gap where us-candidates.json was written by
+trade_1400_with_brackets.py but nothing ever converted it into
+TRADE_REQUEST tickets — the US bot (the largest capital allocation) was a
+signal generator whose signals dead-ended on disk.
+
+Capital base: $35,000 allocated to US bot.
+time_in_force: 'day' (intraday ORB entries — never carried by GTC;
+architecture rule: day orders for US only).
 """
 
 import json
@@ -23,19 +29,19 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 BOT_DIR = Path(__file__).parent
 SHARED_DIR = BOT_DIR.parent / "shared"
-CANDIDATES_FILE = SHARED_DIR / "china-candidates.json"
+CANDIDATES_FILE = SHARED_DIR / "us-candidates.json"
 DIRECTIVES_FILE = SHARED_DIR / "master-directives.json"
 
 load_dotenv(BOT_DIR / ".env", override=True)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [CHINA-EXEC] %(levelname)s %(message)s",
+    format="%(asctime)s [US-EXEC] %(levelname)s %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
-log = logging.getLogger("china_executor")
+log = logging.getLogger("us_executor")
 
-CHINA_CAPITAL_BASE = 15_000.0  # architecture spec: $15k allocated to China bot
+US_CAPITAL_BASE = 35_000.0  # architecture spec: $35k allocated to US bot
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +57,7 @@ def log_to_db(conn, level: str, message: str, payload: dict | None = None) -> No
             cur.execute(
                 "INSERT INTO nwt_system_log (level, component, message, payload) "
                 "VALUES (%s, %s, %s, %s)",
-                (level, "CHINA_EXECUTOR", message, json.dumps(payload) if payload else None),
+                (level, "US_EXECUTOR", message, json.dumps(payload) if payload else None),
             )
         conn.commit()
     except Exception as exc:
@@ -64,7 +70,7 @@ def write_ticket(conn, payload: dict) -> str:
         cur.execute(
             "INSERT INTO nwt_tickets (from_agent, to_agent, type, payload) "
             "VALUES (%s, %s, %s, %s) RETURNING ticket_id",
-            ("CHINA_EXECUTOR", "EXECUTION_ENGINE", "TRADE_REQUEST", json.dumps(payload)),
+            ("US_EXECUTOR", "EXECUTION_ENGINE", "TRADE_REQUEST", json.dumps(payload)),
         )
         ticket_id = str(cur.fetchone()[0])
     conn.commit()
@@ -82,11 +88,25 @@ def load_directives() -> dict:
         return json.load(f)
 
 
+def _candidates_are_fresh(candidates: list) -> bool:
+    """
+    Only submit candidates generated TODAY (UTC). The ORB thesis is intraday;
+    a stale us-candidates.json left over from a previous session must never
+    become an order the next day.
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    for c in candidates:
+        generated_at = c.get("generated_at") or ""
+        if not generated_at.startswith(today):
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    log.info("China executor starting (event-triggered)")
+    log.info("US executor starting (18:10 UTC)")
 
     # Step 1: Directives gate
     directives = load_directives()
@@ -96,31 +116,36 @@ def main() -> None:
         raise RuntimeError(f"regime must be dict (JSONB), got {type(regime)}")
 
     if directives.get("global_kill_switch", True):
-        log.info("Global kill switch active — China executor exiting without tickets")
+        log.info("Global kill switch active — US executor exiting without tickets")
         return
 
-    china_perm = directives.get("bot_permissions", {}).get("china", {})
-    if china_perm.get("status") == "paused":
-        log.info("China bot status=paused — executor exiting without tickets")
+    us_perm = directives.get("bot_permissions", {}).get("us", {})
+    if us_perm.get("status") == "paused":
+        log.info("US bot status=paused — executor exiting without tickets")
         return
 
-    capital_weight = float(china_perm.get("capital_weight", 0.0))
-    size_cap = float(china_perm.get("size_cap", 0.0))
+    capital_weight = float(us_perm.get("capital_weight", 0.0))
+    size_cap = float(us_perm.get("size_cap", 0.0))
 
     if capital_weight <= 0 or size_cap <= 0:
-        log.info("China capital_weight=%.2f or size_cap=%.2f is zero — no tickets", capital_weight, size_cap)
+        log.info("US capital_weight=%.2f or size_cap=%.2f is zero — no tickets", capital_weight, size_cap)
         return
 
     # Step 2: Read candidates
     if not CANDIDATES_FILE.exists():
-        log.info("china-candidates.json not found — no candidates to process")
+        log.info("us-candidates.json not found — no candidates to process")
         return
 
     with open(CANDIDATES_FILE) as f:
         candidates = json.load(f)
 
     if not candidates:
-        log.info("china-candidates.json is empty — no tickets to write")
+        log.info("us-candidates.json is empty — no tickets to write")
+        return
+
+    if not _candidates_are_fresh(candidates):
+        log.warning("us-candidates.json contains candidates not generated today — refusing "
+                    "to submit stale intraday signals")
         return
 
     # Step 3: DB connect
@@ -131,17 +156,23 @@ def main() -> None:
         log.error("DB connection failed: %s — cannot write tickets", exc)
         sys.exit(1)
 
-    # Step 4: Size and submit each candidate
+    # Step 4: Size and submit
     tickets_written = 0
     for candidate in candidates:
+        # Hard guard: US Track A submits equities only (Track C handles the
+        # shared account's options via the nwt_agents stack)
+        if candidate.get("asset_type", "equity") == "option":
+            log.error("US executor received an options candidate for %s — rejected. "
+                      "Track A US bot is equities only.", candidate.get("symbol"))
+            log_to_db(conn, "ERROR", f"US options candidate rejected: {candidate.get('symbol')}")
+            continue
+
         try:
             confidence = float(candidate.get("confidence", 0.5))
-            expected_payoff = candidate.get("expected_payoff", {})
-            sized_notional = CHINA_CAPITAL_BASE * capital_weight * size_cap * confidence
+            sized_notional = US_CAPITAL_BASE * capital_weight * size_cap * confidence
             sized_notional = round(sized_notional, 2)
 
-            # China holding period is 1 day to 3 weeks — use gtc as default
-            # so position can be managed over the hold window
+            expected_payoff = candidate.get("expected_payoff", {})
             ticket_payload = {
                 "approved": True,  # directives gate (kill switch / status / sizing) already passed above
                 "bot": candidate["bot"],
@@ -153,12 +184,12 @@ def main() -> None:
                 "expected_payoff": expected_payoff,
                 "rationale": candidate.get("rationale", ""),
                 "generated_at": candidate.get("generated_at"),
-                "bot_source": "CHINA_BOT",
+                "bot_source": "US_BOT",
                 "asset_type": "equity",
                 "sized_notional": sized_notional,
                 "capital_weight": capital_weight,
                 "size_cap": size_cap,
-                "time_in_force": "gtc",  # China: 1d-3wk hold, gtc for multi-day positions
+                "time_in_force": "day",  # US: intraday ORB — never GTC
                 "stop_pct": expected_payoff.get("stop_pct"),
                 "target_pct": expected_payoff.get("target_pct"),
                 "regime_at_submission": regime,
@@ -175,14 +206,14 @@ def main() -> None:
 
         except Exception as exc:
             log.error("Failed to write ticket for %s: %s", candidate.get("symbol"), exc)
-            log_to_db(conn, "ERROR", f"China ticket write failed for {candidate.get('symbol')}: {exc}")
+            log_to_db(conn, "ERROR", f"US ticket write failed for {candidate.get('symbol')}: {exc}")
 
-    log_to_db(conn, "INFO", f"China executor wrote {tickets_written} ticket(s)", {
+    log_to_db(conn, "INFO", f"US executor wrote {tickets_written} ticket(s)", {
         "tickets": tickets_written,
         "capital_weight": capital_weight,
         "size_cap": size_cap,
     })
-    log.info("China executor done — %d ticket(s) written", tickets_written)
+    log.info("US executor done — %d ticket(s) written", tickets_written)
     conn.close()
 
 
