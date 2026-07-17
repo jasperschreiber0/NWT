@@ -595,10 +595,9 @@ def _record_close_fill(conn, inflight_row: dict, order: dict, fill_price: float)
     if position_id:
         pos = get_ledger_position(conn, position_id)
         if pos and pos.get("status") != "closed":
-            close_position(conn, position_id, fill_price, 0.0, exit_reason)
-            if asset_type == "option":
-                write_trade_outcome(conn, pos, fill_price, exit_reason,
-                                    payload.get("strategy_id"))
+            closed_qty = float(order.get("filled_qty") or pos.get("qty") or 0)
+            apply_close_fill(conn, pos, closed_qty, fill_price, 0.0, exit_reason,
+                             payload.get("strategy_id"))
     if ticket_id:
         insert_decision(conn, ticket_id, "EXECUTED",
                         f"Closed {symbol} at {fill_price:.4f} reason={exit_reason} "
@@ -801,6 +800,54 @@ def write_trade_outcome(conn, position: dict, fill_price: float,
     conn.commit()
 
 
+def apply_close_fill(conn, pos: dict, filled_qty: float, fill_price: float,
+                     slippage: float, exit_reason: str, strategy_id: str = None,
+                     exit_bid: float = None, exit_ask: float = None) -> bool:
+    """
+    Close a ledger position against the qty the close order ACTUALLY filled —
+    never against what the ticket asked for. A close that fills fewer
+    contracts than the row holds shrinks the row (qty and notional_risk
+    scaled down, outcome written for the sold portion only) and leaves it
+    open; marking it fully closed while contracts remain at Alpaca is how
+    3 unsold AAPL contracts rode into expiry with a flat ledger.
+    Returns True if the row was fully closed.
+    """
+    position_id = str(pos["position_id"])
+    row_qty = float(pos.get("qty") or 0)
+
+    if row_qty > 0 and filled_qty > 0 and filled_qty < row_qty - 1e-9:
+        fraction = filled_qty / row_qty
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nwt_portfolio_ledger
+                SET qty = qty - %s, notional_risk = notional_risk * (1 - %s)
+                WHERE position_id = %s
+                """,
+                (filled_qty, fraction, position_id),
+            )
+        conn.commit()
+        if pos.get("asset_type") == "option":
+            part = dict(pos)
+            part["qty"] = filled_qty
+            part["notional_risk"] = float(pos.get("notional_risk") or 0) * fraction
+            write_trade_outcome(conn, part, fill_price, exit_reason, strategy_id)
+        log_system_event(conn, "WARNING", "execution_engine",
+                         f"PARTIAL close: {pos.get('asset')} filled {filled_qty:g} of "
+                         f"{row_qty:g} — row stays open with the remainder",
+                         {"position_id": position_id, "filled_qty": filled_qty,
+                          "row_qty": row_qty, "exit_reason": exit_reason})
+        logger.warning("PARTIAL close %s: %g/%g filled — remainder stays open",
+                       pos.get("asset"), filled_qty, row_qty)
+        return False
+
+    close_position(conn, position_id, fill_price, slippage, exit_reason,
+                   exit_bid=exit_bid, exit_ask=exit_ask)
+    if pos.get("asset_type") == "option":
+        write_trade_outcome(conn, pos, fill_price, exit_reason, strategy_id)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Position monitor (equity multi-day exits)
 # ---------------------------------------------------------------------------
@@ -952,13 +999,15 @@ def process_close_ticket(conn, ticket: dict) -> None:
     qty = int(payload.get("qty", 1))
 
     pos_direction = payload.get("direction", "long")
-    if position_id:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT direction FROM nwt_portfolio_ledger WHERE position_id = %s",
-                        (position_id,))
-            row = cur.fetchone()
-        if row and row.get("direction"):
-            pos_direction = row["direction"]
+    ledger_pos = get_ledger_position(conn, position_id) if position_id else None
+    if ledger_pos:
+        if ledger_pos.get("direction"):
+            pos_direction = ledger_pos["direction"]
+        # The order qty must be the ledger row's REAL fill qty, not whatever
+        # the ticket carried — a notional-derived ticket qty under-sold the
+        # AAPL260717 close (3 of 6 contracts) and the rest rode into expiry.
+        if ledger_pos.get("qty"):
+            qty = max(int(float(ledger_pos["qty"])), 1)
     close_side = "buy" if pos_direction == "short" else "sell"
 
     # Never stack a second close order on top of a working one — the retry
@@ -1008,21 +1057,15 @@ def process_close_ticket(conn, ticket: dict) -> None:
                             f"— recorded in-flight")
             return
 
-        slippage = 0.0
-        if position_id:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM nwt_portfolio_ledger WHERE position_id = %s",
-                            (position_id,))
-                pos = cur.fetchone()
-            if pos:
-                pos = dict(pos)
-                close_position(conn, position_id, fill_price, slippage, exit_reason)
-                if asset_type == "option":
-                    write_trade_outcome(conn, pos, fill_price, exit_reason,
-                                        payload.get("strategy_id"))
+        fully_closed = True
+        if ledger_pos:
+            closed_qty = float(filled.get("filled_qty") or qty)
+            fully_closed = apply_close_fill(conn, ledger_pos, closed_qty, fill_price,
+                                            0.0, exit_reason, payload.get("strategy_id"))
 
         insert_decision(conn, ticket_id, "EXECUTED",
-                        f"Closed {symbol} at {fill_price:.4f} reason={exit_reason}")
+                        f"Closed {symbol} at {fill_price:.4f} reason={exit_reason}"
+                        + ("" if fully_closed else " (PARTIAL — remainder stays open)"))
         log_system_event(conn, "INFO", "execution_engine",
                          f"Close executed: {symbol} at {fill_price:.4f}",
                          {"ticket_id": ticket_id, "exit_reason": exit_reason,

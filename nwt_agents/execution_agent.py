@@ -348,6 +348,16 @@ def _get_option_price(option_symbol: str) -> float | None:
 
 
 def _position_qty(pos: dict) -> int:
+    """
+    The position's REAL contract count — the ledger qty column, which is the
+    actual Alpaca fill. The notional/entry_price fallback exists only for
+    legacy rows written before the qty column: deriving qty from notional on
+    a row that has real qty under-counted the AAPL260717C00312500 close
+    (sold 3 of 6 held contracts, the rest rode into expiry).
+    """
+    ledger_qty = pos.get("qty")
+    if ledger_qty:
+        return max(int(float(ledger_qty)), 1)
     entry_price = float(pos.get("entry_price") or 0)
     notional = float(pos.get("notional_risk") or 0)
     return max(int(round(notional / (entry_price * 100))) if entry_price > 0 else 1, 1)

@@ -244,6 +244,58 @@ def test_inflight_close_resolution_closes_ledger(conn, monkeypatch):
     assert float(row[0]) == pytest.approx(300.0)
 
 
+def test_partial_close_shrinks_row_instead_of_closing(conn, monkeypatch):
+    """The AAPL260717 bug shape: row holds 3 contracts, close order fills
+    only 1 — the row must stay open with qty 2, never be marked flat."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO nwt_portfolio_ledger (bot_source, asset, asset_type, direction, "
+            "qty, entry_price, notional_risk, status) VALUES ('NWT_TRACK_C','AAPL260717C00312500',"
+            "'option','long', 3, 5.0, 1500, 'open') RETURNING position_id"
+        )
+        position_id = str(cur.fetchone()[0])
+    conn.commit()
+
+    seen = {}
+
+    def fake_place_close(symbol, q, asset_type, side="sell"):
+        seen["qty"] = q
+        return {"id": "close-partial-1"}
+
+    monkeypatch.setattr(engine, "place_close_order", fake_place_close)
+    monkeypatch.setattr(engine, "poll_order_until_filled",
+                        lambda oid: {"id": oid, "status": "filled",
+                                     "filled_avg_price": "20.45", "filled_qty": "1"})
+    monkeypatch.setattr(engine, "get_open_orders", lambda s: [])
+
+    payload = {"symbol": "AAPL260717C00312500", "position_id": position_id,
+               "asset_type": "option", "qty": 1, "exit_reason": "target",
+               "strategy_id": "C1"}
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO nwt_tickets (from_agent, to_agent, type, payload) "
+            "VALUES ('NWT_EXECUTION_AGENT','EXECUTION_ENGINE','CLOSE_REQUEST', %s) RETURNING ticket_id",
+            (json.dumps(payload),),
+        )
+        ticket_id = str(cur.fetchone()[0])
+    conn.commit()
+
+    engine.process_close_ticket(conn, {"ticket_id": ticket_id, "payload": payload})
+
+    assert seen["qty"] == 3  # order asks for the ledger's REAL qty, not the ticket's 1
+    row = _ledger(conn)[0]
+    assert row["status"] == "open"          # NOT flat — 2 contracts remain
+    assert float(row["qty"]) == 2
+    assert float(row["notional_risk"]) == pytest.approx(1000.0)
+    with conn.cursor() as cur:
+        cur.execute("SELECT pnl FROM nwt_trade_outcomes WHERE position_id=%s", (position_id,))
+        pnl = float(cur.fetchone()[0])
+    # only the 1 sold contract's PnL: (20.45 - 5.00) * 1 * 100
+    assert pnl == pytest.approx(1545.0)
+    decisions = [d[0] for d in _decisions(conn, ticket_id)]
+    assert decisions == ["EXECUTED"]
+
+
 def test_short_equity_position_is_closed_by_buying(conn, monkeypatch):
     """Covering a short must BUY — always selling doubles the short."""
     with conn.cursor() as cur:
