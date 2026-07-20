@@ -149,3 +149,136 @@ def log_system_event(
             (level, component, message, json.dumps(payload) if payload is not None else None),
         )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Ticket claims — same atomic claim/lease mechanism as
+# nwt_agents/shared_context.py (duplicated here, not imported, since
+# execution/ is deployed separately from nwt_agents/ — same pattern already
+# used for log_system_event above). See
+# db/migrate_2026_07_execution_safety.sql for the schema and rationale.
+# ---------------------------------------------------------------------------
+
+TICKET_CLAIM_LEASE_SECONDS = 180
+
+
+def claim_ticket(conn, ticket_id: str, worker_id: str,
+                  lease_seconds: int = TICKET_CLAIM_LEASE_SECONDS) -> bool:
+    """
+    Atomically claim a ticket for exclusive processing. Returns True iff this
+    call now owns the claim. See shared_context.claim_ticket for the full
+    race-safety explanation — identical mechanism, same table.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_ticket_claims (ticket_id, claimed_by, lease_expires_at, status, updated_at)
+            VALUES (%s, %s, NOW() + (%s * INTERVAL '1 second'), 'in_progress', NOW())
+            ON CONFLICT (ticket_id) DO UPDATE
+              SET claimed_by = EXCLUDED.claimed_by,
+                  claimed_at = NOW(),
+                  lease_expires_at = EXCLUDED.lease_expires_at,
+                  status = 'in_progress',
+                  updated_at = NOW()
+              WHERE nwt_ticket_claims.status = 'failed'
+                 OR (nwt_ticket_claims.status = 'in_progress'
+                     AND nwt_ticket_claims.lease_expires_at < NOW())
+            RETURNING ticket_id
+            """,
+            (ticket_id, worker_id, lease_seconds),
+        )
+        got_it = cur.fetchone() is not None
+    conn.commit()
+    return got_it
+
+
+def release_ticket_claim(conn, ticket_id: str, status: str = "done") -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE nwt_ticket_claims SET status = %s, updated_at = NOW() WHERE ticket_id = %s",
+            (status, ticket_id),
+        )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Force-close outcome recording — the execution side of the state machine
+# whose scheduling half (schedule_force_close_attempt) lives in
+# nwt_agents/shared_context.py and is called by risk_agent.py. This records
+# what actually happened to an attempt risk_agent already scheduled;
+# attempt_count / next_retry_at bookkeeping stays owned by the scheduler,
+# this function only classifies and stores the outcome of one attempt.
+# ---------------------------------------------------------------------------
+
+FORCE_CLOSE_BACKOFF_MINUTES = [1, 5, 15, 60, 360, 1440]  # must match shared_context.py
+
+
+def record_force_close_outcome(conn, position_id: str, success: bool,
+                                error: Optional[str] = None,
+                                terminal: bool = False,
+                                terminal_reason: Optional[str] = None) -> None:
+    """
+    Record the outcome of one FORCE_CLOSE attempt against nwt_force_close_state.
+
+    success=True             -> state=SUCCESS. No further retries — the
+                                 position is closed.
+    terminal=True (implies failure) -> state=FAILED_TERMINAL. The broker has
+                                 told us this can never succeed (position
+                                 already gone, contract expired). No further
+                                 retries; a human doesn't need to act, this
+                                 is an expected end state.
+    otherwise (retryable failure)   -> state=FAILED_RETRYABLE, and
+                                 next_retry_at is set using the backoff
+                                 schedule at whatever attempt_count the
+                                 scheduler already stamped on this row.
+    """
+    if success:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nwt_force_close_state
+                SET state = 'SUCCESS', last_error = NULL, updated_at = NOW()
+                WHERE position_id = %s
+                """,
+                (position_id,),
+            )
+        conn.commit()
+        return
+
+    if terminal:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nwt_force_close_state
+                SET state = 'FAILED_TERMINAL', last_error = %s, terminal_reason = %s, updated_at = NOW()
+                WHERE position_id = %s
+                """,
+                (error, terminal_reason, position_id),
+            )
+        conn.commit()
+        return
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT attempt_count FROM nwt_force_close_state WHERE position_id = %s",
+            (position_id,),
+        )
+        row = cur.fetchone()
+    attempt_count = row["attempt_count"] if row else 1
+    backoff_minutes = FORCE_CLOSE_BACKOFF_MINUTES[
+        min(attempt_count - 1, len(FORCE_CLOSE_BACKOFF_MINUTES) - 1)
+    ]
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE nwt_force_close_state
+            SET state = 'FAILED_RETRYABLE',
+                last_error = %s,
+                next_retry_at = NOW() + (%s * INTERVAL '1 minute'),
+                updated_at = NOW()
+            WHERE position_id = %s
+            """,
+            (error, backoff_minutes, position_id),
+        )
+    conn.commit()

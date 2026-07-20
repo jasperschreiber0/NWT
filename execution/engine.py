@@ -26,7 +26,15 @@ import requests
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 
-from ledger import close_position, get_open_positions, insert_position, log_system_event
+from ledger import (
+    claim_ticket,
+    close_position,
+    get_open_positions,
+    insert_position,
+    log_system_event,
+    record_force_close_outcome,
+    release_ticket_claim,
+)
 
 _here = Path(__file__).parent
 # override=True: the PM2-inherited ambient environment must never shadow this
@@ -52,6 +60,23 @@ def _clean_alpaca_base_url(url: str) -> str:
     return url
 
 
+def _option_dte(option_symbol: str) -> int | None:
+    """
+    Days to expiry, parsed from the OCC symbol (ROOT + YYMMDD + C/P + strike*1000).
+    Returns None if the symbol can't be parsed (e.g. it's an equity symbol).
+    Duplicated from nwt_agents/shared_context.py's option_dte — execution/ is
+    deployed separately, same pattern as log_system_event elsewhere in this file.
+    """
+    key = (option_symbol or "").upper().strip()
+    if len(key) < 15:
+        return None
+    try:
+        expiry = datetime.strptime(key[-15:-9], "%y%m%d").date()
+    except ValueError:
+        return None
+    return (expiry - datetime.now(ET_TZ).date()).days
+
+
 ALPACA_BASE_URL = _clean_alpaca_base_url(os.environ["ALPACA_BASE_URL"])
 ALPACA_DATA_URL = _clean_alpaca_base_url(os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets"))
 ALPACA_KEY = os.environ["ALPACA_API_KEY"]
@@ -73,6 +98,11 @@ REQUIRED_FIELDS = {
 POLL_INTERVAL = 3
 POLL_MAX = 10
 ET_TZ = ZoneInfo("America/New_York")
+
+# Identifies this process as a claim owner (nwt_ticket_claims.claimed_by).
+# Unique per run — crontab.txt has no overlap guard, so two engine.py
+# invocations can legitimately be alive at once; each gets its own id.
+WORKER_ID = f"engine:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 # Aggregate same-direction notional cap (long vs short across all bots/tracks).
 # Distinct from master/strategist.py's PER_BOT_WEIGHT_CEILING, which caps a
@@ -746,11 +776,52 @@ def process_close_ticket(conn, ticket: dict) -> None:
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
 
 
+def _classify_force_close_failure(asset: str, asset_type: str, exc: Exception) -> tuple:
+    """
+    Decide whether a failed close attempt is terminal (never going to
+    succeed, stop retrying) or retryable (transient, try again later).
+
+    status_code == 404       -> not a failure at all: the broker has no such
+                                 position, i.e. it's already closed. Caller
+                                 treats this as SUCCESS, not a failure.
+    option past its own expiry -> terminal. An expired option has no market
+                                 left to submit a closing order against
+                                 (confirmed by tracing a live 422 response
+                                 against SPY260720C00753000 on an
+                                 already-expired, $0 contract) — Alpaca/OCC
+                                 auto-settles it; a manual close order will
+                                 never succeed, retrying forever gains nothing.
+    everything else           -> retryable (network blips, 403s that clear
+                                 up, a prior in-flight order still working,
+                                 etc.) — bounded by schedule_force_close_attempt's
+                                 backoff/max-attempts, not decided here.
+
+    Returns (already_closed: bool, terminal: bool, reason: str).
+    """
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+
+    if status_code == 404:
+        return True, False, "Alpaca reports no such position — already closed"
+
+    if asset_type == "option":
+        dte = _option_dte(asset)
+        if dte is not None and dte < 0:
+            return False, True, f"Option expired {abs(dte)}d ago — awaiting broker auto-settlement"
+
+    return False, False, str(exc)
+
+
 def process_force_close(conn, ticket: dict) -> None:
     """
     Liquidate a ledger position on RISK_AGENT FORCE_CLOSE instruction.
     Uses Alpaca's close-position endpoint (whole position), polls the fill,
     and closes the ledger row with exit price + exit NBBO.
+
+    Every outcome (success, terminal failure, retryable failure) is recorded
+    via record_force_close_outcome() against nwt_force_close_state — this is
+    the half of the force-close state machine that classifies what actually
+    happened; risk_agent.py's schedule_force_close_attempt() owns whether/when
+    to retry based on what gets recorded here.
     """
     ticket_id = str(ticket["ticket_id"])
     payload = ticket.get("payload") or {}
@@ -769,6 +840,8 @@ def process_force_close(conn, ticket: dict) -> None:
         reason = f"FORCE_CLOSE: position {position_id} already closed"
         logger.info("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "SKIPPED", reason)
+        if position_id:
+            record_force_close_outcome(conn, position_id, success=True)
         return
 
     asset = position.get("asset") or asset
@@ -780,10 +853,28 @@ def process_force_close(conn, ticket: dict) -> None:
     try:
         order = alpaca_delete(f"/positions/{asset}")
     except Exception as exc:
+        already_closed, terminal, class_reason = _classify_force_close_failure(asset, asset_type, exc)
+
+        if already_closed:
+            # Broker has no record of this position — nothing left to close.
+            # Ledger doesn't know the real exit price (no fill happened
+            # here), so mark it closed at 0 slippage against last known
+            # quote mid rather than guessing an exit price.
+            fallback_price = expected_price or 0.0
+            close_position(conn, position_id, fallback_price, 0.0, "already_closed_at_broker",
+                           exit_bid=exit_bid, exit_ask=exit_ask)
+            insert_decision(conn, ticket_id, "SKIPPED", f"FORCE_CLOSE: {class_reason}")
+            record_force_close_outcome(conn, position_id, success=True)
+            logger.info("Ticket %s: %s — ledger closed to match", ticket_id, class_reason)
+            return
+
         reason = f"FORCE_CLOSE: liquidation order failed for {asset}: {exc}"
         logger.error("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "FAILED", reason)
-        log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+        log_system_event(conn, "ERROR" if not terminal else "WARNING", "execution_engine", reason,
+                         {"ticket_id": ticket_id, "terminal": terminal})
+        record_force_close_outcome(conn, position_id, success=False, error=str(exc),
+                                   terminal=terminal, terminal_reason=class_reason if terminal else None)
         return
 
     alpaca_order_id = order.get("id", "")
@@ -794,6 +885,7 @@ def process_force_close(conn, ticket: dict) -> None:
         logger.error("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "FAILED", reason)
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+        record_force_close_outcome(conn, position_id, success=False, error=str(exc))
         return
 
     fill_price_str = filled_order.get("filled_avg_price")
@@ -805,6 +897,8 @@ def process_force_close(conn, ticket: dict) -> None:
         log_system_event(conn, "WARNING", "execution_engine", reason, {
             "ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id,
         })
+        record_force_close_outcome(conn, position_id, success=False,
+                                   error=f"no fill price, status={filled_order.get('status')}")
         return
 
     slippage = abs(fill_price - expected_price) / expected_price if expected_price and expected_price > 0 else 0.0
@@ -820,6 +914,7 @@ def process_force_close(conn, ticket: dict) -> None:
                      {"ticket_id": ticket_id, "position_id": position_id,
                       "alpaca_order_id": alpaca_order_id, "fill_price": fill_price,
                       "slippage": slippage})
+    record_force_close_outcome(conn, position_id, success=True)
     logger.info("Ticket %s FORCE_CLOSE EXECUTED: position=%s fill=%.4f", ticket_id, position_id, fill_price)
 
 
@@ -1085,14 +1180,24 @@ def main() -> None:
         if close_tickets:
             logger.info("Found %d force-close tickets", len(close_tickets))
             for ticket in close_tickets:
+                ticket_id = str(ticket.get("ticket_id"))
+                # Atomic claim before any slow Alpaca call — see
+                # db/migrate_2026_07_execution_safety.sql. crontab.txt has no
+                # overlap guard, so without this a second concurrent engine.py
+                # run could select and process this same ticket again,
+                # placing a second real closing order at the broker.
+                if not claim_ticket(conn, ticket_id, WORKER_ID):
+                    logger.info("Ticket %s: not claimed (already owned by another worker) — skipping", ticket_id)
+                    continue
                 try:
                     if ticket.get("type") == "FORCE_CLOSE":
                         process_force_close(conn, ticket)
                     else:
                         process_close_ticket(conn, ticket)
+                    release_ticket_claim(conn, ticket_id, status="done")
                 except Exception as exc:
-                    logger.error("Unhandled error in close ticket %s: %s",
-                                 ticket.get("ticket_id"), exc)
+                    logger.error("Unhandled error in close ticket %s: %s", ticket_id, exc)
+                    release_ticket_claim(conn, ticket_id, status="failed")
 
         pending = fetch_pending_tickets(conn)
         logger.info("Found %d pending TRADE_REQUEST tickets", len(pending))
@@ -1102,11 +1207,16 @@ def main() -> None:
             return
 
         for ticket in pending:
+            ticket_id = str(ticket.get("ticket_id", "unknown"))
+            if not claim_ticket(conn, ticket_id, WORKER_ID):
+                logger.info("Ticket %s: not claimed (already owned by another worker) — skipping", ticket_id)
+                continue
             try:
                 process_ticket(conn, ticket, directives)
+                release_ticket_claim(conn, ticket_id, status="done")
             except Exception as exc:
-                ticket_id = str(ticket.get("ticket_id", "unknown"))
                 logger.error("Unhandled error on ticket %s: %s", ticket_id, exc)
+                release_ticket_claim(conn, ticket_id, status="failed")
                 try:
                     log_system_event(conn, "ERROR", "execution_engine",
                                      f"Unhandled error on ticket {ticket_id}: {exc}",

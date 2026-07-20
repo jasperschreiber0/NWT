@@ -760,3 +760,176 @@ def insert_decision(
             (ticket_id, decision, reasoning, decided_by, sizing_multiplier),
         )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Ticket claims — atomic single-owner claim + lease, protects the window
+# between "ticket selected" and "decision written" (see
+# db/migrate_2026_07_execution_safety.sql for the schema and why this
+# exists: crontab.txt has no overlap guard on the 5-minute agents, and their
+# ticket-selection queries only mark a ticket handled AFTER slow external
+# Alpaca calls complete — a real TOCTOU window for duplicate order placement).
+# ---------------------------------------------------------------------------
+
+TICKET_CLAIM_LEASE_SECONDS = 180  # generous vs POLL_MAX*POLL_INTERVAL=30s per order
+
+
+def claim_ticket(conn, ticket_id: str, worker_id: str,
+                  lease_seconds: int = TICKET_CLAIM_LEASE_SECONDS) -> bool:
+    """
+    Atomically claim a ticket for exclusive processing.
+
+    Returns True  -> this call now owns the claim; caller may process the
+                      ticket and must call release_ticket_claim() when done.
+    Returns False -> the ticket is not claimable right now: another live
+                      (non-expired, in_progress) claim already holds it, or
+                      it was already completed (status='done' is permanent —
+                      a finished ticket can never be reclaimed, even after
+                      its lease would otherwise look expired).
+
+    Race-safe under concurrent callers: Postgres takes a row lock on the
+    conflicting unique key during INSERT ... ON CONFLICT, so concurrent
+    claim_ticket() calls for the same ticket_id serialize. The second caller's
+    UPDATE branch is evaluated against the first caller's already-committed
+    row, and the WHERE guard below only allows the update through if that row
+    is 'failed' (retryable) or an expired 'in_progress' lease — so at most
+    one caller's RETURNING produces a row, and 'done' is a true dead end.
+
+    A worker that crashes mid-processing leaves status='in_progress' with a
+    lease that eventually expires; the WHERE guard's
+    "lease_expires_at < NOW()" branch lets a later run reclaim it rather than
+    the ticket being stuck forever.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_ticket_claims (ticket_id, claimed_by, lease_expires_at, status, updated_at)
+            VALUES (%s, %s, NOW() + (%s * INTERVAL '1 second'), 'in_progress', NOW())
+            ON CONFLICT (ticket_id) DO UPDATE
+              SET claimed_by = EXCLUDED.claimed_by,
+                  claimed_at = NOW(),
+                  lease_expires_at = EXCLUDED.lease_expires_at,
+                  status = 'in_progress',
+                  updated_at = NOW()
+              WHERE nwt_ticket_claims.status = 'failed'
+                 OR (nwt_ticket_claims.status = 'in_progress'
+                     AND nwt_ticket_claims.lease_expires_at < NOW())
+            RETURNING ticket_id
+            """,
+            (ticket_id, worker_id, lease_seconds),
+        )
+        got_it = cur.fetchone() is not None
+    conn.commit()
+    return got_it
+
+
+def release_ticket_claim(conn, ticket_id: str, status: str = "done") -> None:
+    """Release a claim after processing completes (status='done') or a
+    handled failure (status='failed') so the row stops holding the lease."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE nwt_ticket_claims SET status = %s, updated_at = NOW() WHERE ticket_id = %s",
+            (status, ticket_id),
+        )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Force-close lifecycle — explicit terminal states, bounded exponential
+# backoff. Replaces the old cooldown-only retry in risk_agent.py's Rule 12,
+# which had no way to ever stop retrying a position that can never close
+# (e.g. an expired option) or one that has failed indefinitely.
+# ---------------------------------------------------------------------------
+
+# 1m, 5m, 15m, 1h, 6h, 24h — matches db/migrate_2026_07_execution_safety.sql's
+# design note. After this many failed attempts, escalate to
+# FAILED_REQUIRES_HUMAN and stop generating new FORCE_CLOSE tickets.
+FORCE_CLOSE_BACKOFF_MINUTES = [1, 5, 15, 60, 360, 1440]
+FORCE_CLOSE_MAX_ATTEMPTS = len(FORCE_CLOSE_BACKOFF_MINUTES)
+FORCE_CLOSE_ATTEMPTING_COOLDOWN_MINUTES = 15  # room for an in-flight attempt to resolve
+
+
+def get_force_close_state(conn, position_id: str) -> dict | None:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM nwt_force_close_state WHERE position_id = %s", (position_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def schedule_force_close_attempt(conn, position_id: str, asset: str) -> bool:
+    """
+    Single atomic decision: should a new FORCE_CLOSE ticket be created for
+    this position right now? If yes, this call also records the attempt
+    (state=ATTEMPTING, attempt_count+1, last_attempt_at=NOW()) in the same
+    statement — there is no separate read-then-write step, so two
+    overlapping risk_agent.py runs (crontab has no flock) cannot both decide
+    to retry the same position in the same window.
+
+    Returns True  -> caller should create a FORCE_CLOSE ticket now.
+    Returns False -> caller must NOT create a ticket: the position is
+                      already terminal (SUCCESS/FAILED_TERMINAL/
+                      FAILED_REQUIRES_HUMAN), still inside its backoff
+                      cooldown, or a prior attempt may still be in flight.
+                      If this call is what pushes attempt_count past
+                      FORCE_CLOSE_MAX_ATTEMPTS, it also flips the state to
+                      FAILED_REQUIRES_HUMAN and logs CRITICAL once — the
+                      caller still gets False and must not create a ticket.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_force_close_state
+              (position_id, asset, state, attempt_count, last_attempt_at, updated_at)
+            VALUES (%(position_id)s, %(asset)s, 'ATTEMPTING', 1, NOW(), NOW())
+            ON CONFLICT (position_id) DO UPDATE SET
+              state = CASE
+                WHEN nwt_force_close_state.attempt_count + 1 > %(max_attempts)s
+                  THEN 'FAILED_REQUIRES_HUMAN'
+                ELSE 'ATTEMPTING'
+              END,
+              attempt_count = nwt_force_close_state.attempt_count + 1,
+              last_attempt_at = NOW(),
+              escalated_at = CASE
+                WHEN nwt_force_close_state.attempt_count + 1 > %(max_attempts)s THEN NOW()
+                ELSE nwt_force_close_state.escalated_at
+              END,
+              updated_at = NOW()
+            WHERE
+              nwt_force_close_state.state NOT IN ('SUCCESS', 'FAILED_TERMINAL', 'FAILED_REQUIRES_HUMAN')
+              AND (
+                nwt_force_close_state.state != 'FAILED_RETRYABLE'
+                OR nwt_force_close_state.next_retry_at IS NULL
+                OR nwt_force_close_state.next_retry_at <= NOW()
+              )
+              AND (
+                nwt_force_close_state.state != 'ATTEMPTING'
+                OR nwt_force_close_state.last_attempt_at IS NULL
+                OR nwt_force_close_state.last_attempt_at
+                   <= NOW() - (%(attempting_cooldown)s * INTERVAL '1 minute')
+              )
+            RETURNING state, attempt_count
+            """,
+            {
+                "position_id": position_id,
+                "asset": asset,
+                "max_attempts": FORCE_CLOSE_MAX_ATTEMPTS,
+                "attempting_cooldown": FORCE_CLOSE_ATTEMPTING_COOLDOWN_MINUTES,
+            },
+        )
+        row = cur.fetchone()
+    conn.commit()
+
+    if row is None:
+        return False  # terminal, in cooldown, or a prior attempt still in flight
+
+    if row["state"] == "FAILED_REQUIRES_HUMAN":
+        log_system_event(
+            conn, "CRITICAL", "risk_agent",
+            f"FORCE_CLOSE exhausted {FORCE_CLOSE_MAX_ATTEMPTS} attempts for {asset} "
+            f"(position_id={position_id}) — escalated to FAILED_REQUIRES_HUMAN, "
+            f"no further automatic retries. Needs manual intervention.",
+            {"position_id": position_id, "asset": asset, "attempt_count": row["attempt_count"]},
+        )
+        return False
+
+    return True  # state == 'ATTEMPTING' — caller should create the ticket

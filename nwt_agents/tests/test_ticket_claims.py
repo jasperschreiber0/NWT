@@ -1,0 +1,173 @@
+"""
+nwt_agents/tests/test_ticket_claims.py
+Regression tests for the order-execution race condition confirmed by tracing
+execution_agent.py and execution/engine.py: crontab.txt runs both every 5
+minutes with no overlap guard, and both select unclaimed work with
+"SELECT ... WHERE NOT EXISTS (a decision yet)", only marking a ticket handled
+AFTER slow external Alpaca calls complete. Two overlapping cron runs could
+both select the same ticket and both place a real duplicate broker order.
+
+claim_ticket()/release_ticket_claim() (shared_context.py) close that window
+with an atomic INSERT ... ON CONFLICT DO UPDATE ... WHERE guard against
+nwt_ticket_claims. These tests prove, against real Postgres (not a mock),
+that the guard actually serializes concurrent callers correctly.
+
+Run against a throwaway Postgres (NWT_TEST_DB_DSN), never production:
+    NWT_TEST_DB_DSN=postgresql://nwt_test:nwt_test_pw@localhost/nwt_claims_test \
+        pytest nwt_agents/tests/test_ticket_claims.py -v
+"""
+import sys
+import threading
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from shared_context import claim_ticket, release_ticket_claim  # noqa: E402
+
+
+def _insert_ticket(conn, ticket_type="TRADE_REQUEST"):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO nwt_tickets (from_agent, to_agent, type, payload) "
+            "VALUES ('TEST', 'EXECUTION_ENGINE', %s, '{}') RETURNING ticket_id",
+            (ticket_type,),
+        )
+        ticket_id = str(cur.fetchone()[0])
+    conn.commit()
+    return ticket_id
+
+
+# ---------------------------------------------------------------------------
+# Sequential correctness
+# ---------------------------------------------------------------------------
+
+def test_first_caller_claims_successfully(conn):
+    ticket_id = _insert_ticket(conn)
+
+    got_it = claim_ticket(conn, ticket_id, worker_id="worker-a")
+
+    assert got_it is True
+    with conn.cursor() as cur:
+        cur.execute("SELECT claimed_by, status FROM nwt_ticket_claims WHERE ticket_id = %s", (ticket_id,))
+        claimed_by, status = cur.fetchone()
+    assert claimed_by == "worker-a"
+    assert status == "in_progress"
+
+
+def test_second_caller_cannot_claim_a_live_claim(conn, conn2):
+    """
+    The exact scenario from the audit: two processes (here, two independent
+    DB connections, simulating two overlapping cron-launched workers) both
+    try to claim the same not-yet-processed ticket. Only one may succeed —
+    this is what stops a duplicate broker order from ever being placed.
+    """
+    ticket_id = _insert_ticket(conn)
+
+    first = claim_ticket(conn, ticket_id, worker_id="worker-a")
+    second = claim_ticket(conn2, ticket_id, worker_id="worker-b")
+
+    assert first is True
+    assert second is False  # worker-b must never process this ticket
+
+
+def test_release_then_reclaim_by_a_different_worker(conn):
+    """After a worker finishes and releases (status='done'), the ticket must
+    NOT be reclaimable — completion is permanent, unlike a stale lease."""
+    ticket_id = _insert_ticket(conn)
+
+    claim_ticket(conn, ticket_id, worker_id="worker-a")
+    release_ticket_claim(conn, ticket_id, status="done")
+
+    reclaimed = claim_ticket(conn, ticket_id, worker_id="worker-b")
+
+    assert reclaimed is False
+
+
+def test_failed_release_allows_retry_by_another_worker(conn):
+    """A worker that hits an exception releases status='failed' — a later
+    run (this cron cycle or the next) must be able to retry the ticket."""
+    ticket_id = _insert_ticket(conn)
+
+    claim_ticket(conn, ticket_id, worker_id="worker-a")
+    release_ticket_claim(conn, ticket_id, status="failed")
+
+    retried = claim_ticket(conn, ticket_id, worker_id="worker-b")
+
+    assert retried is True
+
+
+def test_stale_lease_is_reclaimable_after_a_crash(conn):
+    """
+    A worker that crashes mid-processing (no release call ever happens)
+    leaves status='in_progress' forever unless the lease has an expiry.
+    Simulate a crash by inserting a claim whose lease already expired, then
+    confirm a fresh worker can take over instead of the ticket being stuck.
+    """
+    ticket_id = _insert_ticket(conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_ticket_claims (ticket_id, claimed_by, lease_expires_at, status)
+            VALUES (%s, 'crashed-worker', NOW() - INTERVAL '1 minute', 'in_progress')
+            """,
+            (ticket_id,),
+        )
+    conn.commit()
+
+    recovered = claim_ticket(conn, ticket_id, worker_id="worker-b")
+
+    assert recovered is True
+    with conn.cursor() as cur:
+        cur.execute("SELECT claimed_by FROM nwt_ticket_claims WHERE ticket_id = %s", (ticket_id,))
+        (claimed_by,) = cur.fetchone()
+    assert claimed_by == "worker-b"
+
+
+def test_live_lease_is_not_reclaimable_before_expiry(conn):
+    """The mirror case of the stale-lease test — a claim that is still
+    within its lease window must not be stealable by a second worker."""
+    ticket_id = _insert_ticket(conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_ticket_claims (ticket_id, claimed_by, lease_expires_at, status)
+            VALUES (%s, 'still-working', NOW() + INTERVAL '5 minutes', 'in_progress')
+            """,
+            (ticket_id,),
+        )
+    conn.commit()
+
+    stolen = claim_ticket(conn, ticket_id, worker_id="worker-b")
+
+    assert stolen is False
+
+
+# ---------------------------------------------------------------------------
+# True concurrency — two real threads, two real connections, racing on the
+# exact same INSERT at (as close as the test harness can get to) the same
+# instant. This is the strongest evidence available that the atomicity
+# comes from Postgres's row lock, not from Python-level call ordering.
+# ---------------------------------------------------------------------------
+
+def test_concurrent_threads_racing_on_first_claim_only_one_wins(conn, conn2):
+    ticket_id = _insert_ticket(conn)
+
+    results = {}
+    barrier = threading.Barrier(2)
+
+    def _attempt(name, connection):
+        barrier.wait()  # release both threads as close to simultaneously as possible
+        results[name] = claim_ticket(connection, ticket_id, worker_id=name)
+
+    t1 = threading.Thread(target=_attempt, args=("worker-1", conn))
+    t2 = threading.Thread(target=_attempt, args=("worker-2", conn2))
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    winners = [w for w, got_it in results.items() if got_it]
+    assert len(winners) == 1, f"expected exactly one winner, got {results}"

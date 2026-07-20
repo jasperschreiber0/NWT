@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -26,6 +27,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from shared_context import (
     check_no_trade_mode,
+    claim_ticket,
     clean_alpaca_base_url,
     get_db,
     insert_decision,
@@ -34,6 +36,7 @@ from shared_context import (
     log_system_event,
     option_dte,
     pre_trade_veto,
+    release_ticket_claim,
 )
 
 logging.basicConfig(
@@ -52,6 +55,11 @@ ALPACA_HEADERS = {
 
 ACCOUNT_SIZE = 97_000.0
 ET_TZ = ZoneInfo("America/New_York")
+
+# Identifies this process as a claim owner (nwt_ticket_claims.claimed_by).
+# crontab.txt runs this every 5 minutes with no overlap guard, so two
+# invocations can legitimately be alive at once; each needs its own id.
+WORKER_ID = f"execution_agent:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +576,19 @@ def main() -> None:
 
         for ticket in approved_proposals:
             ticket_id = str(ticket["ticket_id"])
+
+            # Atomic claim before any slow external work (option chain
+            # resolution, quote fetches) — see
+            # db/migrate_2026_07_execution_safety.sql. crontab.txt has no
+            # overlap guard, so without this a second concurrent
+            # execution_agent.py run could select and submit this same
+            # approved proposal a second time, producing two TRADE_REQUEST
+            # tickets (and, downstream, two real broker orders) for one
+            # decision.
+            if not claim_ticket(conn, ticket_id, WORKER_ID):
+                logger.info("Ticket %s: not claimed (already owned by another worker) — skipping", ticket_id)
+                continue
+
             payload = ticket.get("payload") or {}
 
             symbol = payload.get("symbol", "")
@@ -611,6 +632,7 @@ def main() -> None:
                 insert_decision(conn, ticket_id, "VETOED", veto_reason, "NWT_EXECUTION_AGENT")
                 log_system_event(conn, "WARNING", "execution_agent", veto_reason, {"ticket_id": ticket_id})
                 failed_count += 1
+                release_ticket_claim(conn, ticket_id, status="done")
                 continue
 
             # Base execution payload; leg/contract fields filled in per branch below.
@@ -644,6 +666,7 @@ def main() -> None:
                     insert_decision(conn, ticket_id, "FAILED", reason, "NWT_EXECUTION_AGENT")
                     log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
                     failed_count += 1
+                    release_ticket_claim(conn, ticket_id, status="failed")
                     continue
                 execution_payload["legs"] = legs
                 execution_payload["qty"] = size_spread_qty(legs, sized_notional)
@@ -665,6 +688,7 @@ def main() -> None:
                     insert_decision(conn, ticket_id, "FAILED", reason, "NWT_EXECUTION_AGENT")
                     log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
                     failed_count += 1
+                    release_ticket_claim(conn, ticket_id, status="failed")
                     continue
 
                 option_symbol = contract["option_symbol"]
@@ -708,6 +732,7 @@ def main() -> None:
                     "NWT_EXECUTION_AGENT",
                 )
                 submitted_count += 1
+                release_ticket_claim(conn, ticket_id, status="done")
 
             except Exception as exc:
                 reason = f"Failed to submit execution ticket: {exc}"
@@ -715,6 +740,7 @@ def main() -> None:
                 insert_decision(conn, ticket_id, "FAILED", reason, "NWT_EXECUTION_AGENT")
                 log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
                 failed_count += 1
+                release_ticket_claim(conn, ticket_id, status="failed")
 
         log_system_event(
             conn,
