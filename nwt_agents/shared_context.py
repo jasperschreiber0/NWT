@@ -760,3 +760,309 @@ def insert_decision(
             (ticket_id, decision, reasoning, decided_by, sizing_multiplier),
         )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Ticket claims — atomic single-owner claim + lease, protects the window
+# between "ticket selected" and "decision written" (see
+# db/migrate_2026_07_execution_safety.sql for the schema and why this
+# exists: crontab.txt has no overlap guard on the 5-minute agents, and their
+# ticket-selection queries only mark a ticket handled AFTER slow external
+# Alpaca calls complete — a real TOCTOU window for duplicate order placement).
+# ---------------------------------------------------------------------------
+
+TICKET_CLAIM_LEASE_SECONDS = 300  # see execution/engine.py's POLL_MAX/POLL_INTERVAL note below
+# NOTE: 300s is a starting margin, not a substitute for renewal. engine.py's
+# poll_order_until_filled alone has a worst case of
+# POLL_MAX(10) x (POLL_INTERVAL(3s) + alpaca_get's 15s timeout) = 180s, and
+# execution_agent.py's spread-leg resolution (chain fetches + per-leg price
+# fetches) can run ~100-115s — close enough to a fixed lease that a
+# legitimate slow run could still have its lease expire mid-processing.
+# renew_ticket_claim() below is the real fix: call it right before entering
+# a known-slow stretch so that stretch gets a fresh full lease budget
+# regardless of how much of the original lease was already spent.
+
+
+def claim_ticket(conn, ticket_id: str, worker_id: str,
+                  lease_seconds: int = TICKET_CLAIM_LEASE_SECONDS) -> bool:
+    """
+    Atomically claim a ticket for exclusive processing.
+
+    Returns True  -> this call now owns the claim; caller may process the
+                      ticket and must call release_ticket_claim() when done.
+    Returns False -> the ticket is not claimable right now: another live
+                      (non-expired, in_progress) claim already holds it, or
+                      it was already completed (status='done' is permanent —
+                      a finished ticket can never be reclaimed, even after
+                      its lease would otherwise look expired).
+
+    Race-safe under concurrent callers: Postgres takes a row lock on the
+    conflicting unique key during INSERT ... ON CONFLICT, so concurrent
+    claim_ticket() calls for the same ticket_id serialize. The second caller's
+    UPDATE branch is evaluated against the first caller's already-committed
+    row, and the WHERE guard below only allows the update through if that row
+    is 'failed' (retryable) or an expired 'in_progress' lease — so at most
+    one caller's RETURNING produces a row, and 'done' is a true dead end.
+
+    A worker that crashes mid-processing leaves status='in_progress' with a
+    lease that eventually expires; the WHERE guard's
+    "lease_expires_at < NOW()" branch lets a later run reclaim it rather than
+    the ticket being stuck forever.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_ticket_claims (ticket_id, claimed_by, lease_expires_at, status, updated_at)
+            VALUES (%s, %s, NOW() + (%s * INTERVAL '1 second'), 'in_progress', NOW())
+            ON CONFLICT (ticket_id) DO UPDATE
+              SET claimed_by = EXCLUDED.claimed_by,
+                  claimed_at = NOW(),
+                  lease_expires_at = EXCLUDED.lease_expires_at,
+                  status = 'in_progress',
+                  updated_at = NOW()
+              WHERE nwt_ticket_claims.status = 'failed'
+                 OR (nwt_ticket_claims.status = 'in_progress'
+                     AND nwt_ticket_claims.lease_expires_at < NOW())
+            RETURNING ticket_id
+            """,
+            (ticket_id, worker_id, lease_seconds),
+        )
+        got_it = cur.fetchone() is not None
+    conn.commit()
+    return got_it
+
+
+def release_ticket_claim(conn, ticket_id: str, worker_id: str, status: str = "done") -> bool:
+    """
+    Release a claim after processing completes (status='done') or a handled
+    failure (status='failed').
+
+    worker_id is required and enforced via WHERE claimed_by = %s — without
+    this guard, a worker that no longer owns the claim (e.g. its lease
+    expired and a second worker already reclaimed it) could still call
+    release and clobber that second worker's live claim: setting
+    status='failed' on someone else's active, in-progress claim would make
+    it immediately reclaimable by a THIRD worker regardless of the second
+    worker's lease_expires_at, defeating the mutual-exclusion guarantee
+    entirely. Returns True only if this worker's own claim was the one
+    actually updated; False means the caller no longer owned it and must
+    not assume its release had any effect.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE nwt_ticket_claims SET status = %s, updated_at = NOW() "
+            "WHERE ticket_id = %s AND claimed_by = %s",
+            (status, ticket_id, worker_id),
+        )
+        released = cur.rowcount > 0
+    conn.commit()
+    return released
+
+
+def renew_ticket_claim(conn, ticket_id: str, worker_id: str,
+                        lease_seconds: int = TICKET_CLAIM_LEASE_SECONDS) -> bool:
+    """
+    Extend the lease on a claim this worker still holds — call this right
+    before a known-slow stretch of work (an external poll loop, multiple
+    sequential API calls) so that stretch gets a fresh full lease budget
+    instead of relying on the original claim-time lease being large enough
+    to cover it. Only extends a claim this exact worker_id still owns with
+    status='in_progress' — a worker that already lost its claim (lease
+    already expired and reclaimed by someone else) gets False back and must
+    not continue processing, since it is no longer the exclusive owner.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE nwt_ticket_claims
+            SET lease_expires_at = NOW() + (%s * INTERVAL '1 second'), updated_at = NOW()
+            WHERE ticket_id = %s AND claimed_by = %s AND status = 'in_progress'
+            """,
+            (lease_seconds, ticket_id, worker_id),
+        )
+        renewed = cur.rowcount > 0
+    conn.commit()
+    return renewed
+
+
+# ---------------------------------------------------------------------------
+# Force-close lifecycle — explicit terminal states, bounded exponential
+# backoff. Replaces the old cooldown-only retry in risk_agent.py's Rule 12,
+# which had no way to ever stop retrying a position that can never close
+# (e.g. an expired option) or one that has failed indefinitely.
+# ---------------------------------------------------------------------------
+
+# 1m, 5m, 15m, 1h, 6h, 24h — matches db/migrate_2026_07_execution_safety.sql's
+# design note. After this many failed attempts, escalate to
+# FAILED_REQUIRES_HUMAN and stop generating new FORCE_CLOSE tickets.
+FORCE_CLOSE_BACKOFF_MINUTES = [1, 5, 15, 60, 360, 1440]
+FORCE_CLOSE_MAX_ATTEMPTS = len(FORCE_CLOSE_BACKOFF_MINUTES)
+FORCE_CLOSE_ATTEMPTING_COOLDOWN_MINUTES = 15  # room for an in-flight attempt to resolve
+
+
+def get_force_close_state(conn, position_id: str) -> dict | None:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM nwt_force_close_state WHERE position_id = %s", (position_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def has_pending_close_ticket(conn, position_id: str) -> bool:
+    """
+    True if a CLOSE_REQUEST ticket for this position already exists in
+    nwt_tickets with no EXECUTION_ENGINE decision yet.
+
+    Replaces the old time-window dedup (execution_agent.py's
+    _has_pending_close(), a flat 2-hour created_at lookback) with the same
+    state-based approach already used for FORCE_CLOSE
+    (has_pending_force_close_ticket): a ticket is "pending" exactly as long
+    as it has no terminal decision, however long that takes, not for a
+    fixed window that can expire while the ticket is still legitimately
+    unprocessed (e.g. execution/engine.py is backed up or briefly down).
+    Every decision this codebase ever writes (EXECUTED, FAILED, REJECTED,
+    SKIPPED, EXECUTED_DUPLICATE) represents a resolved outcome, so "any
+    EXECUTION_ENGINE decision exists" is the correct terminal check — there
+    is no separate CANCELLED status in this system to check for.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM nwt_tickets t
+              WHERE t.type = 'CLOSE_REQUEST'
+                AND t.payload->>'position_id' = %s
+                AND NOT EXISTS (
+                  SELECT 1 FROM nwt_ticket_decisions d
+                  WHERE d.ticket_id = t.ticket_id AND d.decided_by = 'EXECUTION_ENGINE'
+                )
+            )
+            """,
+            (position_id,),
+        )
+        (exists,) = cur.fetchone()
+    return bool(exists)
+
+
+def has_pending_force_close_ticket(conn, position_id: str) -> bool:
+    """
+    True if a FORCE_CLOSE ticket for this position already exists in
+    nwt_tickets with no EXECUTION_ENGINE decision yet — i.e. it is still
+    waiting to be claimed/processed by execution/engine.py.
+
+    This is checked ahead of (and independent from) the time-based
+    ATTEMPTING cooldown in schedule_force_close_attempt below. The cooldown
+    alone is a crash-recovery heuristic — after
+    FORCE_CLOSE_ATTEMPTING_COOLDOWN_MINUTES it assumes the prior attempt is
+    abandoned and allows a retry. But "abandoned" and "still queued, just
+    slow to get picked up" look identical from a pure clock read: if
+    engine.py falls behind or is briefly down for longer than the cooldown,
+    the first ticket is still perfectly valid and outstanding, yet the
+    cooldown alone would let a second ticket be created for the same
+    position. claim_ticket() only guarantees one WORKER per ticket_id — it
+    does nothing to stop two DIFFERENT tickets for the same position from
+    both existing and both eventually being processed. Checking for an
+    actual outstanding ticket first closes that gap at the source, instead
+    of relying only on close_position()'s idempotent WHERE status='open'
+    guard to contain the consequences after the fact.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM nwt_tickets t
+              WHERE t.type = 'FORCE_CLOSE'
+                AND t.payload->>'position_id' = %s
+                AND NOT EXISTS (
+                  SELECT 1 FROM nwt_ticket_decisions d
+                  WHERE d.ticket_id = t.ticket_id AND d.decided_by = 'EXECUTION_ENGINE'
+                )
+            )
+            """,
+            (position_id,),
+        )
+        (exists,) = cur.fetchone()
+    return bool(exists)
+
+
+def schedule_force_close_attempt(conn, position_id: str, asset: str) -> bool:
+    """
+    Single atomic decision: should a new FORCE_CLOSE ticket be created for
+    this position right now? If yes, this call also records the attempt
+    (state=ATTEMPTING, attempt_count+1, last_attempt_at=NOW()) in the same
+    statement — there is no separate read-then-write step, so two
+    overlapping risk_agent.py runs (crontab has no flock) cannot both decide
+    to retry the same position in the same window.
+
+    Returns True  -> caller should create a FORCE_CLOSE ticket now.
+    Returns False -> caller must NOT create a ticket: a FORCE_CLOSE ticket
+                      for this position is already outstanding
+                      (has_pending_force_close_ticket), the position is
+                      already terminal (SUCCESS/FAILED_TERMINAL/
+                      FAILED_REQUIRES_HUMAN), still inside its backoff
+                      cooldown, or a prior attempt may still be in flight.
+                      If this call is what pushes attempt_count past
+                      FORCE_CLOSE_MAX_ATTEMPTS, it also flips the state to
+                      FAILED_REQUIRES_HUMAN and logs CRITICAL once — the
+                      caller still gets False and must not create a ticket.
+    """
+    if has_pending_force_close_ticket(conn, position_id):
+        return False
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_force_close_state
+              (position_id, asset, state, attempt_count, last_attempt_at, updated_at)
+            VALUES (%(position_id)s, %(asset)s, 'ATTEMPTING', 1, NOW(), NOW())
+            ON CONFLICT (position_id) DO UPDATE SET
+              state = CASE
+                WHEN nwt_force_close_state.attempt_count + 1 > %(max_attempts)s
+                  THEN 'FAILED_REQUIRES_HUMAN'
+                ELSE 'ATTEMPTING'
+              END,
+              attempt_count = nwt_force_close_state.attempt_count + 1,
+              last_attempt_at = NOW(),
+              escalated_at = CASE
+                WHEN nwt_force_close_state.attempt_count + 1 > %(max_attempts)s THEN NOW()
+                ELSE nwt_force_close_state.escalated_at
+              END,
+              updated_at = NOW()
+            WHERE
+              nwt_force_close_state.state NOT IN ('SUCCESS', 'FAILED_TERMINAL', 'FAILED_REQUIRES_HUMAN')
+              AND (
+                nwt_force_close_state.state != 'FAILED_RETRYABLE'
+                OR nwt_force_close_state.next_retry_at IS NULL
+                OR nwt_force_close_state.next_retry_at <= NOW()
+              )
+              AND (
+                nwt_force_close_state.state != 'ATTEMPTING'
+                OR nwt_force_close_state.last_attempt_at IS NULL
+                OR nwt_force_close_state.last_attempt_at
+                   <= NOW() - (%(attempting_cooldown)s * INTERVAL '1 minute')
+              )
+            RETURNING state, attempt_count
+            """,
+            {
+                "position_id": position_id,
+                "asset": asset,
+                "max_attempts": FORCE_CLOSE_MAX_ATTEMPTS,
+                "attempting_cooldown": FORCE_CLOSE_ATTEMPTING_COOLDOWN_MINUTES,
+            },
+        )
+        row = cur.fetchone()
+    conn.commit()
+
+    if row is None:
+        return False  # terminal, in cooldown, or a prior attempt still in flight
+
+    if row["state"] == "FAILED_REQUIRES_HUMAN":
+        log_system_event(
+            conn, "CRITICAL", "risk_agent",
+            f"FORCE_CLOSE exhausted {FORCE_CLOSE_MAX_ATTEMPTS} attempts for {asset} "
+            f"(position_id={position_id}) — escalated to FAILED_REQUIRES_HUMAN, "
+            f"no further automatic retries. Needs manual intervention.",
+            {"position_id": position_id, "asset": asset, "attempt_count": row["attempt_count"]},
+        )
+        return False
+
+    return True  # state == 'ATTEMPTING' — caller should create the ticket

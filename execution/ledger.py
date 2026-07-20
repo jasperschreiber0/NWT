@@ -84,11 +84,27 @@ def close_position(
     exit_reason: str = "unknown",
     exit_bid: Optional[float] = None,
     exit_ask: Optional[float] = None,
-) -> None:
+) -> bool:
     """
     UPDATE nwt_portfolio_ledger: set status='closed', exit_price, exit_time,
     realized_slippage, exit_reason, and exit NBBO (feeds the pnl_adjusted haircut).
     exit_reason: target | stop | hard_close | max_hold | kill_switch | manual
+
+    WHERE status = 'open' makes this idempotent: if two FORCE_CLOSE tickets
+    for the same position both reach this call (possible if a second ticket
+    got created for a position whose first ticket was still queued — see
+    risk_agent.py's schedule_force_close_attempt / has_pending_force_close_ticket
+    for the primary fix), only the first one to actually run this UPDATE
+    changes anything. Without this guard a second, later close (e.g. via
+    the 404-already-closed fallback path, which can use a 0.0 price when no
+    quote is available) could silently overwrite a correct exit_price with
+    a wrong one.
+
+    Returns True if this call actually closed the position (a row matched
+    WHERE status='open'), False if it was already closed by someone else —
+    callers that need to know whether THEY caused the close (e.g. to decide
+    whether to write a trade outcome) must check this, not just the absence
+    of an exception.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -101,15 +117,22 @@ def close_position(
                 exit_reason = %s,
                 exit_bid = %s,
                 exit_ask = %s
-            WHERE position_id = %s
+            WHERE position_id = %s AND status = 'open'
             """,
             (exit_price, datetime.now(timezone.utc), slippage, exit_reason, exit_bid, exit_ask, position_id),
         )
-        if cur.rowcount == 0:
-            logger.warning("close_position: no rows updated for position_id=%s", position_id)
+        actually_closed = cur.rowcount > 0
+        if not actually_closed:
+            logger.warning(
+                "close_position: position_id=%s was not 'open' (already closed by another "
+                "attempt, or does not exist) — no-op, not overwriting the existing exit data",
+                position_id,
+            )
     conn.commit()
-    logger.info("Closed position %s at %.4f slippage=%.4f reason=%s",
-                position_id, exit_price, slippage, exit_reason)
+    if actually_closed:
+        logger.info("Closed position %s at %.4f slippage=%.4f reason=%s",
+                    position_id, exit_price, slippage, exit_reason)
+    return actually_closed
 
 
 def get_open_positions(conn, bot_source: Optional[str] = None) -> list:
@@ -149,3 +172,306 @@ def log_system_event(
             (level, component, message, json.dumps(payload) if payload is not None else None),
         )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Ticket claims — same atomic claim/lease mechanism as
+# nwt_agents/shared_context.py (duplicated here, not imported, since
+# execution/ is deployed separately from nwt_agents/ — same pattern already
+# used for log_system_event above). See
+# db/migrate_2026_07_execution_safety.sql for the schema and rationale.
+# ---------------------------------------------------------------------------
+
+TICKET_CLAIM_LEASE_SECONDS = 300  # must match shared_context.py — see its own note:
+# 300s is a starting margin, not a substitute for renewal. poll_order_until_filled
+# in engine.py alone has a worst case of POLL_MAX(10) x (POLL_INTERVAL(3s) +
+# alpaca_get's 15s timeout) = 180s — renew_ticket_claim() below is called right
+# before that poll starts so it always gets a fresh full budget.
+
+
+def claim_ticket(conn, ticket_id: str, worker_id: str,
+                  lease_seconds: int = TICKET_CLAIM_LEASE_SECONDS) -> bool:
+    """
+    Atomically claim a ticket for exclusive processing. Returns True iff this
+    call now owns the claim. See shared_context.claim_ticket for the full
+    race-safety explanation — identical mechanism, same table.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_ticket_claims (ticket_id, claimed_by, lease_expires_at, status, updated_at)
+            VALUES (%s, %s, NOW() + (%s * INTERVAL '1 second'), 'in_progress', NOW())
+            ON CONFLICT (ticket_id) DO UPDATE
+              SET claimed_by = EXCLUDED.claimed_by,
+                  claimed_at = NOW(),
+                  lease_expires_at = EXCLUDED.lease_expires_at,
+                  status = 'in_progress',
+                  updated_at = NOW()
+              WHERE nwt_ticket_claims.status = 'failed'
+                 OR (nwt_ticket_claims.status = 'in_progress'
+                     AND nwt_ticket_claims.lease_expires_at < NOW())
+            RETURNING ticket_id
+            """,
+            (ticket_id, worker_id, lease_seconds),
+        )
+        got_it = cur.fetchone() is not None
+    conn.commit()
+    return got_it
+
+
+def release_ticket_claim(conn, ticket_id: str, worker_id: str, status: str = "done") -> bool:
+    """
+    worker_id is required and enforced via WHERE claimed_by = %s. See
+    shared_context.release_ticket_claim for the full rationale — without
+    this guard, a worker that no longer owns the claim could clobber a
+    different worker's live claim out from under it. Returns True only if
+    this worker's own claim was the one actually updated.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE nwt_ticket_claims SET status = %s, updated_at = NOW() "
+            "WHERE ticket_id = %s AND claimed_by = %s",
+            (status, ticket_id, worker_id),
+        )
+        released = cur.rowcount > 0
+    conn.commit()
+    return released
+
+
+def renew_ticket_claim(conn, ticket_id: str, worker_id: str,
+                        lease_seconds: int = TICKET_CLAIM_LEASE_SECONDS) -> bool:
+    """
+    Extend the lease on a claim this worker still holds. See
+    shared_context.renew_ticket_claim for the full rationale — identical
+    mechanism, same table. Only renews a claim this exact worker_id still
+    owns with status='in_progress'; returns False (and the caller must stop)
+    if the claim was already lost to lease expiry and reclaimed elsewhere.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE nwt_ticket_claims
+            SET lease_expires_at = NOW() + (%s * INTERVAL '1 second'), updated_at = NOW()
+            WHERE ticket_id = %s AND claimed_by = %s AND status = 'in_progress'
+            """,
+            (lease_seconds, ticket_id, worker_id),
+        )
+        renewed = cur.rowcount > 0
+    conn.commit()
+    return renewed
+
+
+# ---------------------------------------------------------------------------
+# Force-close outcome recording — the execution side of the state machine
+# whose scheduling half (schedule_force_close_attempt) lives in
+# nwt_agents/shared_context.py and is called by risk_agent.py. This records
+# what actually happened to an attempt risk_agent already scheduled;
+# attempt_count / next_retry_at bookkeeping stays owned by the scheduler,
+# this function only classifies and stores the outcome of one attempt.
+# ---------------------------------------------------------------------------
+
+FORCE_CLOSE_BACKOFF_MINUTES = [1, 5, 15, 60, 360, 1440]  # must match shared_context.py
+
+
+def get_force_close_state(conn, position_id: str) -> Optional[dict]:
+    """Duplicated from nwt_agents/shared_context.py's twin function."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM nwt_force_close_state WHERE position_id = %s", (position_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def record_force_close_outcome(conn, position_id: str, success: bool,
+                                error: Optional[str] = None,
+                                terminal: bool = False,
+                                terminal_reason: Optional[str] = None) -> None:
+    """
+    Record the outcome of one FORCE_CLOSE attempt against nwt_force_close_state.
+
+    success=True             -> state=SUCCESS. No further retries — the
+                                 position is closed.
+    terminal=True (implies failure) -> state=FAILED_TERMINAL. The broker has
+                                 told us this can never succeed (position
+                                 already gone, contract expired). No further
+                                 retries; a human doesn't need to act, this
+                                 is an expected end state.
+    otherwise (retryable failure)   -> state=FAILED_RETRYABLE, and
+                                 next_retry_at is set using the backoff
+                                 schedule at whatever attempt_count the
+                                 scheduler already stamped on this row.
+    """
+    if success:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nwt_force_close_state
+                SET state = 'SUCCESS', last_error = NULL, updated_at = NOW()
+                WHERE position_id = %s
+                """,
+                (position_id,),
+            )
+        conn.commit()
+        return
+
+    if terminal:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nwt_force_close_state
+                SET state = 'FAILED_TERMINAL', last_error = %s, terminal_reason = %s, updated_at = NOW()
+                WHERE position_id = %s
+                """,
+                (error, terminal_reason, position_id),
+            )
+        conn.commit()
+        return
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT attempt_count FROM nwt_force_close_state WHERE position_id = %s",
+            (position_id,),
+        )
+        row = cur.fetchone()
+    attempt_count = row["attempt_count"] if row else 1
+    backoff_minutes = FORCE_CLOSE_BACKOFF_MINUTES[
+        min(attempt_count - 1, len(FORCE_CLOSE_BACKOFF_MINUTES) - 1)
+    ]
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE nwt_force_close_state
+            SET state = 'FAILED_RETRYABLE',
+                last_error = %s,
+                next_retry_at = NOW() + (%s * INTERVAL '1 minute'),
+                updated_at = NOW()
+            WHERE position_id = %s
+            """,
+            (error, backoff_minutes, position_id),
+        )
+    conn.commit()
+
+
+def record_force_close_unknown(conn, position_id: str, asset: str, ticket_id: str,
+                                worker_id: Optional[str] = None,
+                                reason: str = "CLAIM_LOST_AFTER_BROKER_ACTION") -> None:
+    """
+    Record that a FORCE_CLOSE attempt's outcome is genuinely unknown: a
+    broker call (the liquidation DELETE) may have already happened, but
+    this worker lost its claim before it could record what happened.
+    Marking this FAILED would be wrong (the liquidation might have
+    succeeded — retrying could double-liquidate); marking it SUCCESS would
+    also be wrong (it might not have). UNKNOWN is a genuinely distinct
+    state that must be resolved by reconciliation
+    (engine.reconcile_unknown_force_close) against live broker state, not
+    guessed at here.
+
+    INSERT ... ON CONFLICT DO UPDATE rather than a plain UPDATE: in the
+    normal flow a row always already exists (schedule_force_close_attempt
+    creates it before any ticket does), but a plain UPDATE would silently
+    affect zero rows — and silently record nothing — in any scenario where
+    it doesn't (a ticket created some other way, a row deleted out from
+    under it). Recording UNKNOWN must never be a silent no-op.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_force_close_state
+              (position_id, asset, state, attempt_count, last_error, last_ticket_id,
+               last_worker_id, updated_at)
+            VALUES (%(position_id)s, %(asset)s, 'UNKNOWN', 1, %(reason)s, %(ticket_id)s,
+                    %(worker_id)s, NOW())
+            ON CONFLICT (position_id) DO UPDATE SET
+              state = 'UNKNOWN',
+              last_error = %(reason)s,
+              last_ticket_id = %(ticket_id)s,
+              last_worker_id = %(worker_id)s,
+              updated_at = NOW()
+            """,
+            {"position_id": position_id, "asset": asset, "reason": reason,
+             "ticket_id": ticket_id, "worker_id": worker_id},
+        )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# CLOSE_REQUEST dedup — same mechanism as
+# nwt_agents/shared_context.has_pending_close_ticket (duplicated here, not
+# imported, same pattern as everything else in this file). Used by
+# run_equity_position_monitor() in engine.py before creating a new
+# CLOSE_REQUEST for a position — replaces relying on a fixed time window.
+# ---------------------------------------------------------------------------
+
+def record_client_order_id(conn, ticket_id: str, client_order_id: str) -> None:
+    """
+    Persist the client_order_id sent to Alpaca for this ticket, for
+    auditability — called at the moment order submission begins (right
+    after computing it, before the broker call), not after the outcome is
+    known. ON CONFLICT DO NOTHING: client_order_id_for() is deterministic,
+    so a crash-and-retry recomputes and re-records the identical value —
+    this must be idempotent, not raise on the second attempt.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_order_submissions (ticket_id, client_order_id)
+            VALUES (%s, %s)
+            ON CONFLICT (ticket_id) DO NOTHING
+            """,
+            (ticket_id, client_order_id),
+        )
+    conn.commit()
+
+
+def get_client_order_id(conn, ticket_id: str) -> Optional[str]:
+    """Retrieve the client_order_id previously recorded for a ticket, or
+    None if none was ever recorded (e.g. the ticket never reached order
+    submission — REJECTED/VETOED before that point)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT client_order_id FROM nwt_order_submissions WHERE ticket_id = %s", (ticket_id,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def insert_ticket(conn, from_agent: str, to_agent: str, type_: str, payload: dict) -> str:
+    """
+    INSERT into nwt_tickets. Returns ticket_id as string. Duplicated from
+    nwt_agents/shared_context.insert_ticket — same pattern as everything
+    else in this file. Needed now that run_equity_position_monitor()
+    creates CLOSE_REQUEST tickets instead of calling the broker directly.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_tickets (from_agent, to_agent, type, payload)
+            VALUES (%s, %s, %s, %s)
+            RETURNING ticket_id
+            """,
+            (from_agent, to_agent, type_, json.dumps(payload)),
+        )
+        ticket_id = cur.fetchone()[0]
+    conn.commit()
+    return str(ticket_id)
+
+
+def has_pending_close_ticket(conn, position_id: str) -> bool:
+    """True if a CLOSE_REQUEST ticket for this position exists with no
+    EXECUTION_ENGINE decision yet — see shared_context.py's twin function
+    for the full rationale."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM nwt_tickets t
+              WHERE t.type = 'CLOSE_REQUEST'
+                AND t.payload->>'position_id' = %s
+                AND NOT EXISTS (
+                  SELECT 1 FROM nwt_ticket_decisions d
+                  WHERE d.ticket_id = t.ticket_id AND d.decided_by = 'EXECUTION_ENGINE'
+                )
+            )
+            """,
+            (position_id,),
+        )
+        (exists,) = cur.fetchone()
+    return bool(exists)
