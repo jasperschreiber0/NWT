@@ -30,6 +30,8 @@ from shared_context import (
     claim_ticket,
     clean_alpaca_base_url,
     get_db,
+    has_pending_close_ticket,
+    has_pending_force_close_ticket,
     insert_decision,
     insert_ticket,
     load_master_directives,
@@ -363,17 +365,19 @@ def _position_qty(pos: dict) -> int:
 
 
 def _has_pending_close(conn, position_id: str) -> bool:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT COUNT(*) FROM nwt_tickets
-            WHERE type IN ('CLOSE_REQUEST', 'FORCE_CLOSE')
-              AND payload->>'position_id' = %s
-              AND created_at > NOW() - INTERVAL '2 hours'
-            """,
-            (position_id,),
-        )
-        return cur.fetchone()[0] > 0
+    """
+    State-based dedup — replaces the old fixed 2-hour created_at lookback,
+    which was not a true idempotency guarantee (a CLOSE_REQUEST that took
+    longer than 2 hours to reach engine.py, e.g. because it was backed up
+    or briefly down, would silently stop protecting the position and a
+    second ticket could be created for it). A ticket now counts as
+    "pending" for exactly as long as it has no terminal decision — see
+    has_pending_close_ticket/has_pending_force_close_ticket in
+    shared_context.py for the same mechanism already used for FORCE_CLOSE.
+    """
+    if has_pending_close_ticket(conn, position_id):
+        return True
+    return has_pending_force_close_ticket(conn, position_id)
 
 
 def _emit_close_request(conn, pos: dict, exit_reason: str) -> None:

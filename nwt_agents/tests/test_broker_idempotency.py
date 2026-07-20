@@ -375,42 +375,23 @@ def test_force_close_preflight_proceeds_when_position_still_open(conn, monkeypat
     assert len(delete_calls) == 1  # the real liquidation attempt still happens
 
 
-# ---------------------------------------------------------------------------
-# Equity monitor close (no ticket/claim on this path) — client_order_id
-# keyed by position_id is the only duplicate-order guard available here.
-# ---------------------------------------------------------------------------
-
-def test_close_equity_position_recovers_existing_order(conn, monkeypatch):
-    position_id = str(uuid.uuid4())
-    place_close_order_calls = []
-    monkeypatch.setattr(
-        engine, "find_order_by_client_order_id",
-        lambda coid: {"id": "existing-eq-order", "status": "accepted"},
-    )
-    monkeypatch.setattr(
-        engine, "place_close_order",
-        lambda *a, **k: place_close_order_calls.append(1) or {"id": "SHOULD_NOT_BE_CALLED"},
-    )
-    monkeypatch.setattr(
-        engine, "poll_order_until_filled",
-        lambda order_id: {"id": order_id, "status": "filled", "filled_avg_price": "101.0"},
-    )
-    pos = {"position_id": position_id, "asset": "AAPL"}
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO nwt_portfolio_ledger (position_id, bot_source, asset, asset_type, status) "
-            "VALUES (%s, 'US_BOT', 'AAPL', 'equity', 'open')",
-            (position_id,),
-        )
-    conn.commit()
-
-    engine._close_equity_position(conn, pos, current_price=100.0, position_id=position_id,
-                                  symbol="AAPL", notional=1000.0, entry_price=100.0, exit_reason="target")
-
-    assert place_close_order_calls == []
+# NOTE: the old direct-broker equity close path (_close_equity_position)
+# was removed by targeted remediation FIX 1 — equity exits now go through
+# the ticket pipeline (_emit_equity_close_request -> process_close_ticket),
+# same as options. See test_equity_close_pipeline.py for full coverage,
+# including test_no_direct_broker_close_function_remains_on_engine which
+# asserts _close_equity_position no longer exists.
 
 
-def test_process_force_close_raises_and_writes_no_decision_on_lost_claim(conn, monkeypatch):
+def test_process_force_close_raises_claim_lost_error_after_broker_action(conn, monkeypatch):
+    """
+    ClaimLostError must still propagate uncaught out of process_force_close
+    when renewal fails after the liquidation DELETE already succeeded.
+    (As of FIX 3, this path now ALSO writes an explicit UNKNOWN decision —
+    a deliberate exception to Path 1/2's "no decision" rule, since
+    FORCE_CLOSE has a reconciliation mechanism to resolve it later; see
+    test_force_close_unknown.py for the full state-machine coverage.)
+    """
     position_id = str(uuid.uuid4())
     with conn.cursor() as cur:
         cur.execute(
@@ -437,4 +418,91 @@ def test_process_force_close_raises_and_writes_no_decision_on_lost_claim(conn, m
     with conn.cursor() as cur:
         cur.execute("SELECT decision FROM nwt_ticket_decisions WHERE ticket_id = %s", (ticket_id,))
         decisions = cur.fetchall()
-    assert decisions == []
+    assert decisions == [("UNKNOWN",)]  # FIX 3 now writes this explicitly — see test_force_close_unknown.py
+
+
+# ---------------------------------------------------------------------------
+# FIX 4 — client_order_id persistence. Deterministic generation
+# (client_order_id_for) remains the source of truth; nwt_order_submissions
+# is a convenience audit index, written at the moment submission begins.
+# ---------------------------------------------------------------------------
+
+def test_process_ticket_persists_client_order_id_at_submission(conn, monkeypatch):
+    payload = {
+        "approved": True, "bot_source": "US_BOT", "symbol": "AAPL",
+        "direction": "long", "strategy_id": "US-ORB-001", "sized_notional": 1000,
+        "asset_type": "equity", "time_in_force": "day",
+    }
+    ticket_id = _insert_trade_request_ticket(conn, payload)
+    ticket = {"ticket_id": ticket_id, "payload": payload}
+
+    monkeypatch.setattr(engine, "synchronous_risk_veto", lambda conn, payload: (False, ""))
+    monkeypatch.setattr(engine, "check_directional_cap", lambda conn, direction, notional: (False, 0.0, 100000.0))
+    monkeypatch.setattr(engine, "get_latest_quote", lambda symbol, asset_type: (99.0, 101.0))
+    monkeypatch.setattr(engine, "get_current_price", lambda symbol: 100.0)
+    monkeypatch.setattr(engine, "find_order_by_client_order_id", lambda coid: None)
+    monkeypatch.setattr(engine, "place_equity_order", lambda payload, coid: {"id": "new-order-1"})
+    monkeypatch.setattr(engine, "renew_ticket_claim", lambda *a, **k: True)
+    monkeypatch.setattr(
+        engine, "poll_order_until_filled",
+        lambda order_id: {"id": order_id, "status": "filled", "filled_avg_price": "100.5", "filled_qty": "10"},
+    )
+
+    engine.process_ticket(conn, ticket, directives={"global_kill_switch": False})
+
+    persisted = engine.get_client_order_id(conn, ticket_id)
+    assert persisted == engine.client_order_id_for(ticket_id)
+
+
+def test_process_close_ticket_persists_client_order_id_at_submission(conn, monkeypatch):
+    position_id = str(uuid.uuid4())
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO nwt_portfolio_ledger (position_id, bot_source, asset, asset_type, direction, status) "
+            "VALUES (%s, 'NWT_TRACK_C', 'AAPL260101C00500000', 'option', 'long', 'open')",
+            (position_id,),
+        )
+    conn.commit()
+    payload = {"option_symbol": "AAPL260101C00500000", "position_id": position_id,
+               "exit_reason": "target", "asset_type": "option", "qty": 1, "direction": "long"}
+    ticket_id = _insert_trade_request_ticket(conn, payload)
+    ticket = {"ticket_id": ticket_id, "payload": payload}
+
+    monkeypatch.setattr(engine, "find_order_by_client_order_id", lambda coid: None)
+    monkeypatch.setattr(engine, "place_close_order", lambda *a, **k: {"id": "close-order-1"})
+    monkeypatch.setattr(engine, "renew_ticket_claim", lambda *a, **k: True)
+    monkeypatch.setattr(
+        engine, "poll_order_until_filled",
+        lambda order_id: {"id": order_id, "status": "filled", "filled_avg_price": "5.0"},
+    )
+
+    engine.process_close_ticket(conn, ticket)
+
+    persisted = engine.get_client_order_id(conn, ticket_id)
+    assert persisted == engine.client_order_id_for(ticket_id, prefix="nwt-close")
+
+
+def test_client_order_id_retrievable_and_survives_a_retry(conn):
+    """Persistence must be idempotent: recomputing and re-recording the
+    same deterministic value on a crash-and-retry must not raise."""
+    payload = {
+        "approved": True, "bot_source": "US_BOT", "symbol": "AAPL",
+        "direction": "long", "strategy_id": "US-ORB-001", "sized_notional": 1000,
+        "asset_type": "equity", "time_in_force": "day",
+    }
+    ticket_id = _insert_trade_request_ticket(conn, payload)
+
+    coid = engine.client_order_id_for(ticket_id)
+    engine.record_client_order_id(conn, ticket_id, coid)
+    engine.record_client_order_id(conn, ticket_id, coid)  # simulated retry — must not raise
+
+    assert engine.get_client_order_id(conn, ticket_id) == coid
+
+
+def test_get_client_order_id_returns_none_when_never_recorded(conn):
+    payload = {"approved": True, "bot_source": "US_BOT", "symbol": "AAPL",
+               "direction": "long", "strategy_id": "X", "sized_notional": 1000,
+               "asset_type": "equity", "time_in_force": "day"}
+    ticket_id = _insert_trade_request_ticket(conn, payload)  # never processed
+
+    assert engine.get_client_order_id(conn, ticket_id) is None

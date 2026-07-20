@@ -907,6 +907,42 @@ def get_force_close_state(conn, position_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def has_pending_close_ticket(conn, position_id: str) -> bool:
+    """
+    True if a CLOSE_REQUEST ticket for this position already exists in
+    nwt_tickets with no EXECUTION_ENGINE decision yet.
+
+    Replaces the old time-window dedup (execution_agent.py's
+    _has_pending_close(), a flat 2-hour created_at lookback) with the same
+    state-based approach already used for FORCE_CLOSE
+    (has_pending_force_close_ticket): a ticket is "pending" exactly as long
+    as it has no terminal decision, however long that takes, not for a
+    fixed window that can expire while the ticket is still legitimately
+    unprocessed (e.g. execution/engine.py is backed up or briefly down).
+    Every decision this codebase ever writes (EXECUTED, FAILED, REJECTED,
+    SKIPPED, EXECUTED_DUPLICATE) represents a resolved outcome, so "any
+    EXECUTION_ENGINE decision exists" is the correct terminal check — there
+    is no separate CANCELLED status in this system to check for.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM nwt_tickets t
+              WHERE t.type = 'CLOSE_REQUEST'
+                AND t.payload->>'position_id' = %s
+                AND NOT EXISTS (
+                  SELECT 1 FROM nwt_ticket_decisions d
+                  WHERE d.ticket_id = t.ticket_id AND d.decided_by = 'EXECUTION_ENGINE'
+                )
+            )
+            """,
+            (position_id,),
+        )
+        (exists,) = cur.fetchone()
+    return bool(exists)
+
+
 def has_pending_force_close_ticket(conn, position_id: str) -> bool:
     """
     True if a FORCE_CLOSE ticket for this position already exists in

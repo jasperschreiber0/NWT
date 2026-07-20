@@ -273,6 +273,14 @@ def renew_ticket_claim(conn, ticket_id: str, worker_id: str,
 FORCE_CLOSE_BACKOFF_MINUTES = [1, 5, 15, 60, 360, 1440]  # must match shared_context.py
 
 
+def get_force_close_state(conn, position_id: str) -> Optional[dict]:
+    """Duplicated from nwt_agents/shared_context.py's twin function."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM nwt_force_close_state WHERE position_id = %s", (position_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
 def record_force_close_outcome(conn, position_id: str, success: bool,
                                 error: Optional[str] = None,
                                 terminal: bool = False,
@@ -342,3 +350,128 @@ def record_force_close_outcome(conn, position_id: str, success: bool,
             (error, backoff_minutes, position_id),
         )
     conn.commit()
+
+
+def record_force_close_unknown(conn, position_id: str, asset: str, ticket_id: str,
+                                worker_id: Optional[str] = None,
+                                reason: str = "CLAIM_LOST_AFTER_BROKER_ACTION") -> None:
+    """
+    Record that a FORCE_CLOSE attempt's outcome is genuinely unknown: a
+    broker call (the liquidation DELETE) may have already happened, but
+    this worker lost its claim before it could record what happened.
+    Marking this FAILED would be wrong (the liquidation might have
+    succeeded — retrying could double-liquidate); marking it SUCCESS would
+    also be wrong (it might not have). UNKNOWN is a genuinely distinct
+    state that must be resolved by reconciliation
+    (engine.reconcile_unknown_force_close) against live broker state, not
+    guessed at here.
+
+    INSERT ... ON CONFLICT DO UPDATE rather than a plain UPDATE: in the
+    normal flow a row always already exists (schedule_force_close_attempt
+    creates it before any ticket does), but a plain UPDATE would silently
+    affect zero rows — and silently record nothing — in any scenario where
+    it doesn't (a ticket created some other way, a row deleted out from
+    under it). Recording UNKNOWN must never be a silent no-op.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_force_close_state
+              (position_id, asset, state, attempt_count, last_error, last_ticket_id,
+               last_worker_id, updated_at)
+            VALUES (%(position_id)s, %(asset)s, 'UNKNOWN', 1, %(reason)s, %(ticket_id)s,
+                    %(worker_id)s, NOW())
+            ON CONFLICT (position_id) DO UPDATE SET
+              state = 'UNKNOWN',
+              last_error = %(reason)s,
+              last_ticket_id = %(ticket_id)s,
+              last_worker_id = %(worker_id)s,
+              updated_at = NOW()
+            """,
+            {"position_id": position_id, "asset": asset, "reason": reason,
+             "ticket_id": ticket_id, "worker_id": worker_id},
+        )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# CLOSE_REQUEST dedup — same mechanism as
+# nwt_agents/shared_context.has_pending_close_ticket (duplicated here, not
+# imported, same pattern as everything else in this file). Used by
+# run_equity_position_monitor() in engine.py before creating a new
+# CLOSE_REQUEST for a position — replaces relying on a fixed time window.
+# ---------------------------------------------------------------------------
+
+def record_client_order_id(conn, ticket_id: str, client_order_id: str) -> None:
+    """
+    Persist the client_order_id sent to Alpaca for this ticket, for
+    auditability — called at the moment order submission begins (right
+    after computing it, before the broker call), not after the outcome is
+    known. ON CONFLICT DO NOTHING: client_order_id_for() is deterministic,
+    so a crash-and-retry recomputes and re-records the identical value —
+    this must be idempotent, not raise on the second attempt.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_order_submissions (ticket_id, client_order_id)
+            VALUES (%s, %s)
+            ON CONFLICT (ticket_id) DO NOTHING
+            """,
+            (ticket_id, client_order_id),
+        )
+    conn.commit()
+
+
+def get_client_order_id(conn, ticket_id: str) -> Optional[str]:
+    """Retrieve the client_order_id previously recorded for a ticket, or
+    None if none was ever recorded (e.g. the ticket never reached order
+    submission — REJECTED/VETOED before that point)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT client_order_id FROM nwt_order_submissions WHERE ticket_id = %s", (ticket_id,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def insert_ticket(conn, from_agent: str, to_agent: str, type_: str, payload: dict) -> str:
+    """
+    INSERT into nwt_tickets. Returns ticket_id as string. Duplicated from
+    nwt_agents/shared_context.insert_ticket — same pattern as everything
+    else in this file. Needed now that run_equity_position_monitor()
+    creates CLOSE_REQUEST tickets instead of calling the broker directly.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_tickets (from_agent, to_agent, type, payload)
+            VALUES (%s, %s, %s, %s)
+            RETURNING ticket_id
+            """,
+            (from_agent, to_agent, type_, json.dumps(payload)),
+        )
+        ticket_id = cur.fetchone()[0]
+    conn.commit()
+    return str(ticket_id)
+
+
+def has_pending_close_ticket(conn, position_id: str) -> bool:
+    """True if a CLOSE_REQUEST ticket for this position exists with no
+    EXECUTION_ENGINE decision yet — see shared_context.py's twin function
+    for the full rationale."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM nwt_tickets t
+              WHERE t.type = 'CLOSE_REQUEST'
+                AND t.payload->>'position_id' = %s
+                AND NOT EXISTS (
+                  SELECT 1 FROM nwt_ticket_decisions d
+                  WHERE d.ticket_id = t.ticket_id AND d.decided_by = 'EXECUTION_ENGINE'
+                )
+            )
+            """,
+            (position_id,),
+        )
+        (exists,) = cur.fetchone()
+    return bool(exists)

@@ -15,6 +15,8 @@ import pytest
 TEST_DSN = os.environ.get("NWT_TEST_DB_DSN")
 
 SCHEMA_SQL = """
+DROP TABLE IF EXISTS nwt_order_submissions;
+DROP TABLE IF EXISTS nwt_strategy_genome;
 DROP TABLE IF EXISTS nwt_force_close_state;
 DROP TABLE IF EXISTS nwt_ticket_claims;
 DROP TABLE IF EXISTS nwt_ticket_decisions;
@@ -60,9 +62,13 @@ CREATE TABLE nwt_trade_outcomes (
     archetype TEXT,
     symbol TEXT,
     direction TEXT,
+    entry_price NUMERIC,
+    entry_time TIMESTAMPTZ,
+    exit_price NUMERIC,
     pnl NUMERIC,
     pnl_pct NUMERIC,
     pnl_adjusted NUMERIC,
+    slippage_model TEXT,
     exit_time TIMESTAMPTZ,
     closed_at TIMESTAMPTZ,
     position_id UUID REFERENCES nwt_portfolio_ledger(position_id)
@@ -118,12 +124,33 @@ CREATE TABLE nwt_force_close_state (
     next_retry_at TIMESTAMPTZ,
     terminal_reason TEXT,
     escalated_at TIMESTAMPTZ,
+    last_ticket_id UUID,
+    last_worker_id TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT force_close_state_valid CHECK (
       state IN ('PENDING', 'ATTEMPTING', 'SUCCESS', 'FAILED_RETRYABLE',
-                'FAILED_TERMINAL', 'FAILED_REQUIRES_HUMAN')
+                'FAILED_TERMINAL', 'FAILED_REQUIRES_HUMAN', 'UNKNOWN')
     )
+);
+
+-- Mirrors db/migrate_2026_07_order_submissions.sql
+CREATE TABLE nwt_order_submissions (
+    ticket_id UUID PRIMARY KEY REFERENCES nwt_tickets(ticket_id),
+    client_order_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Mirrors db/schema.sql — needed by run_equity_position_monitor()'s
+-- genome fallback lookup when a ledger row has no stop_pct/target_pct.
+CREATE TABLE nwt_strategy_genome (
+    strategy_id TEXT NOT NULL,
+    track TEXT NOT NULL,
+    stop_loss_pct NUMERIC,
+    profit_target_pct NUMERIC,
+    version INTEGER NOT NULL DEFAULT 1,
+    active BOOLEAN DEFAULT TRUE,
+    PRIMARY KEY (strategy_id, version)
 );
 """
 

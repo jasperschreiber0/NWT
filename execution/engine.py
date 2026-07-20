@@ -29,10 +29,16 @@ from psycopg2.extras import RealDictCursor
 from ledger import (
     claim_ticket,
     close_position,
+    get_client_order_id,
+    get_force_close_state,
     get_open_positions,
+    has_pending_close_ticket,
     insert_position,
+    insert_ticket,
     log_system_event,
+    record_client_order_id,
     record_force_close_outcome,
+    record_force_close_unknown,
     release_ticket_claim,
     renew_ticket_claim,
 )
@@ -668,6 +674,19 @@ def write_trade_outcome(conn, position: dict, fill_price: float,
 # ---------------------------------------------------------------------------
 
 def run_equity_position_monitor(conn) -> None:
+    """
+    Evaluate every open equity position for stop/target/max-hold exit.
+
+    This function (and everything it calls) must NEVER place a broker
+    order directly — it only creates CLOSE_REQUEST tickets via
+    _emit_equity_close_request(). The actual close (claim, client_order_id,
+    broker call, ledger update) happens later in this same main() run via
+    the normal fetch_force_close_tickets() -> process_close_ticket()
+    pipeline, exactly like options exits. This used to call the broker
+    directly (_close_equity_position, now removed) with no nwt_tickets row,
+    no claim, and no execution decision — the weakest-audited, least
+    crash-safe path in the system.
+    """
     positions = get_open_positions(conn)
     equity_positions = [p for p in positions if p.get("asset_type") == "equity"
                         and p.get("bot_source") != "UNATTRIBUTED"]
@@ -684,6 +703,13 @@ def run_equity_position_monitor(conn) -> None:
         strategy_id = pos.get("bot_source", "")
 
         if entry_price <= 0 or not symbol:
+            continue
+
+        # State-based dedup (has_pending_close_ticket), not a time window —
+        # a position with an already-outstanding, undecided CLOSE_REQUEST
+        # never gets a second one, no matter how many monitor cycles pass
+        # before engine.py's own close-tickets loop actually consumes it.
+        if has_pending_close_ticket(conn, position_id):
             continue
 
         try:
@@ -721,60 +747,73 @@ def run_equity_position_monitor(conn) -> None:
                     stop_pct = -abs(float(genome["stop_loss_pct"]))
                     target_pct = float(genome["profit_target_pct"])
             except Exception:
-                pass
+                # A failed query here leaves the connection's transaction
+                # aborted until rolled back — every subsequent query on
+                # this same conn (including has_pending_close_ticket/
+                # insert_ticket for THIS position, and every other
+                # position later in this same loop) would otherwise fail
+                # with "current transaction is aborted" even though this
+                # specific failure is meant to be non-fatal (falls back to
+                # the hardcoded stop_pct/target_pct defaults above).
+                conn.rollback()
 
+        # exit_reason values are unchanged from before this refactor — 'stop',
+        # 'target', 'max_hold' — matching close_position()'s documented
+        # vocabulary and whatever else in the codebase (performance/tracker.py,
+        # session_scorecard.py) already expects these exact strings.
+        exit_reason = None
         entry_time = pos.get("entry_time")
         if entry_time:
             age_days = (datetime.now(timezone.utc) - entry_time.replace(tzinfo=timezone.utc)).days
             if age_days >= max_hold_days:
-                _close_equity_position(conn, pos, current_price, position_id, symbol,
-                                       notional, entry_price, "max_hold")
-                continue
+                exit_reason = "max_hold"
 
-        exit_reason = None
-        if pnl_pct <= stop_pct:
-            exit_reason = "stop"
-        elif pnl_pct >= target_pct:
-            exit_reason = "target"
+        if exit_reason is None:
+            if pnl_pct <= stop_pct:
+                exit_reason = "stop"
+            elif pnl_pct >= target_pct:
+                exit_reason = "target"
 
         if exit_reason:
-            _close_equity_position(conn, pos, current_price, position_id, symbol,
-                                   notional, entry_price, exit_reason)
+            _emit_equity_close_request(conn, pos, position_id, symbol, notional, entry_price, exit_reason)
 
 
-def _close_equity_position(conn, pos, current_price, position_id, symbol,
-                            notional, entry_price, exit_reason) -> None:
-    # This path has no nwt_tickets ticket (run_equity_position_monitor drives
-    # it straight off the ledger every cron cycle) so there is no claim/lease
-    # to protect it — client_order_id, keyed by position_id (stable across
-    # retries, since a crash-before-close leaves the position still
-    # status='open' and therefore still selected next cycle), is the only
-    # duplicate-order guard available on this specific path.
-    client_order_id = client_order_id_for(str(position_id), prefix="nwt-eqclose")
-    existing_order = find_order_by_client_order_id(client_order_id)
-    if existing_order:
-        logger.warning(
-            "Equity close for position %s: order with client_order_id=%s already exists "
-            "(id=%s, status=%s) — recovering instead of resubmitting",
-            position_id, client_order_id, existing_order.get("id"), existing_order.get("status"),
-        )
+def _emit_equity_close_request(conn, pos: dict, position_id: str, symbol: str,
+                               notional: float, entry_price: float, exit_reason: str) -> None:
+    """
+    Create a CLOSE_REQUEST ticket for an equity exit — this is the ONLY
+    thing this function is allowed to do. process_close_ticket() (claim,
+    client_order_id, broker call, ledger update) owns everything
+    downstream, identical to how options exits already work. qty is
+    computed here (from notional/entry_price) since equity closes have no
+    separate contract-price lookup the way options do.
+    """
+    qty = compute_qty_from_notional(notional, entry_price)
     try:
-        qty = compute_qty_from_notional(notional, entry_price)
-        order = existing_order or place_close_order(symbol, qty, "equity", client_order_id)
-        filled = poll_order_until_filled(order["id"])
-        fill_price = float(filled.get("filled_avg_price") or current_price)
-        slippage = abs(fill_price - current_price) / current_price if current_price > 0 else 0.0
-        close_position(conn, position_id, fill_price, slippage, exit_reason)
-        log_system_event(conn, "INFO", "execution_engine",
-                         f"Closed equity {symbol} reason={exit_reason} fill={fill_price:.4f}",
-                         {"position_id": position_id, "exit_reason": exit_reason,
-                          "fill_price": fill_price})
-        logger.info("Closed equity %s at %.4f reason=%s", symbol, fill_price, exit_reason)
+        ticket_id = insert_ticket(
+            conn,
+            from_agent="EQUITY_MONITOR",
+            to_agent="EXECUTION_ENGINE",
+            type_="CLOSE_REQUEST",
+            payload={
+                "approved": True,
+                "bot_source": pos.get("bot_source", "EQUITY_MONITOR"),
+                "symbol": symbol,
+                "position_id": position_id,
+                "asset_type": "equity",
+                "direction": pos.get("direction", "long"),
+                "strategy_id": pos.get("bot_source", ""),
+                "qty": qty,
+                "sized_notional": notional,
+                "time_in_force": "day",
+                "exit_reason": exit_reason,
+                "trigger_source": "EQUITY_MONITOR",
+            },
+        )
+        logger.info("Equity close requested: %s position_id=%s reason=%s ticket=%s",
+                    symbol, position_id, exit_reason, ticket_id)
     except Exception as exc:
-        logger.error("Failed to close equity position %s: %s", position_id, exc)
-        log_system_event(conn, "ERROR", "execution_engine",
-                         f"Equity close failed for {symbol}: {exc}",
-                         {"position_id": position_id})
+        logger.error("Failed to create CLOSE_REQUEST for equity position %s: %s", position_id, exc)
 
 
 class ClaimLostError(Exception):
@@ -822,6 +861,7 @@ def process_close_ticket(conn, ticket: dict) -> None:
     close_side = "buy" if pos_direction == "short" else "sell"
 
     client_order_id = client_order_id_for(ticket_id, prefix="nwt-close")
+    record_client_order_id(conn, ticket_id, client_order_id)  # submission begins now
     existing_order = find_order_by_client_order_id(client_order_id)
     if existing_order:
         logger.warning(
@@ -916,6 +956,58 @@ def _classify_force_close_failure(asset: str, asset_type: str, exc: Exception) -
     return False, False, str(exc)
 
 
+def reconcile_unknown_force_close(conn, position_id: str, asset: str) -> str | None:
+    """
+    If this position's force-close state is UNKNOWN (a prior attempt's
+    worker lost its claim after the liquidation DELETE may have already
+    reached the broker, so record_force_close_outcome() was never called),
+    resolve it now by querying live broker state:
+      - no position at the broker (404)   -> the earlier attempt DID
+        succeed. Close the ledger row if it isn't already, mark SUCCESS.
+      - position still open at the broker -> the earlier attempt did NOT
+        succeed. Mark FAILED_RETRYABLE so the normal backoff/escalation
+        machinery in schedule_force_close_attempt picks it back up exactly
+        like any other retryable failure — no separate retry path needed.
+      - broker query itself fails (network blip, 5xx) -> leave UNKNOWN in
+        place rather than guessing; a transient lookup failure must not be
+        treated as either outcome.
+
+    Returns 'SUCCESS' or 'FAILED_RETRYABLE' if it resolved something,
+    None if there was nothing to reconcile (state wasn't UNKNOWN) or the
+    broker query itself failed.
+    """
+    state = get_force_close_state(conn, position_id)
+    if not state or state.get("state") != "UNKNOWN":
+        return None
+
+    logger.warning(
+        "Reconciling UNKNOWN force-close outcome for position %s (%s) — querying broker "
+        "before proceeding with a new attempt", position_id, asset,
+    )
+    try:
+        alpaca_get(f"/positions/{asset}")
+        position_still_open = True
+    except Exception as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code != 404:
+            logger.warning("Reconciliation: broker query failed for %s, leaving UNKNOWN: %s", asset, exc)
+            return None
+        position_still_open = False
+
+    if position_still_open:
+        record_force_close_outcome(
+            conn, position_id, success=False,
+            error="Reconciled from UNKNOWN — broker still shows the position open",
+        )
+        logger.warning("Reconciled position %s: still open at broker -> FAILED_RETRYABLE", position_id)
+        return "FAILED_RETRYABLE"
+
+    close_position(conn, position_id, 0.0, 0.0, "already_closed_at_broker")
+    record_force_close_outcome(conn, position_id, success=True)
+    logger.info("Reconciled position %s: broker confirms closed -> SUCCESS", position_id)
+    return "SUCCESS"
+
+
 def process_force_close(conn, ticket: dict) -> None:
     """
     Liquidate a ledger position on RISK_AGENT FORCE_CLOSE instruction.
@@ -940,6 +1032,28 @@ def process_force_close(conn, ticket: dict) -> None:
         insert_decision(conn, ticket_id, "FAILED", reason)
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
         return
+
+    # Reconcile a prior UNKNOWN outcome (a previous attempt's worker lost
+    # its claim after the broker DELETE may have already succeeded, so
+    # nothing was ever recorded) BEFORE doing anything else — otherwise
+    # this attempt would blindly retry on top of an outcome nobody actually
+    # knows, risking a second real liquidation if the first one worked.
+    resolved_asset = position.get("asset") or asset
+    reconciled = reconcile_unknown_force_close(conn, position_id, resolved_asset)
+    if reconciled == "SUCCESS":
+        insert_decision(conn, ticket_id, "SKIPPED",
+                        f"FORCE_CLOSE: reconciled a prior UNKNOWN outcome — broker confirms "
+                        f"{resolved_asset} already closed")
+        return
+    if reconciled == "FAILED_RETRYABLE":
+        insert_decision(conn, ticket_id, "SKIPPED",
+                        f"FORCE_CLOSE: reconciled a prior UNKNOWN outcome — broker shows "
+                        f"{resolved_asset} still open, marked for retry")
+        return
+    # reconciled is None: either state wasn't UNKNOWN (normal case), or the
+    # broker query itself failed transiently — in the latter case leave
+    # UNKNOWN in place and fall through to a normal attempt below rather
+    # than blocking forever on a flaky reconciliation check.
 
     if position.get("status") == "closed":
         reason = f"FORCE_CLOSE: position {position_id} already closed"
@@ -1014,11 +1128,25 @@ def process_force_close(conn, ticket: dict) -> None:
         # real by this point, so if we've lost the claim, marking this
         # FAILED (as the except below would) is actively wrong — it would
         # tell the state machine to retry a position that may already be
-        # closing, risking a second real liquidation attempt.
+        # closing, risking a second real liquidation attempt. Record
+        # UNKNOWN instead — reconcile_unknown_force_close() resolves it
+        # against live broker state on the next attempt.
         if not renew_ticket_claim(conn, ticket_id, WORKER_ID):
+            record_force_close_unknown(conn, position_id, asset, ticket_id, WORKER_ID)
+            # An UNKNOWN decision (not a silence, unlike Path 1/2's
+            # ClaimLostError handling) is written for THIS ticket so
+            # has_pending_force_close_ticket() no longer sees it as
+            # outstanding — otherwise risk_agent.py could never schedule
+            # another attempt for this position, and reconciliation would
+            # never get a ticket to run against. This is safe specifically
+            # because FORCE_CLOSE has a reconciliation mechanism to resolve
+            # the ambiguity later; Paths 1/2 don't, so they stay silent.
+            insert_decision(conn, ticket_id,
+                            "UNKNOWN", "Claim lost after liquidation order was already submitted")
             raise ClaimLostError(
                 f"Lost claim ownership for ticket {ticket_id} after FORCE_CLOSE liquidation "
-                f"order was already submitted — another worker may already be processing it"
+                f"order was already submitted — another worker may already be processing it. "
+                f"Outcome recorded as UNKNOWN for position {position_id}."
             )
         filled_order = poll_order_until_filled(alpaca_order_id) if alpaca_order_id else order
     except ClaimLostError:
@@ -1196,6 +1324,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     entry_bid = entry_ask = None
 
     client_order_id = client_order_id_for(ticket_id)
+    record_client_order_id(conn, ticket_id, client_order_id)  # submission begins now
     existing_order = find_order_by_client_order_id(client_order_id)
     if existing_order:
         # A process crash between "Alpaca accepted this order" and "we
