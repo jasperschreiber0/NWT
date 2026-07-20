@@ -832,15 +832,31 @@ def claim_ticket(conn, ticket_id: str, worker_id: str,
     return got_it
 
 
-def release_ticket_claim(conn, ticket_id: str, status: str = "done") -> None:
-    """Release a claim after processing completes (status='done') or a
-    handled failure (status='failed') so the row stops holding the lease."""
+def release_ticket_claim(conn, ticket_id: str, worker_id: str, status: str = "done") -> bool:
+    """
+    Release a claim after processing completes (status='done') or a handled
+    failure (status='failed').
+
+    worker_id is required and enforced via WHERE claimed_by = %s — without
+    this guard, a worker that no longer owns the claim (e.g. its lease
+    expired and a second worker already reclaimed it) could still call
+    release and clobber that second worker's live claim: setting
+    status='failed' on someone else's active, in-progress claim would make
+    it immediately reclaimable by a THIRD worker regardless of the second
+    worker's lease_expires_at, defeating the mutual-exclusion guarantee
+    entirely. Returns True only if this worker's own claim was the one
+    actually updated; False means the caller no longer owned it and must
+    not assume its release had any effect.
+    """
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE nwt_ticket_claims SET status = %s, updated_at = NOW() WHERE ticket_id = %s",
-            (status, ticket_id),
+            "UPDATE nwt_ticket_claims SET status = %s, updated_at = NOW() "
+            "WHERE ticket_id = %s AND claimed_by = %s",
+            (status, ticket_id, worker_id),
         )
+        released = cur.rowcount > 0
     conn.commit()
+    return released
 
 
 def renew_ticket_claim(conn, ticket_id: str, worker_id: str,

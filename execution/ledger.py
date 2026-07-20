@@ -219,13 +219,23 @@ def claim_ticket(conn, ticket_id: str, worker_id: str,
     return got_it
 
 
-def release_ticket_claim(conn, ticket_id: str, status: str = "done") -> None:
+def release_ticket_claim(conn, ticket_id: str, worker_id: str, status: str = "done") -> bool:
+    """
+    worker_id is required and enforced via WHERE claimed_by = %s. See
+    shared_context.release_ticket_claim for the full rationale — without
+    this guard, a worker that no longer owns the claim could clobber a
+    different worker's live claim out from under it. Returns True only if
+    this worker's own claim was the one actually updated.
+    """
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE nwt_ticket_claims SET status = %s, updated_at = NOW() WHERE ticket_id = %s",
-            (status, ticket_id),
+            "UPDATE nwt_ticket_claims SET status = %s, updated_at = NOW() "
+            "WHERE ticket_id = %s AND claimed_by = %s",
+            (status, ticket_id, worker_id),
         )
+        released = cur.rowcount > 0
     conn.commit()
+    return released
 
 
 def renew_ticket_claim(conn, ticket_id: str, worker_id: str,

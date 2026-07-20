@@ -103,6 +103,65 @@ def test_second_worker_cannot_process_the_same_malformed_ticket_concurrently(con
     assert second is False
 
 
+def test_lost_claim_mid_processing_writes_no_decision(conn, monkeypatch):
+    """
+    Final adversarial audit finding: if renew_ticket_claim reports this
+    worker no longer owns the ticket (lease expired, another worker already
+    reclaimed it), the order-resolution work in this function may already
+    have submitted something real to the broker moments earlier. Writing a
+    FAILED decision in that case would be actively wrong — it would tell
+    the rest of the system "nothing happened" when something might have.
+    The fix must produce 'claim_lost' and write NO decision at all, not a
+    FAILED one.
+    """
+    import execution_agent
+
+    ticket_id = _insert_proposal_ticket(
+        conn, {"symbol": "AAPL", "sized_notional": 1000, "strategy_type": "long_call", "from_track": "C"},
+    )
+    ticket = {
+        "ticket_id": ticket_id,
+        "payload": {"symbol": "AAPL", "sized_notional": 1000, "strategy_type": "long_call", "from_track": "C"},
+    }
+
+    # Isolate this test to exactly the property under test: force past the
+    # veto gate (its own network/file dependencies are irrelevant here) and
+    # force the renewal to report lost ownership.
+    monkeypatch.setattr(execution_agent, "pre_trade_veto", lambda conn, track: (False, ""))
+    monkeypatch.setattr(execution_agent, "renew_ticket_claim", lambda *a, **k: False)
+
+    outcome = execution_agent._handle_one_proposal(conn, ticket)
+
+    assert outcome == "claim_lost"
+    with conn.cursor() as cur:
+        cur.execute("SELECT decision FROM nwt_ticket_decisions WHERE ticket_id = %s", (ticket_id,))
+        decisions = cur.fetchall()
+    assert decisions == []  # no decision at all — not FAILED, not anything
+
+
+def test_lost_claim_mid_processing_logs_critical(conn, monkeypatch):
+    import execution_agent
+
+    ticket_id = _insert_proposal_ticket(
+        conn, {"symbol": "AAPL", "sized_notional": 1000, "strategy_type": "long_call", "from_track": "C"},
+    )
+    ticket = {
+        "ticket_id": ticket_id,
+        "payload": {"symbol": "AAPL", "sized_notional": 1000, "strategy_type": "long_call", "from_track": "C"},
+    }
+    monkeypatch.setattr(execution_agent, "pre_trade_veto", lambda conn, track: (False, ""))
+    monkeypatch.setattr(execution_agent, "renew_ticket_claim", lambda *a, **k: False)
+
+    execution_agent._handle_one_proposal(conn, ticket)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM nwt_system_log WHERE level = 'CRITICAL' AND component = 'execution_agent'"
+        )
+        (count,) = cur.fetchone()
+    assert count >= 1
+
+
 def test_a_second_valid_ticket_is_not_claimed_by_processing_the_first(conn):
     """
     Sanity check that claiming/handling one ticket has no effect on an

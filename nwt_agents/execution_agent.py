@@ -535,6 +535,25 @@ def monitor_options_positions(conn) -> None:
                     gid, len(legs), exit_reason)
 
 
+class ClaimLostError(Exception):
+    """
+    Raised when a worker discovers, via a failed lease renewal, that it no
+    longer owns the ticket it believed it was exclusively processing.
+
+    This must be handled distinctly from an ordinary failure: by the time
+    this fires, the worker may have ALREADY submitted a real broker order
+    (client_order_id_for-style idempotency lives in execution/engine.py,
+    not here — this module only submits TRADE_REQUEST tickets, not broker
+    orders directly, so the risk here is a duplicate TRADE_REQUEST rather
+    than a duplicate fill, but the same principle applies: we no longer
+    know our own outcome for certain). Writing a FAILED decision here would
+    be actively wrong if the submission actually succeeded moments before
+    losing the claim — it would tell the rest of the system "nothing
+    happened" when something might have. This must escalate loudly instead
+    of guessing.
+    """
+
+
 def _process_approved_proposal(conn, ticket: dict, ticket_id: str) -> bool:
     """
     Everything about turning one approved TRADE_PROPOSAL into a submitted
@@ -618,7 +637,18 @@ def _process_approved_proposal(conn, ticket: dict, ticket_id: str) -> bool:
     # each with a 15-20s timeout — ~100-115s worst case) so a legitimate
     # slow run doesn't have its claim lease expire out from under it and
     # get reclaimed by an overlapping worker mid-resolution.
-    renew_ticket_claim(conn, ticket_id, WORKER_ID)
+    #
+    # The return value MUST be checked: if it's False, this worker's lease
+    # already expired and a different worker may have already reclaimed
+    # (and be actively processing) this exact ticket. Continuing past this
+    # point without checking would mean two workers could both believe they
+    # own the ticket and both proceed to submit a TRADE_REQUEST for it —
+    # renewing is worthless as a safety mechanism if its result is ignored.
+    if not renew_ticket_claim(conn, ticket_id, WORKER_ID):
+        raise ClaimLostError(
+            f"Lost claim ownership for ticket {ticket_id} before order resolution completed — "
+            f"another worker may already be processing it"
+        )
 
     if strategy_type in SPREAD_STRATEGIES:
         # Defined-risk structure — resolve all legs, submit as one mleg order
@@ -727,8 +757,24 @@ def _handle_one_proposal(conn, ticket: dict) -> str:
 
     try:
         submitted = _process_approved_proposal(conn, ticket, ticket_id)
-        release_ticket_claim(conn, ticket_id, status="done")
+        release_ticket_claim(conn, ticket_id, WORKER_ID, status="done")
         return "submitted" if submitted else "handled_failure"
+    except ClaimLostError as exc:
+        # We no longer own this ticket — do NOT write a decision (we don't
+        # actually know whether our own submission went through before we
+        # lost ownership, so guessing FAILED could hide a real duplicate)
+        # and do NOT call release_ticket_claim (the ownership-guarded
+        # release would be a safe no-op anyway, since claimed_by no longer
+        # matches WORKER_ID, but there is nothing correct to release). Log
+        # loudly instead — this needs a human to reconcile against Alpaca
+        # order history for this ticket_id, not an automatic retry.
+        conn.rollback()
+        logger.critical("Ticket %s: %s", ticket_id, exc)
+        try:
+            log_system_event(conn, "CRITICAL", "execution_agent", str(exc), {"ticket_id": ticket_id})
+        except Exception:
+            pass
+        return "claim_lost"
     except Exception as exc:
         # A raised exception may have left the connection's current
         # transaction aborted (e.g. a psycopg2 error) — roll back first so
@@ -745,7 +791,7 @@ def _handle_one_proposal(conn, ticket: dict) -> str:
             log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
         except Exception:
             pass
-        release_ticket_claim(conn, ticket_id, status="failed")
+        release_ticket_claim(conn, ticket_id, WORKER_ID, status="failed")
         return "unhandled_error"
 
 
@@ -793,7 +839,7 @@ def main() -> None:
             outcome = _handle_one_proposal(conn, ticket)
             if outcome == "submitted":
                 submitted_count += 1
-            elif outcome in ("handled_failure", "unhandled_error"):
+            elif outcome in ("handled_failure", "unhandled_error", "claim_lost"):
                 failed_count += 1
             # "not_claimed" counts toward neither — another worker owns it.
 

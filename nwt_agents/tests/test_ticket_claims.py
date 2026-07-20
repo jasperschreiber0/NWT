@@ -79,7 +79,7 @@ def test_release_then_reclaim_by_a_different_worker(conn):
     ticket_id = _insert_ticket(conn)
 
     claim_ticket(conn, ticket_id, worker_id="worker-a")
-    release_ticket_claim(conn, ticket_id, status="done")
+    release_ticket_claim(conn, ticket_id, worker_id="worker-a", status="done")
 
     reclaimed = claim_ticket(conn, ticket_id, worker_id="worker-b")
 
@@ -92,7 +92,7 @@ def test_failed_release_allows_retry_by_another_worker(conn):
     ticket_id = _insert_ticket(conn)
 
     claim_ticket(conn, ticket_id, worker_id="worker-a")
-    release_ticket_claim(conn, ticket_id, status="failed")
+    release_ticket_claim(conn, ticket_id, worker_id="worker-a", status="failed")
 
     retried = claim_ticket(conn, ticket_id, worker_id="worker-b")
 
@@ -151,6 +151,61 @@ def test_live_lease_is_not_reclaimable_before_expiry(conn):
 # instant. This is the strongest evidence available that the atomicity
 # comes from Postgres's row lock, not from Python-level call ordering.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Ownership guard on release — final adversarial audit finding: a worker
+# that no longer owns a claim (lease expired, reclaimed by someone else)
+# must never be able to clobber that other worker's LIVE claim via
+# release_ticket_claim. Before this fix, release had no claimed_by check at
+# all, so a stale worker calling release(status='failed') would flip a
+# currently-active claim to 'failed' — making it immediately reclaimable by
+# a THIRD worker regardless of the second worker's lease_expires_at. This
+# is the concrete "two workers both believe they own the ticket" scenario.
+# ---------------------------------------------------------------------------
+
+def test_release_by_a_worker_that_never_owned_the_claim_is_a_noop(conn):
+    ticket_id = _insert_ticket(conn)
+    claim_ticket(conn, ticket_id, worker_id="worker-a")
+
+    released = release_ticket_claim(conn, ticket_id, worker_id="worker-b", status="failed")
+
+    assert released is False
+    with conn.cursor() as cur:
+        cur.execute("SELECT claimed_by, status FROM nwt_ticket_claims WHERE ticket_id = %s", (ticket_id,))
+        claimed_by, status = cur.fetchone()
+    assert claimed_by == "worker-a"
+    assert status == "in_progress"  # untouched — worker-a's claim survives
+
+
+def test_stale_worker_cannot_sabotage_the_reclaiming_workers_live_claim(conn, conn2):
+    """
+    The exact scenario: worker-a's lease expires, worker-b legitimately
+    reclaims and is actively processing, and THEN worker-a (unaware it lost
+    ownership — e.g. it's still running a slow operation, or its own
+    process is just slow to reach its except-block) tries to release. That
+    release must not affect worker-b's now-active claim at all.
+    """
+    ticket_id = _insert_ticket(conn)
+    claim_ticket(conn, ticket_id, worker_id="worker-a", lease_seconds=1)
+    time.sleep(1.2)
+    claim_ticket(conn2, ticket_id, worker_id="worker-b")  # worker-b legitimately reclaims
+
+    # worker-a, unaware it lost the claim, tries to release as if it still owned it
+    released = release_ticket_claim(conn, ticket_id, worker_id="worker-a", status="failed")
+
+    assert released is False
+    with conn.cursor() as cur:
+        cur.execute("SELECT claimed_by, status FROM nwt_ticket_claims WHERE ticket_id = %s", (ticket_id,))
+        claimed_by, status = cur.fetchone()
+    # worker-b's claim must be completely untouched by worker-a's stale release
+    assert claimed_by == "worker-b"
+    assert status == "in_progress"
+
+    # And a third worker must still be correctly blocked, exactly as if
+    # worker-a's release call had never happened.
+    third = claim_ticket(conn2, ticket_id, worker_id="worker-c")
+    assert third is False
+
 
 # ---------------------------------------------------------------------------
 # Lease renewal — deployment-readiness audit fix: a fixed, un-renewed lease

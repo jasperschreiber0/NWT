@@ -457,7 +457,55 @@ def compute_qty_from_notional(sized_notional: float, price: float) -> int:
     return max(int(sized_notional / price), 1)
 
 
-def place_equity_order(payload: dict) -> dict:
+# ---------------------------------------------------------------------------
+# Broker-side idempotency
+#
+# No claim/lease sequencing on our side can fully close the window between
+# "Alpaca accepted an order" and "we durably recorded that anywhere" — a
+# process can be killed (OOM, VM restart, cron timeout) at any point in that
+# window, however small application-level logic makes it, and on recovery
+# fetch_pending_tickets would select the same undecided ticket again,
+# resubmitting the same order for real. client_order_id is the actual
+# backstop: it is derived deterministically from the ticket_id, so a
+# resubmission for the same ticket always carries the identical id, and
+# Alpaca itself rejects a second order with a client_order_id it has already
+# seen. find_order_by_client_order_id lets a recovering worker check for
+# and reuse that original order instead of ever attempting a resubmission
+# in the first place.
+# ---------------------------------------------------------------------------
+
+def client_order_id_for(ticket_id: str, prefix: str = "nwt") -> str:
+    """Deterministic, Alpaca-safe (<=48 char) client_order_id. Same
+    ticket_id always produces the same id — that determinism is the whole
+    mechanism; do not add any randomness or timestamp here."""
+    return f"{prefix}-{ticket_id}"[:48]
+
+
+def find_order_by_client_order_id(client_order_id: str) -> dict | None:
+    """
+    Check whether an order with this client_order_id already exists at the
+    broker. limit=100 recent orders (status=all) is checked client-side —
+    Alpaca's list endpoint is not guaranteed to support server-side
+    client_order_id filtering across all API versions, and 100 is generous
+    against the volume any single 5-minute engine.py cycle could plausibly
+    place. Returns None (not found, or the lookup itself failed) rather than
+    raising — a lookup failure must not block a legitimate first-time
+    submission; the broker's own duplicate-order rejection remains the
+    backstop if this check is ever wrong.
+    """
+    try:
+        orders = alpaca_get("/orders?status=all&limit=100&nested=true")
+    except Exception as exc:
+        logger.warning("find_order_by_client_order_id(%s): lookup failed, proceeding as not-found: %s",
+                       client_order_id, exc)
+        return None
+    for o in (orders if isinstance(orders, list) else []):
+        if o.get("client_order_id") == client_order_id:
+            return o
+    return None
+
+
+def place_equity_order(payload: dict, client_order_id: str) -> dict:
     symbol = payload["symbol"]
     sized_notional = float(payload["sized_notional"])
     time_in_force = payload["time_in_force"]
@@ -473,12 +521,14 @@ def place_equity_order(payload: dict) -> dict:
         "side": side,
         "type": "market",
         "time_in_force": time_in_force,
+        "client_order_id": client_order_id,
     }
-    logger.info("Placing equity order: %s %s x%d (notional=%.2f)", side, symbol, qty, sized_notional)
+    logger.info("Placing equity order: %s %s x%d (notional=%.2f) client_order_id=%s",
+                side, symbol, qty, sized_notional, client_order_id)
     return alpaca_post("/orders", order_body)
 
 
-def place_options_order(payload: dict) -> dict:
+def place_options_order(payload: dict, client_order_id: str) -> dict:
     """
     Single-leg option entries are ALWAYS buy-to-open — a bearish thesis buys
     a put, it never sells a call. Sell-to-open is only reachable inside a
@@ -496,6 +546,7 @@ def place_options_order(payload: dict) -> dict:
             "qty": str(qty),
             "type": "market",
             "time_in_force": time_in_force,
+            "client_order_id": client_order_id,
             "legs": [
                 {
                     "symbol": leg["option_symbol"],
@@ -506,8 +557,8 @@ def place_options_order(payload: dict) -> dict:
                 for leg in legs
             ],
         }
-        logger.info("Placing mleg options order: %d legs x%d (%s)",
-                    len(legs), qty, ", ".join(f"{l['side']} {l['option_symbol']}" for l in legs))
+        logger.info("Placing mleg options order: %d legs x%d (%s) client_order_id=%s",
+                    len(legs), qty, ", ".join(f"{l['side']} {l['option_symbol']}" for l in legs), client_order_id)
         return alpaca_post("/orders", order_body)
 
     option_symbol = payload["option_symbol"]
@@ -518,12 +569,13 @@ def place_options_order(payload: dict) -> dict:
         "type": "market",
         "time_in_force": time_in_force,
         "order_class": "simple",
+        "client_order_id": client_order_id,
     }
-    logger.info("Placing options order: buy %s x%d", option_symbol, qty)
+    logger.info("Placing options order: buy %s x%d client_order_id=%s", option_symbol, qty, client_order_id)
     return alpaca_post("/orders", order_body)
 
 
-def place_close_order(symbol: str, qty: int, asset_type: str, side: str = "sell") -> dict:
+def place_close_order(symbol: str, qty: int, asset_type: str, client_order_id: str, side: str = "sell") -> dict:
     """
     side defaults to "sell" (closing a long position — true for equity and
     every single-leg option position). A short option leg (only reachable
@@ -537,10 +589,11 @@ def place_close_order(symbol: str, qty: int, asset_type: str, side: str = "sell"
         "side": side,
         "type": "market",
         "time_in_force": "day",
+        "client_order_id": client_order_id,
     }
     if asset_type == "option":
         order_body["order_class"] = "simple"
-    logger.info("Placing close order: %s %s x%d", side, symbol, qty)
+    logger.info("Placing close order: %s %s x%d client_order_id=%s", side, symbol, qty, client_order_id)
     return alpaca_post("/orders", order_body)
 
 
@@ -691,9 +744,23 @@ def run_equity_position_monitor(conn) -> None:
 
 def _close_equity_position(conn, pos, current_price, position_id, symbol,
                             notional, entry_price, exit_reason) -> None:
+    # This path has no nwt_tickets ticket (run_equity_position_monitor drives
+    # it straight off the ledger every cron cycle) so there is no claim/lease
+    # to protect it — client_order_id, keyed by position_id (stable across
+    # retries, since a crash-before-close leaves the position still
+    # status='open' and therefore still selected next cycle), is the only
+    # duplicate-order guard available on this specific path.
+    client_order_id = client_order_id_for(str(position_id), prefix="nwt-eqclose")
+    existing_order = find_order_by_client_order_id(client_order_id)
+    if existing_order:
+        logger.warning(
+            "Equity close for position %s: order with client_order_id=%s already exists "
+            "(id=%s, status=%s) — recovering instead of resubmitting",
+            position_id, client_order_id, existing_order.get("id"), existing_order.get("status"),
+        )
     try:
         qty = compute_qty_from_notional(notional, entry_price)
-        order = place_close_order(symbol, qty, "equity")
+        order = existing_order or place_close_order(symbol, qty, "equity", client_order_id)
         filled = poll_order_until_filled(order["id"])
         fill_price = float(filled.get("filled_avg_price") or current_price)
         slippage = abs(fill_price - current_price) / current_price if current_price > 0 else 0.0
@@ -708,6 +775,20 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
         log_system_event(conn, "ERROR", "execution_engine",
                          f"Equity close failed for {symbol}: {exc}",
                          {"position_id": position_id})
+
+
+class ClaimLostError(Exception):
+    """
+    Raised when renew_ticket_claim() reports this worker no longer owns the
+    ticket it believed it exclusively held. By the time this fires the
+    order may have ALREADY been submitted to the broker moments earlier —
+    writing a FAILED decision here would be actively wrong if the
+    submission actually succeeded, telling the rest of the system "nothing
+    happened" when a real order might be sitting at Alpaca. Every catch
+    site must re-raise this untouched (never let the local "poll failed"
+    handler swallow it) so it reaches main()'s per-ticket wrapper, which
+    logs CRITICAL and deliberately writes no decision.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -740,13 +821,29 @@ def process_close_ticket(conn, ticket: dict) -> None:
             pos_direction = row["direction"]
     close_side = "buy" if pos_direction == "short" else "sell"
 
+    client_order_id = client_order_id_for(ticket_id, prefix="nwt-close")
+    existing_order = find_order_by_client_order_id(client_order_id)
+    if existing_order:
+        logger.warning(
+            "Ticket %s: close order with client_order_id=%s already exists at broker "
+            "(id=%s, status=%s) — recovering instead of resubmitting",
+            ticket_id, client_order_id, existing_order.get("id"), existing_order.get("status"),
+        )
+
     try:
-        order = place_close_order(symbol, qty, asset_type, side=close_side)
+        order = existing_order or place_close_order(symbol, qty, asset_type, client_order_id, side=close_side)
         # Fresh lease before the poll loop — poll_order_until_filled's own
         # worst case (POLL_MAX x (POLL_INTERVAL + timeout) = 180s) can equal
         # or exceed the base claim lease; renewing here means a legitimately
         # slow fill doesn't lose the claim to an overlapping worker mid-poll.
-        renew_ticket_claim(conn, ticket_id, WORKER_ID)
+        # The return value MUST be checked — see ClaimLostError's docstring:
+        # renewing is worthless as a safety mechanism if a False result is
+        # ignored, since the order above may have already reached the broker.
+        if not renew_ticket_claim(conn, ticket_id, WORKER_ID):
+            raise ClaimLostError(
+                f"Lost claim ownership for ticket {ticket_id} after order submission — "
+                f"another worker may already be processing it"
+            )
         filled = poll_order_until_filled(order["id"])
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
@@ -775,6 +872,8 @@ def process_close_ticket(conn, ticket: dict) -> None:
                          f"Close executed: {symbol} at {fill_price:.4f}",
                          {"ticket_id": ticket_id, "exit_reason": exit_reason,
                           "position_id": position_id})
+    except ClaimLostError:
+        raise  # propagate untouched — see ClaimLostError's docstring
     except Exception as exc:
         reason = f"Close failed: {exc}"
         logger.error("Ticket %s: %s", ticket_id, reason)
@@ -853,6 +952,30 @@ def process_force_close(conn, ticket: dict) -> None:
     asset = position.get("asset") or asset
     asset_type = position.get("asset_type", "option")
 
+    # Pre-flight state check: DELETE /positions/{symbol} has no
+    # client-supplied idempotency key (unlike the raw POST /orders endpoint
+    # used everywhere else), so it cannot be made fully idempotent the same
+    # way. Checking live broker state FIRST at least means a crash-and-retry
+    # against an already-closed position never even attempts the DELETE
+    # call, narrowing (though — see this function's residual-risk note in
+    # the deployment audit — not fully eliminating, since a position whose
+    # closing order is still in flight from a prior crashed attempt can
+    # still show as "open" here) the window where a second real closing
+    # order could be placed.
+    try:
+        alpaca_get(f"/positions/{asset}")
+    except Exception as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code == 404:
+            close_position(conn, position_id, 0.0, 0.0, "already_closed_at_broker")
+            insert_decision(conn, ticket_id, "SKIPPED",
+                            f"FORCE_CLOSE: pre-flight check found no position for {asset} — already closed")
+            record_force_close_outcome(conn, position_id, success=True)
+            logger.info("Ticket %s: pre-flight check found %s already closed — skipped DELETE", ticket_id, asset)
+            return
+        # Any other pre-flight failure (network blip, 5xx) — fall through to
+        # the real attempt below and let its own classification handle it.
+
     exit_bid, exit_ask = get_latest_quote(asset, asset_type)
     expected_price = (exit_bid + exit_ask) / 2.0 if (exit_bid and exit_ask) else None
 
@@ -886,9 +1009,20 @@ def process_force_close(conn, ticket: dict) -> None:
     alpaca_order_id = order.get("id", "")
     try:
         # See the identical note in process_close_ticket — renew before the
-        # poll loop's own ~180s worst case.
-        renew_ticket_claim(conn, ticket_id, WORKER_ID)
+        # poll loop's own ~180s worst case. Return value MUST be checked:
+        # the liquidation DELETE above has already reached the broker for
+        # real by this point, so if we've lost the claim, marking this
+        # FAILED (as the except below would) is actively wrong — it would
+        # tell the state machine to retry a position that may already be
+        # closing, risking a second real liquidation attempt.
+        if not renew_ticket_claim(conn, ticket_id, WORKER_ID):
+            raise ClaimLostError(
+                f"Lost claim ownership for ticket {ticket_id} after FORCE_CLOSE liquidation "
+                f"order was already submitted — another worker may already be processing it"
+            )
         filled_order = poll_order_until_filled(alpaca_order_id) if alpaca_order_id else order
+    except ClaimLostError:
+        raise  # propagate untouched — see ClaimLostError's docstring
     except Exception as exc:
         reason = f"FORCE_CLOSE: order poll failed: {exc}"
         logger.error("Ticket %s: %s", ticket_id, reason)
@@ -1061,10 +1195,23 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     expected_price = None
     entry_bid = entry_ask = None
 
+    client_order_id = client_order_id_for(ticket_id)
+    existing_order = find_order_by_client_order_id(client_order_id)
+    if existing_order:
+        # A process crash between "Alpaca accepted this order" and "we
+        # recorded that anywhere" is the one class of duplicate-order risk
+        # no claim/lease sequencing on our side can fully close — recover
+        # the original order instead of ever attempting to resubmit it.
+        logger.warning(
+            "Ticket %s: order with client_order_id=%s already exists at broker "
+            "(id=%s, status=%s) — recovering instead of resubmitting",
+            ticket_id, client_order_id, existing_order.get("id"), existing_order.get("status"),
+        )
+
     try:
         if asset_type == "equity":
             entry_bid, entry_ask = get_latest_quote(symbol, "equity")
-            order = place_equity_order(payload)
+            order = existing_order or place_equity_order(payload, client_order_id)
             expected_price = get_current_price(symbol)
         elif asset_type == "option":
             if not legs:
@@ -1072,7 +1219,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
                 entry_bid, entry_ask = get_latest_quote(option_symbol, "option")
                 if entry_bid and entry_ask:
                     expected_price = (entry_bid + entry_ask) / 2.0
-            order = place_options_order(payload)
+            order = existing_order or place_options_order(payload, client_order_id)
         else:
             reason = f"Unknown asset_type: {asset_type}"
             insert_decision(conn, ticket_id, "FAILED", reason)
@@ -1088,9 +1235,18 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
 
     try:
         # See the identical note in process_close_ticket — renew before the
-        # poll loop's own ~180s worst case.
-        renew_ticket_claim(conn, ticket_id, WORKER_ID)
+        # poll loop's own ~180s worst case. Return value MUST be checked:
+        # the order above has already reached the broker for real by this
+        # point, so a lost claim here must not be treated as an ordinary
+        # "poll failed" -> FAILED decision.
+        if not renew_ticket_claim(conn, ticket_id, WORKER_ID):
+            raise ClaimLostError(
+                f"Lost claim ownership for ticket {ticket_id} after order {alpaca_order_id} "
+                f"was already submitted — another worker may already be processing it"
+            )
         filled_order = poll_order_until_filled(alpaca_order_id)
+    except ClaimLostError:
+        raise  # propagate untouched — see ClaimLostError's docstring
     except Exception as exc:
         reason = f"Order poll failed: {exc}"
         insert_decision(conn, ticket_id, "FAILED", reason)
@@ -1226,10 +1382,21 @@ def main() -> None:
                         process_force_close(conn, ticket)
                     else:
                         process_close_ticket(conn, ticket)
-                    release_ticket_claim(conn, ticket_id, status="done")
+                    release_ticket_claim(conn, ticket_id, WORKER_ID, status="done")
+                except ClaimLostError as exc:
+                    # We no longer own this ticket, and a real broker order
+                    # may already have been placed before we found out — do
+                    # NOT write a decision (would tell the system "nothing
+                    # happened" when something might have) and do NOT
+                    # release (the ownership guard makes it a no-op anyway).
+                    # This needs a human to reconcile against Alpaca order
+                    # history for this ticket_id.
+                    conn.rollback()
+                    logger.critical("Ticket %s: %s", ticket_id, exc)
+                    log_system_event(conn, "CRITICAL", "execution_engine", str(exc), {"ticket_id": ticket_id})
                 except Exception as exc:
                     logger.error("Unhandled error in close ticket %s: %s", ticket_id, exc)
-                    release_ticket_claim(conn, ticket_id, status="failed")
+                    release_ticket_claim(conn, ticket_id, WORKER_ID, status="failed")
 
         pending = fetch_pending_tickets(conn)
         logger.info("Found %d pending TRADE_REQUEST tickets", len(pending))
@@ -1245,10 +1412,16 @@ def main() -> None:
                 continue
             try:
                 process_ticket(conn, ticket, directives)
-                release_ticket_claim(conn, ticket_id, status="done")
+                release_ticket_claim(conn, ticket_id, WORKER_ID, status="done")
+            except ClaimLostError as exc:
+                # See the identical handling in the FORCE_CLOSE/CLOSE_REQUEST
+                # loop above — no decision, no release, CRITICAL log only.
+                conn.rollback()
+                logger.critical("Ticket %s: %s", ticket_id, exc)
+                log_system_event(conn, "CRITICAL", "execution_engine", str(exc), {"ticket_id": ticket_id})
             except Exception as exc:
                 logger.error("Unhandled error on ticket %s: %s", ticket_id, exc)
-                release_ticket_claim(conn, ticket_id, status="failed")
+                release_ticket_claim(conn, ticket_id, WORKER_ID, status="failed")
                 try:
                     log_system_event(conn, "ERROR", "execution_engine",
                                      f"Unhandled error on ticket {ticket_id}: {exc}",
