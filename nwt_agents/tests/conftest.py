@@ -16,6 +16,7 @@ TEST_DSN = os.environ.get("NWT_TEST_DB_DSN")
 
 SCHEMA_SQL = """
 DROP TABLE IF EXISTS nwt_order_submissions;
+DROP TABLE IF EXISTS nwt_inflight_orders;
 DROP TABLE IF EXISTS nwt_strategy_genome;
 DROP TABLE IF EXISTS nwt_force_close_state;
 DROP TABLE IF EXISTS nwt_ticket_claims;
@@ -139,6 +140,21 @@ CREATE TABLE nwt_order_submissions (
     ticket_id UUID PRIMARY KEY REFERENCES nwt_tickets(ticket_id),
     client_order_id TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Mirrors db/migrate_2026_07_inflight_orders.sql
+CREATE TABLE nwt_inflight_orders (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    ticket_id UUID REFERENCES nwt_tickets(ticket_id),
+    alpaca_order_id TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    position_id UUID,
+    exit_reason TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ,
+    resolution TEXT
 );
 
 -- Mirrors db/schema.sql — needed by run_equity_position_monitor()'s

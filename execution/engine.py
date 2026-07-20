@@ -107,8 +107,8 @@ POLL_MAX = 10
 ET_TZ = ZoneInfo("America/New_York")
 
 # Identifies this process as a claim owner (nwt_ticket_claims.claimed_by).
-# Unique per run — crontab.txt has no overlap guard, so two engine.py
-# invocations can legitimately be alive at once; each gets its own id.
+# crontab.txt has no overlap guard, so two engine.py invocations can
+# legitimately be alive at once; each gets its own id.
 WORKER_ID = f"engine:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 # Aggregate same-direction notional cap (long vs short across all bots/tracks).
@@ -180,6 +180,33 @@ def alpaca_delete(path: str) -> dict:
     resp = requests.delete(url, headers=ALPACA_HEADERS, timeout=15)
     if not resp.ok:
         logger.error("Alpaca DELETE %s → %d: %s", path, resp.status_code, resp.text[:500])
+    resp.raise_for_status()
+    return resp.json()
+
+
+def market_is_open() -> bool:
+    """
+    Alpaca's own market clock. Fail-closed (False) if unreachable: placing a
+    market order into a closed market is exactly the failure mode that
+    produced the 2026-07-16 untracked-position incident — the order can't
+    fill inside the poll window, and a GTC order then fills at the open long
+    after the engine stopped watching it. Deferring a ticket costs one
+    5-minute cron cycle; an orphaned fill costs a no_trade_mode halt.
+    """
+    try:
+        clock = alpaca_get("/clock")
+        return bool(clock.get("is_open", False))
+    except Exception as exc:
+        logger.warning("Market clock fetch failed (%s) — treating market as CLOSED", exc)
+        return False
+
+
+def get_open_orders(symbol: str) -> list:
+    """Open (working) Alpaca orders for one symbol."""
+    url = f"{ALPACA_BASE_URL}/v2/orders"
+    resp = requests.get(url, headers=ALPACA_HEADERS,
+                        params={"status": "open", "symbols": symbol, "limit": 50},
+                        timeout=15)
     resp.raise_for_status()
     return resp.json()
 
@@ -317,6 +344,67 @@ def synchronous_risk_veto(conn, payload: dict) -> tuple:
     return False, ""
 
 
+# ---------------------------------------------------------------------------
+# Broker-side idempotency
+#
+# No claim/lease sequencing, and no amount of in-flight order tracking
+# after the fact, can fully close the window between "Alpaca accepted an
+# order" and "we durably recorded that anywhere" — a process can be killed
+# in that window however small application logic makes it. client_order_id
+# is the actual backstop: deterministic per ticket_id, so a resubmission
+# for the same ticket always carries the identical id and Alpaca itself
+# rejects a second order with an id it has already seen.
+# find_order_by_client_order_id lets a recovering worker check for and
+# reuse that original order instead of ever attempting a resubmission.
+# ---------------------------------------------------------------------------
+
+def client_order_id_for(ticket_id: str, prefix: str = "nwt") -> str:
+    """Deterministic, Alpaca-safe (<=48 char) client_order_id. Same
+    ticket_id always produces the same id — that determinism is the whole
+    mechanism; do not add any randomness or timestamp here."""
+    return f"{prefix}-{ticket_id}"[:48]
+
+
+def find_order_by_client_order_id(client_order_id: str) -> dict | None:
+    """
+    Check whether an order with this client_order_id already exists at the
+    broker. limit=100 recent orders (status=all) is checked client-side —
+    Alpaca's list endpoint is not guaranteed to support server-side
+    client_order_id filtering across all API versions, and 100 is generous
+    against the volume any single 5-minute engine.py cycle could plausibly
+    place. Returns None (not found, or the lookup itself failed) rather than
+    raising — a lookup failure must not block a legitimate first-time
+    submission; the broker's own duplicate-order rejection remains the
+    backstop if this check is ever wrong.
+    """
+    try:
+        orders = alpaca_get("/orders?status=all&limit=100&nested=true")
+    except Exception as exc:
+        logger.warning("find_order_by_client_order_id(%s): lookup failed, proceeding as not-found: %s",
+                       client_order_id, exc)
+        return None
+    for o in (orders if isinstance(orders, list) else []):
+        if o.get("client_order_id") == client_order_id:
+            return o
+    return None
+
+
+class ClaimLostError(Exception):
+    """
+    Raised when renew_ticket_claim() reports this worker no longer owns the
+    ticket it believed it exclusively held. By the time this fires, an
+    order may have ALREADY been submitted to the broker moments earlier —
+    writing a FAILED decision here would be actively wrong, telling the
+    rest of the system "nothing happened" when a real order might be
+    sitting at Alpaca. Every catch site must re-raise this untouched
+    (never let a local "poll failed" handler swallow it) so it reaches
+    main()'s per-ticket wrapper, which logs CRITICAL and deliberately
+    writes no decision (except FORCE_CLOSE, which writes an explicit
+    UNKNOWN decision — see record_force_close_unknown's docstring for why
+    that's a deliberate, narrower exception).
+    """
+
+
 def poll_order_until_filled(order_id: str) -> dict:
     for attempt in range(POLL_MAX):
         order = alpaca_get(f"/orders/{order_id}")
@@ -353,7 +441,8 @@ def fetch_pending_tickets(conn) -> list:
             WHERE t.to_agent = 'EXECUTION_ENGINE'
               AND t.type = 'TRADE_REQUEST'
               AND t.from_agent IN (
-                  'EU_EXECUTOR', 'AUS_EXECUTOR', 'CHINA_EXECUTOR', 'NWT_EXECUTION_AGENT'
+                  'US_EXECUTOR', 'EU_EXECUTOR', 'AUS_EXECUTOR', 'CHINA_EXECUTOR',
+                  'NWT_EXECUTION_AGENT'
               )
               AND NOT EXISTS (
                   SELECT 1 FROM nwt_ticket_decisions d
@@ -428,6 +517,195 @@ def upsert_heartbeat(conn) -> None:
 
 
 # ---------------------------------------------------------------------------
+# In-flight order tracking
+#
+# An order that has been submitted to Alpaca but has not reached a terminal
+# state is a liability the system still owns. The engine used to poll for
+# ~30s and then mark the ticket FAILED — while the order stayed live. Any
+# later fill created a position the ledger never heard about
+# (in_alpaca_not_ledger → no_trade_mode halt), and on the close path a
+# still-working close order caused every retry to 422. Every submitted
+# order is now recorded in nwt_inflight_orders until it terminates, and
+# resolve_inflight_orders() runs at the top of every engine cycle —
+# including under no_trade_mode, because resolving what we already own is
+# risk accounting, not new trading.
+# ---------------------------------------------------------------------------
+
+ORDER_TERMINAL_DEAD = ("canceled", "expired", "rejected", "replaced", "stopped")
+INFLIGHT_ENTRY_CANCEL_AFTER_HOURS = 24
+
+
+def record_inflight_order(conn, ticket_id: str, alpaca_order_id: str, kind: str,
+                          payload: dict, position_id: str = None,
+                          exit_reason: str = None) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_inflight_orders
+                (ticket_id, alpaca_order_id, kind, payload, position_id, exit_reason)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (alpaca_order_id) DO NOTHING
+            """,
+            (ticket_id, alpaca_order_id, kind, json.dumps(payload, default=str),
+             position_id, exit_reason),
+        )
+    conn.commit()
+
+
+def retire_inflight_order(conn, inflight_id: str, status: str, resolution: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE nwt_inflight_orders
+            SET status=%s, resolution=%s, resolved_at=NOW()
+            WHERE id=%s
+            """,
+            (status, resolution, inflight_id),
+        )
+    conn.commit()
+
+
+def has_pending_inflight_close(conn, position_id: str = None, symbol: str = None) -> bool:
+    """True if a close order for this position/symbol is already working."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM nwt_inflight_orders
+            WHERE status='pending' AND kind='close'
+              AND (position_id = %s OR payload->>'symbol' = %s)
+            """,
+            (position_id, symbol),
+        )
+        return cur.fetchone()[0] > 0
+
+
+def fetch_pending_inflight(conn) -> list:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM nwt_inflight_orders WHERE status='pending' ORDER BY created_at ASC"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def resolve_inflight_orders(conn) -> None:
+    """
+    Poll every pending in-flight order once. Fills produce the same ledger/
+    outcome writes an immediate fill would have; dead orders retire the row
+    with a FAILED ticket decision; entry orders still working after
+    INFLIGHT_ENTRY_CANCEL_AFTER_HOURS get a cancel request (the cancel drives
+    them terminal on a later cycle). Close orders are never auto-canceled —
+    a working close is still reducing risk.
+    """
+    for row in fetch_pending_inflight(conn):
+        inflight_id = str(row["id"])
+        order_id = row["alpaca_order_id"]
+        ticket_id = str(row["ticket_id"]) if row.get("ticket_id") else None
+        payload = row.get("payload") or {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+
+        try:
+            order = alpaca_get(f"/orders/{order_id}")
+        except Exception as exc:
+            logger.warning("In-flight %s: order %s poll failed: %s", inflight_id, order_id, exc)
+            continue
+
+        status = order.get("status", "")
+        filled_qty = float(order.get("filled_qty") or 0)
+        fill_price = order.get("filled_avg_price")
+        fill_price = float(fill_price) if fill_price else None
+        is_spread = bool(payload.get("legs"))
+
+        if status == "filled" or (status == "done_for_day" and filled_qty > 0):
+            try:
+                if row["kind"] == "entry":
+                    record_entry_fill(conn, ticket_id, payload, order, order_id,
+                                      note="resolved from in-flight")
+                else:
+                    _record_close_fill(conn, row, order, fill_price)
+                retire_inflight_order(conn, inflight_id, "resolved", "filled")
+                logger.info("In-flight %s (%s) RESOLVED filled: order=%s",
+                            inflight_id, row["kind"], order_id)
+            except Exception as exc:
+                logger.error("In-flight %s: fill recording failed: %s", inflight_id, exc)
+                log_system_event(conn, "ERROR", "execution_engine",
+                                 f"In-flight fill recording failed for order {order_id}: {exc}",
+                                 {"inflight_id": inflight_id, "ticket_id": ticket_id})
+            continue
+
+        if (status in ORDER_TERMINAL_DEAD or status == "done_for_day") and filled_qty > 0 and (fill_price or is_spread):
+            # Died with a partial fill — those shares/contracts are real.
+            try:
+                if row["kind"] == "entry":
+                    record_entry_fill(conn, ticket_id, payload, order, order_id,
+                                      note=f"partial fill, order {status} (in-flight)")
+                else:
+                    _record_close_fill(conn, row, order, fill_price)
+                retire_inflight_order(conn, inflight_id, "resolved", f"partial_{status}")
+                logger.warning("In-flight %s (%s) resolved with PARTIAL fill: order=%s status=%s",
+                               inflight_id, row["kind"], order_id, status)
+            except Exception as exc:
+                logger.error("In-flight %s: partial-fill recording failed: %s", inflight_id, exc)
+                log_system_event(conn, "ERROR", "execution_engine",
+                                 f"In-flight partial-fill recording failed for order {order_id}: {exc}",
+                                 {"inflight_id": inflight_id, "ticket_id": ticket_id})
+            continue
+
+        if status in ORDER_TERMINAL_DEAD or (status == "done_for_day" and filled_qty == 0):
+            reason = f"In-flight order {order_id} terminated without fill: status={status}"
+            retire_inflight_order(conn, inflight_id, "dead", status)
+            if ticket_id:
+                insert_decision(conn, ticket_id, "FAILED", reason)
+            log_system_event(conn, "WARNING", "execution_engine", reason,
+                             {"inflight_id": inflight_id, "ticket_id": ticket_id})
+            logger.warning(reason)
+            continue
+
+        # Still working. Entries that have been live too long get canceled —
+        # a signal sized against yesterday's prices must not fill tomorrow.
+        age_hours = (datetime.now(timezone.utc) - row["created_at"]).total_seconds() / 3600
+        if row["kind"] == "entry" and age_hours > INFLIGHT_ENTRY_CANCEL_AFTER_HOURS:
+            try:
+                url = f"{ALPACA_BASE_URL}/v2/orders/{order_id}"
+                resp = requests.delete(url, headers=ALPACA_HEADERS, timeout=15)
+                if resp.status_code in (200, 204):
+                    logger.info("In-flight %s: cancel requested for stale entry order %s",
+                                inflight_id, order_id)
+                # keep row pending: the cancel resolves it terminally next cycle
+            except Exception as exc:
+                logger.warning("In-flight %s: cancel request failed: %s", inflight_id, exc)
+
+
+def _record_close_fill(conn, inflight_row: dict, order: dict, fill_price: float) -> None:
+    """A tracked close order filled — close the ledger row + write the outcome."""
+    payload = inflight_row.get("payload") or {}
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    position_id = str(inflight_row.get("position_id") or "")
+    exit_reason = inflight_row.get("exit_reason") or "hard_close"
+    ticket_id = str(inflight_row["ticket_id"]) if inflight_row.get("ticket_id") else None
+    asset_type = payload.get("asset_type", "option")
+    symbol = payload.get("symbol", "")
+
+    if fill_price is None or fill_price <= 0:
+        raise RuntimeError(f"close order {order.get('id')} filled without a fill price")
+
+    if position_id:
+        pos = get_ledger_position(conn, position_id)
+        if pos and pos.get("status") != "closed":
+            closed_qty = float(order.get("filled_qty") or pos.get("qty") or 0)
+            apply_close_fill(conn, pos, closed_qty, fill_price, 0.0, exit_reason,
+                             payload.get("strategy_id"))
+    if ticket_id:
+        insert_decision(conn, ticket_id, "EXECUTED",
+                        f"Closed {symbol} at {fill_price:.4f} reason={exit_reason} "
+                        f"(resolved from in-flight)")
+    log_system_event(conn, "INFO", "execution_engine",
+                     f"In-flight close resolved: {symbol} at {fill_price:.4f}",
+                     {"position_id": position_id, "exit_reason": exit_reason})
+
+
+# ---------------------------------------------------------------------------
 # Directional cap
 # ---------------------------------------------------------------------------
 
@@ -461,54 +739,6 @@ def check_directional_cap(conn, direction: str, incoming_notional: float) -> tup
 
 def compute_qty_from_notional(sized_notional: float, price: float) -> int:
     return max(int(sized_notional / price), 1)
-
-
-# ---------------------------------------------------------------------------
-# Broker-side idempotency
-#
-# No claim/lease sequencing on our side can fully close the window between
-# "Alpaca accepted an order" and "we durably recorded that anywhere" — a
-# process can be killed (OOM, VM restart, cron timeout) at any point in that
-# window, however small application-level logic makes it, and on recovery
-# fetch_pending_tickets would select the same undecided ticket again,
-# resubmitting the same order for real. client_order_id is the actual
-# backstop: it is derived deterministically from the ticket_id, so a
-# resubmission for the same ticket always carries the identical id, and
-# Alpaca itself rejects a second order with a client_order_id it has already
-# seen. find_order_by_client_order_id lets a recovering worker check for
-# and reuse that original order instead of ever attempting a resubmission
-# in the first place.
-# ---------------------------------------------------------------------------
-
-def client_order_id_for(ticket_id: str, prefix: str = "nwt") -> str:
-    """Deterministic, Alpaca-safe (<=48 char) client_order_id. Same
-    ticket_id always produces the same id — that determinism is the whole
-    mechanism; do not add any randomness or timestamp here."""
-    return f"{prefix}-{ticket_id}"[:48]
-
-
-def find_order_by_client_order_id(client_order_id: str) -> dict | None:
-    """
-    Check whether an order with this client_order_id already exists at the
-    broker. limit=100 recent orders (status=all) is checked client-side —
-    Alpaca's list endpoint is not guaranteed to support server-side
-    client_order_id filtering across all API versions, and 100 is generous
-    against the volume any single 5-minute engine.py cycle could plausibly
-    place. Returns None (not found, or the lookup itself failed) rather than
-    raising — a lookup failure must not block a legitimate first-time
-    submission; the broker's own duplicate-order rejection remains the
-    backstop if this check is ever wrong.
-    """
-    try:
-        orders = alpaca_get("/orders?status=all&limit=100&nested=true")
-    except Exception as exc:
-        logger.warning("find_order_by_client_order_id(%s): lookup failed, proceeding as not-found: %s",
-                       client_order_id, exc)
-        return None
-    for o in (orders if isinstance(orders, list) else []):
-        if o.get("client_order_id") == client_order_id:
-            return o
-    return None
 
 
 def place_equity_order(payload: dict, client_order_id: str) -> dict:
@@ -630,7 +860,11 @@ def write_trade_outcome(conn, position: dict, fill_price: float,
     """Write a completed nwt_trade_outcomes row. Called on options position close."""
     entry_price = float(position.get("entry_price") or 0)
     notional = float(position.get("notional_risk") or 0)
-    qty = max(int(round(notional / (entry_price * 100))) if entry_price > 0 else 1, 1)
+    ledger_qty = position.get("qty")
+    if ledger_qty:
+        qty = max(int(float(ledger_qty)), 1)
+    else:
+        qty = max(int(round(notional / (entry_price * 100))) if entry_price > 0 else 1, 1)
 
     pnl = (fill_price - entry_price) * qty * 100
     if position.get("direction") == "short":
@@ -669,6 +903,64 @@ def write_trade_outcome(conn, position: dict, fill_price: float,
     conn.commit()
 
 
+def apply_close_fill(conn, pos: dict, filled_qty: float, fill_price: float,
+                     slippage: float, exit_reason: str, strategy_id: str = None,
+                     exit_bid: float = None, exit_ask: float = None) -> bool:
+    """
+    Close a ledger position against the qty the close order ACTUALLY filled —
+    never against what the ticket asked for. A close that fills fewer
+    contracts than the row holds shrinks the row (qty and notional_risk
+    scaled down, outcome written for the sold portion only) and leaves it
+    open; marking it fully closed while contracts remain at Alpaca is how
+    3 unsold AAPL contracts rode into expiry with a flat ledger.
+    Returns True if the row was fully closed.
+    """
+    position_id = str(pos["position_id"])
+    row_qty = float(pos.get("qty") or 0)
+
+    if row_qty > 0 and filled_qty > 0 and filled_qty < row_qty - 1e-9:
+        fraction = filled_qty / row_qty
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nwt_portfolio_ledger
+                SET qty = qty - %s, notional_risk = notional_risk * (1 - %s)
+                WHERE position_id = %s
+                """,
+                (filled_qty, fraction, position_id),
+            )
+        conn.commit()
+        if pos.get("asset_type") == "option":
+            part = dict(pos)
+            part["qty"] = filled_qty
+            part["notional_risk"] = float(pos.get("notional_risk") or 0) * fraction
+            write_trade_outcome(conn, part, fill_price, exit_reason, strategy_id)
+        log_system_event(conn, "WARNING", "execution_engine",
+                         f"PARTIAL close: {pos.get('asset')} filled {filled_qty:g} of "
+                         f"{row_qty:g} — row stays open with the remainder",
+                         {"position_id": position_id, "filled_qty": filled_qty,
+                          "row_qty": row_qty, "exit_reason": exit_reason})
+        logger.warning("PARTIAL close %s: %g/%g filled — remainder stays open",
+                       pos.get("asset"), filled_qty, row_qty)
+        return False
+
+    actually_closed = close_position(conn, position_id, fill_price, slippage, exit_reason,
+                                     exit_bid=exit_bid, exit_ask=exit_ask)
+    if not actually_closed:
+        # close_position() is idempotent (WHERE status='open') — this
+        # position was already closed by a different, racing attempt (e.g.
+        # a second FORCE_CLOSE/CLOSE_REQUEST ticket for the same position).
+        # write_trade_outcome() must NOT run again here: a second call
+        # would write a duplicate outcome row for a close that already has
+        # one, corrupting PnL/attribution for this trade.
+        logger.warning("apply_close_fill: position %s was already closed by another attempt — "
+                       "not writing a duplicate trade outcome", position_id)
+        return True
+    if pos.get("asset_type") == "option":
+        write_trade_outcome(conn, pos, fill_price, exit_reason, strategy_id)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Position monitor (equity multi-day exits)
 # ---------------------------------------------------------------------------
@@ -679,13 +971,13 @@ def run_equity_position_monitor(conn) -> None:
 
     This function (and everything it calls) must NEVER place a broker
     order directly — it only creates CLOSE_REQUEST tickets via
-    _emit_equity_close_request(). The actual close (claim, client_order_id,
-    broker call, ledger update) happens later in this same main() run via
-    the normal fetch_force_close_tickets() -> process_close_ticket()
-    pipeline, exactly like options exits. This used to call the broker
-    directly (_close_equity_position, now removed) with no nwt_tickets row,
-    no claim, and no execution decision — the weakest-audited, least
-    crash-safe path in the system.
+    _emit_equity_close_request(). The actual close (dedup, claim,
+    client_order_id, in-flight tracking, partial-fill handling, broker
+    call, ledger update) happens later in this same main() run via the
+    normal fetch_force_close_tickets() -> process_close_ticket() pipeline,
+    exactly like options exits — a direct-broker-call equity close path
+    used to exist here with no nwt_tickets row, no claim, and no execution
+    decision, the weakest-audited path in the system.
     """
     positions = get_open_positions(conn)
     equity_positions = [p for p in positions if p.get("asset_type") == "equity"
@@ -749,12 +1041,11 @@ def run_equity_position_monitor(conn) -> None:
             except Exception:
                 # A failed query here leaves the connection's transaction
                 # aborted until rolled back — every subsequent query on
-                # this same conn (including has_pending_close_ticket/
-                # insert_ticket for THIS position, and every other
-                # position later in this same loop) would otherwise fail
-                # with "current transaction is aborted" even though this
-                # specific failure is meant to be non-fatal (falls back to
-                # the hardcoded stop_pct/target_pct defaults above).
+                # this same conn (has_pending_close_ticket/insert_ticket for
+                # THIS position, and every other position later in this
+                # same loop) would otherwise fail with "current transaction
+                # is aborted" even though this specific failure is meant to
+                # be non-fatal (falls back to the hardcoded defaults above).
                 conn.rollback()
 
         # exit_reason values are unchanged from before this refactor — 'stop',
@@ -782,13 +1073,16 @@ def _emit_equity_close_request(conn, pos: dict, position_id: str, symbol: str,
                                notional: float, entry_price: float, exit_reason: str) -> None:
     """
     Create a CLOSE_REQUEST ticket for an equity exit — this is the ONLY
-    thing this function is allowed to do. process_close_ticket() (claim,
-    client_order_id, broker call, ledger update) owns everything
-    downstream, identical to how options exits already work. qty is
-    computed here (from notional/entry_price) since equity closes have no
-    separate contract-price lookup the way options do.
+    thing this function is allowed to do. process_close_ticket() (dedup,
+    claim, client_order_id, in-flight tracking, partial-fill handling,
+    broker call, ledger update) owns everything downstream, identical to
+    how options exits already work. qty prefers the ledger row's real
+    filled qty over a notional/entry_price recomputation — the same fix
+    that keeps process_close_ticket from under-selling a position whose
+    entry qty was rounded.
     """
-    qty = compute_qty_from_notional(notional, entry_price)
+    ledger_qty = pos.get("qty")
+    qty = int(float(ledger_qty)) if ledger_qty else compute_qty_from_notional(notional, entry_price)
     try:
         ticket_id = insert_ticket(
             conn,
@@ -816,20 +1110,6 @@ def _emit_equity_close_request(conn, pos: dict, position_id: str, symbol: str,
         logger.error("Failed to create CLOSE_REQUEST for equity position %s: %s", position_id, exc)
 
 
-class ClaimLostError(Exception):
-    """
-    Raised when renew_ticket_claim() reports this worker no longer owns the
-    ticket it believed it exclusively held. By the time this fires the
-    order may have ALREADY been submitted to the broker moments earlier —
-    writing a FAILED decision here would be actively wrong if the
-    submission actually succeeded, telling the rest of the system "nothing
-    happened" when a real order might be sitting at Alpaca. Every catch
-    site must re-raise this untouched (never let the local "poll failed"
-    handler swallow it) so it reaches main()'s per-ticket wrapper, which
-    logs CRITICAL and deliberately writes no decision.
-    """
-
-
 # ---------------------------------------------------------------------------
 # FORCE_CLOSE / CLOSE_REQUEST processing
 # ---------------------------------------------------------------------------
@@ -851,14 +1131,37 @@ def process_close_ticket(conn, ticket: dict) -> None:
     qty = int(payload.get("qty", 1))
 
     pos_direction = payload.get("direction", "long")
-    if position_id:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT direction FROM nwt_portfolio_ledger WHERE position_id = %s",
-                        (position_id,))
-            row = cur.fetchone()
-        if row and row.get("direction"):
-            pos_direction = row["direction"]
+    ledger_pos = get_ledger_position(conn, position_id) if position_id else None
+    if ledger_pos:
+        if ledger_pos.get("direction"):
+            pos_direction = ledger_pos["direction"]
+        # The order qty must be the ledger row's REAL fill qty, not whatever
+        # the ticket carried — a notional-derived ticket qty under-sold the
+        # AAPL260717 close (3 of 6 contracts) and the rest rode into expiry.
+        if ledger_pos.get("qty"):
+            qty = max(int(float(ledger_pos["qty"])), 1)
     close_side = "buy" if pos_direction == "short" else "sell"
+
+    # Never stack a second close order on top of a working one — the retry
+    # 422s ("insufficient qty available") because the first order is already
+    # holding the position's qty. Check both our own in-flight ledger and
+    # Alpaca's open orders (covers orders placed before in-flight tracking
+    # existed, or by a human).
+    if has_pending_inflight_close(conn, position_id, symbol):
+        insert_decision(conn, ticket_id, "SKIPPED",
+                        f"Close already in flight for {symbol} — resolver owns it")
+        return
+    try:
+        if any(o for o in get_open_orders(symbol) if o.get("side") == close_side):
+            insert_decision(conn, ticket_id, "SKIPPED",
+                            f"An open {close_side} order already exists at Alpaca for {symbol} "
+                            f"— not stacking a second close")
+            log_system_event(conn, "WARNING", "execution_engine",
+                             f"Close skipped — untracked open {close_side} order exists for {symbol}",
+                             {"ticket_id": ticket_id, "position_id": position_id})
+            return
+    except Exception as exc:
+        logger.warning("Open-order check failed for %s (%s) — proceeding with close", symbol, exc)
 
     client_order_id = client_order_id_for(ticket_id, prefix="nwt-close")
     record_client_order_id(conn, ticket_id, client_order_id)  # submission begins now
@@ -872,42 +1175,47 @@ def process_close_ticket(conn, ticket: dict) -> None:
 
     try:
         order = existing_order or place_close_order(symbol, qty, asset_type, client_order_id, side=close_side)
-        # Fresh lease before the poll loop — poll_order_until_filled's own
-        # worst case (POLL_MAX x (POLL_INTERVAL + timeout) = 180s) can equal
-        # or exceed the base claim lease; renewing here means a legitimately
-        # slow fill doesn't lose the claim to an overlapping worker mid-poll.
-        # The return value MUST be checked — see ClaimLostError's docstring:
-        # renewing is worthless as a safety mechanism if a False result is
-        # ignored, since the order above may have already reached the broker.
+        # The order above is real at the broker now — see the identical
+        # note in process_ticket for why the claim MUST be renewed and
+        # checked here, before polling.
         if not renew_ticket_claim(conn, ticket_id, WORKER_ID):
             raise ClaimLostError(
-                f"Lost claim ownership for ticket {ticket_id} after order submission — "
-                f"another worker may already be processing it"
+                f"Lost claim ownership for ticket {ticket_id} after close order was already "
+                f"submitted — another worker may already be processing it"
             )
         filled = poll_order_until_filled(order["id"])
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
 
-        if fill_status != "filled" or fill_price <= 0:
+        if fill_status in ORDER_TERMINAL_DEAD and fill_price <= 0:
             insert_decision(conn, ticket_id, "FAILED",
-                            f"Close order not filled — status={fill_status}")
+                            f"Close order died unfilled — status={fill_status}")
             return
 
-        slippage = 0.0
-        if position_id:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM nwt_portfolio_ledger WHERE position_id = %s",
-                            (position_id,))
-                pos = cur.fetchone()
-            if pos:
-                pos = dict(pos)
-                close_position(conn, position_id, fill_price, slippage, exit_reason)
-                if asset_type == "option":
-                    write_trade_outcome(conn, pos, fill_price, exit_reason,
-                                        payload.get("strategy_id"))
+        if fill_status != "filled" or fill_price <= 0:
+            # Order still working — the position is NOT closed yet, but the
+            # order is live. Hand it to the in-flight resolver instead of
+            # declaring failure and re-closing into a 422 next cycle.
+            record_inflight_order(
+                conn, ticket_id, order["id"], "close",
+                {"symbol": symbol, "asset_type": asset_type, "qty": qty,
+                 "strategy_id": payload.get("strategy_id")},
+                position_id=position_id, exit_reason=exit_reason,
+            )
+            insert_decision(conn, ticket_id, "SUBMITTED",
+                            f"Close order {order['id']} still working (status={fill_status}) "
+                            f"— recorded in-flight")
+            return
+
+        fully_closed = True
+        if ledger_pos:
+            closed_qty = float(filled.get("filled_qty") or qty)
+            fully_closed = apply_close_fill(conn, ledger_pos, closed_qty, fill_price,
+                                            0.0, exit_reason, payload.get("strategy_id"))
 
         insert_decision(conn, ticket_id, "EXECUTED",
-                        f"Closed {symbol} at {fill_price:.4f} reason={exit_reason}")
+                        f"Closed {symbol} at {fill_price:.4f} reason={exit_reason}"
+                        + ("" if fully_closed else " (PARTIAL — remainder stays open)"))
         log_system_event(conn, "INFO", "execution_engine",
                          f"Close executed: {symbol} at {fill_price:.4f}",
                          {"ticket_id": ticket_id, "exit_reason": exit_reason,
@@ -923,36 +1231,22 @@ def process_close_ticket(conn, ticket: dict) -> None:
 
 def _classify_force_close_failure(asset: str, asset_type: str, exc: Exception) -> tuple:
     """
-    Decide whether a failed close attempt is terminal (never going to
+    Decide whether a failed DELETE attempt is terminal (never going to
     succeed, stop retrying) or retryable (transient, try again later).
-
-    status_code == 404       -> not a failure at all: the broker has no such
-                                 position, i.e. it's already closed. Caller
-                                 treats this as SUCCESS, not a failure.
-    option past its own expiry -> terminal. An expired option has no market
-                                 left to submit a closing order against
-                                 (confirmed by tracing a live 422 response
-                                 against SPY260720C00753000 on an
-                                 already-expired, $0 contract) — Alpaca/OCC
-                                 auto-settles it; a manual close order will
-                                 never succeed, retrying forever gains nothing.
-    everything else           -> retryable (network blips, 403s that clear
-                                 up, a prior in-flight order still working,
-                                 etc.) — bounded by schedule_force_close_attempt's
-                                 backoff/max-attempts, not decided here.
-
+    status_code == 404 -> not a failure at all: the broker has no such
+    position, i.e. it's already closed. An expired option has no market
+    left to submit a closing order against — terminal. Everything else
+    (network blips, 403s that clear up, market-hours rejections) is
+    retryable, bounded by schedule_force_close_attempt's backoff.
     Returns (already_closed: bool, terminal: bool, reason: str).
     """
     status_code = getattr(getattr(exc, "response", None), "status_code", None)
-
     if status_code == 404:
         return True, False, "Alpaca reports no such position — already closed"
-
     if asset_type == "option":
         dte = _option_dte(asset)
         if dte is not None and dte < 0:
             return False, True, f"Option expired {abs(dte)}d ago — awaiting broker auto-settlement"
-
     return False, False, str(exc)
 
 
@@ -961,20 +1255,17 @@ def reconcile_unknown_force_close(conn, position_id: str, asset: str) -> str | N
     If this position's force-close state is UNKNOWN (a prior attempt's
     worker lost its claim after the liquidation DELETE may have already
     reached the broker, so record_force_close_outcome() was never called),
-    resolve it now by querying live broker state:
+    resolve it now by querying live broker state before doing anything
+    else:
       - no position at the broker (404)   -> the earlier attempt DID
         succeed. Close the ledger row if it isn't already, mark SUCCESS.
       - position still open at the broker -> the earlier attempt did NOT
         succeed. Mark FAILED_RETRYABLE so the normal backoff/escalation
-        machinery in schedule_force_close_attempt picks it back up exactly
-        like any other retryable failure — no separate retry path needed.
+        machinery in schedule_force_close_attempt picks it back up.
       - broker query itself fails (network blip, 5xx) -> leave UNKNOWN in
-        place rather than guessing; a transient lookup failure must not be
-        treated as either outcome.
-
-    Returns 'SUCCESS' or 'FAILED_RETRYABLE' if it resolved something,
-    None if there was nothing to reconcile (state wasn't UNKNOWN) or the
-    broker query itself failed.
+        place rather than guessing.
+    Returns 'SUCCESS' or 'FAILED_RETRYABLE' if it resolved something, None
+    if there was nothing to reconcile or the broker query itself failed.
     """
     state = get_force_close_state(conn, position_id)
     if not state or state.get("state") != "UNKNOWN":
@@ -1014,11 +1305,11 @@ def process_force_close(conn, ticket: dict) -> None:
     Uses Alpaca's close-position endpoint (whole position), polls the fill,
     and closes the ledger row with exit price + exit NBBO.
 
-    Every outcome (success, terminal failure, retryable failure) is recorded
-    via record_force_close_outcome() against nwt_force_close_state — this is
-    the half of the force-close state machine that classifies what actually
-    happened; risk_agent.py's schedule_force_close_attempt() owns whether/when
-    to retry based on what gets recorded here.
+    Every outcome is recorded against nwt_force_close_state
+    (record_force_close_outcome / record_force_close_unknown) — the half
+    of the force-close state machine that classifies what actually
+    happened; risk_agent.py's schedule_force_close_attempt() owns
+    whether/when to retry based on what gets recorded here.
     """
     ticket_id = str(ticket["ticket_id"])
     payload = ticket.get("payload") or {}
@@ -1036,8 +1327,7 @@ def process_force_close(conn, ticket: dict) -> None:
     # Reconcile a prior UNKNOWN outcome (a previous attempt's worker lost
     # its claim after the broker DELETE may have already succeeded, so
     # nothing was ever recorded) BEFORE doing anything else — otherwise
-    # this attempt would blindly retry on top of an outcome nobody actually
-    # knows, risking a second real liquidation if the first one worked.
+    # this attempt would blindly retry on top of an outcome nobody knows.
     resolved_asset = position.get("asset") or asset
     reconciled = reconcile_unknown_force_close(conn, position_id, resolved_asset)
     if reconciled == "SUCCESS":
@@ -1051,9 +1341,8 @@ def process_force_close(conn, ticket: dict) -> None:
                         f"{resolved_asset} still open, marked for retry")
         return
     # reconciled is None: either state wasn't UNKNOWN (normal case), or the
-    # broker query itself failed transiently — in the latter case leave
-    # UNKNOWN in place and fall through to a normal attempt below rather
-    # than blocking forever on a flaky reconciliation check.
+    # broker query itself failed transiently — fall through to a normal
+    # attempt rather than blocking forever on a flaky reconciliation check.
 
     if position.get("status") == "closed":
         reason = f"FORCE_CLOSE: position {position_id} already closed"
@@ -1066,16 +1355,31 @@ def process_force_close(conn, ticket: dict) -> None:
     asset = position.get("asset") or asset
     asset_type = position.get("asset_type", "option")
 
+    # A close for this position may already be working — don't stack another
+    # liquidation on top (the retry 422s while the first order holds the qty).
+    if has_pending_inflight_close(conn, position_id, asset):
+        insert_decision(conn, ticket_id, "SKIPPED",
+                        f"FORCE_CLOSE: close already in flight for {asset} — resolver owns it")
+        return
+    try:
+        pos_side = "buy" if position.get("direction") == "short" else "sell"
+        if any(o for o in get_open_orders(asset) if o.get("side") == pos_side):
+            insert_decision(conn, ticket_id, "SKIPPED",
+                            f"FORCE_CLOSE: an open {pos_side} order already exists at Alpaca "
+                            f"for {asset} — not stacking a second close")
+            log_system_event(conn, "WARNING", "execution_engine",
+                             f"FORCE_CLOSE skipped — untracked open {pos_side} order exists for {asset}",
+                             {"ticket_id": ticket_id, "position_id": position_id})
+            return
+    except Exception as exc:
+        logger.warning("Open-order check failed for %s (%s) — proceeding with liquidation", asset, exc)
+
     # Pre-flight state check: DELETE /positions/{symbol} has no
     # client-supplied idempotency key (unlike the raw POST /orders endpoint
-    # used everywhere else), so it cannot be made fully idempotent the same
-    # way. Checking live broker state FIRST at least means a crash-and-retry
-    # against an already-closed position never even attempts the DELETE
-    # call, narrowing (though — see this function's residual-risk note in
-    # the deployment audit — not fully eliminating, since a position whose
-    # closing order is still in flight from a prior crashed attempt can
-    # still show as "open" here) the window where a second real closing
-    # order could be placed.
+    # used everywhere else in this file), so it cannot be made fully
+    # idempotent the same way. Checking live broker state FIRST at least
+    # means a crash-and-retry against an already-closed position never
+    # even attempts the DELETE call.
     try:
         alpaca_get(f"/positions/{asset}")
     except Exception as exc:
@@ -1087,8 +1391,8 @@ def process_force_close(conn, ticket: dict) -> None:
             record_force_close_outcome(conn, position_id, success=True)
             logger.info("Ticket %s: pre-flight check found %s already closed — skipped DELETE", ticket_id, asset)
             return
-        # Any other pre-flight failure (network blip, 5xx) — fall through to
-        # the real attempt below and let its own classification handle it.
+        # Any other pre-flight failure (network blip, 5xx) — fall through
+        # to the real attempt below and let its own classification handle it.
 
     exit_bid, exit_ask = get_latest_quote(asset, asset_type)
     expected_price = (exit_bid + exit_ask) / 2.0 if (exit_bid and exit_ask) else None
@@ -1099,10 +1403,6 @@ def process_force_close(conn, ticket: dict) -> None:
         already_closed, terminal, class_reason = _classify_force_close_failure(asset, asset_type, exc)
 
         if already_closed:
-            # Broker has no record of this position — nothing left to close.
-            # Ledger doesn't know the real exit price (no fill happened
-            # here), so mark it closed at 0 slippage against last known
-            # quote mid rather than guessing an exit price.
             fallback_price = expected_price or 0.0
             close_position(conn, position_id, fallback_price, 0.0, "already_closed_at_broker",
                            exit_bid=exit_bid, exit_ask=exit_ask)
@@ -1122,25 +1422,19 @@ def process_force_close(conn, ticket: dict) -> None:
 
     alpaca_order_id = order.get("id", "")
     try:
-        # See the identical note in process_close_ticket — renew before the
-        # poll loop's own ~180s worst case. Return value MUST be checked:
-        # the liquidation DELETE above has already reached the broker for
-        # real by this point, so if we've lost the claim, marking this
-        # FAILED (as the except below would) is actively wrong — it would
-        # tell the state machine to retry a position that may already be
-        # closing, risking a second real liquidation attempt. Record
-        # UNKNOWN instead — reconcile_unknown_force_close() resolves it
-        # against live broker state on the next attempt.
+        # Return value MUST be checked: the liquidation DELETE above has
+        # already reached the broker for real by this point, so if we've
+        # lost the claim, marking this FAILED would be actively wrong —
+        # record UNKNOWN instead. reconcile_unknown_force_close() resolves
+        # it against live broker state on the next attempt.
         if not renew_ticket_claim(conn, ticket_id, WORKER_ID):
             record_force_close_unknown(conn, position_id, asset, ticket_id, WORKER_ID)
-            # An UNKNOWN decision (not a silence, unlike Path 1/2's
+            # An UNKNOWN decision (not silence, unlike Path 1/2's
             # ClaimLostError handling) is written for THIS ticket so
             # has_pending_force_close_ticket() no longer sees it as
             # outstanding — otherwise risk_agent.py could never schedule
-            # another attempt for this position, and reconciliation would
-            # never get a ticket to run against. This is safe specifically
-            # because FORCE_CLOSE has a reconciliation mechanism to resolve
-            # the ambiguity later; Paths 1/2 don't, so they stay silent.
+            # another attempt, and reconciliation would never get a
+            # ticket to run against.
             insert_decision(conn, ticket_id,
                             "UNKNOWN", "Claim lost after liquidation order was already submitted")
             raise ClaimLostError(
@@ -1162,14 +1456,31 @@ def process_force_close(conn, ticket: dict) -> None:
     fill_price_str = filled_order.get("filled_avg_price")
     fill_price = float(fill_price_str) if fill_price_str else None
     if fill_price is None:
-        reason = f"FORCE_CLOSE: no fill price — status={filled_order.get('status')}"
+        status = filled_order.get("status", "")
+        if alpaca_order_id and status not in ORDER_TERMINAL_DEAD:
+            # Liquidation order is live but hasn't filled inside the poll
+            # window — hand it to the in-flight resolver rather than
+            # declaring failure while the order still works the position.
+            record_inflight_order(
+                conn, ticket_id, alpaca_order_id, "close",
+                {"symbol": asset, "asset_type": asset_type,
+                 "strategy_id": payload.get("strategy_id")},
+                position_id=position_id, exit_reason="hard_close",
+            )
+            reason = (f"FORCE_CLOSE: order {alpaca_order_id} still working "
+                      f"(status={status}) — recorded in-flight")
+            insert_decision(conn, ticket_id, "SUBMITTED", reason)
+            log_system_event(conn, "INFO", "execution_engine", reason,
+                             {"ticket_id": ticket_id, "position_id": position_id})
+            return
+        reason = f"FORCE_CLOSE: no fill price — status={status}"
         logger.warning("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "FAILED", reason)
         log_system_event(conn, "WARNING", "execution_engine", reason, {
             "ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id,
         })
         record_force_close_outcome(conn, position_id, success=False,
-                                   error=f"no fill price, status={filled_order.get('status')}")
+                                   error=f"no fill price, status={status}")
         return
 
     slippage = abs(fill_price - expected_price) / expected_price if expected_price and expected_price > 0 else 0.0
@@ -1178,12 +1489,10 @@ def process_force_close(conn, ticket: dict) -> None:
     record_force_close_outcome(conn, position_id, success=True)
 
     if not actually_closed:
-        # A real order filled at the broker just now, but the ledger row was
-        # already 'closed' — a second FORCE_CLOSE ticket for the same
-        # position beat this one to it (see risk_agent.py's
-        # has_pending_force_close_ticket for the primary fix). This is a
-        # genuine double-execution at the broker, not just a ledger race —
-        # worth its own log line, distinct from "no-op, nothing to do".
+        # A real order filled at the broker just now, but the ledger row
+        # was already 'closed' — a second FORCE_CLOSE ticket for the same
+        # position beat this one to it. Genuine double-execution at the
+        # broker, not just a ledger race — worth its own log line.
         reasoning = (
             f"FORCE_CLOSE order filled at {fill_price:.4f} but ledger position "
             f"{position_id} was already closed by another attempt — exit data NOT "
@@ -1278,6 +1587,89 @@ def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
     return spread_group_id
 
 
+def record_entry_fill(conn, ticket_id: str, payload: dict, filled_order: dict,
+                      alpaca_order_id: str, expected_price: float = None,
+                      entry_bid: float = None, entry_ask: float = None,
+                      note: str = "") -> None:
+    """
+    A filled entry order becomes ledger row(s) + an EXECUTED decision.
+    Shared by the immediate-fill path (process_ticket) and the in-flight
+    resolver — the ledger write must be identical regardless of when the
+    fill was observed.
+    """
+    asset_type = payload["asset_type"]
+    symbol = payload["symbol"]
+    legs = payload.get("legs") or []
+    direction = payload.get("direction", "long")
+    sized_notional = float(payload.get("sized_notional", 0))
+
+    if asset_type == "option" and legs:
+        insert_spread_ledger_rows(conn, ticket_id, payload, filled_order, alpaca_order_id)
+        return
+
+    fill_price_str = filled_order.get("filled_avg_price")
+    fill_price = float(fill_price_str) if fill_price_str else None
+    if fill_price is None or fill_price <= 0:
+        raise RuntimeError(f"order {alpaca_order_id} filled without a fill price")
+
+    filled_qty_str = filled_order.get("filled_qty")
+    filled_qty = float(filled_qty_str) if filled_qty_str else float(payload.get("qty", 1))
+
+    instrument = payload.get("option_symbol", symbol) if asset_type == "option" else symbol
+    if entry_bid is None and entry_ask is None:
+        entry_bid, entry_ask = get_latest_quote(instrument, asset_type)
+
+    slippage = (abs(fill_price - expected_price) / expected_price
+                if expected_price and expected_price > 0 else 0.0)
+
+    if asset_type == "option":
+        # Single-leg options are always bought (long premium) — engine.py's
+        # place_options_order never sells outside a multi-leg order. The
+        # ledger direction is the INSTRUMENT direction (drives close side
+        # and PnL sign), not the market thesis: a long put is a bearish
+        # position we nonetheless own, and sell to close. delta_exposure
+        # carries the thesis sign via option_type instead.
+        ledger_direction = "long"
+        base_delta = 0.5 if payload.get("option_type", "call") == "call" else -0.5
+        delta_exposure = payload.get("delta_exposure", base_delta)
+    else:
+        ledger_direction = direction
+        delta_exposure = 1.0 if direction == "long" else -1.0
+
+    ledger_data = {
+        "bot_source": payload["bot_source"],
+        "strategy_id": payload.get("strategy_id"),
+        "asset": instrument,
+        "asset_type": asset_type,
+        "direction": ledger_direction,
+        "delta_exposure": delta_exposure,
+        "notional_risk": sized_notional,
+        "qty": filled_qty,
+        "entry_price": fill_price,
+        "entry_time": datetime.now(timezone.utc),
+        "entry_bid": entry_bid,
+        "entry_ask": entry_ask,
+        "alpaca_order_id": alpaca_order_id,
+        "stop_pct": payload.get("stop_pct"),
+        "target_pct": payload.get("target_pct"),
+    }
+
+    position_id = insert_position(conn, ledger_data)
+
+    reasoning = (f"Filled at {fill_price:.4f}, slippage={slippage:.4f}, "
+                 f"position_id={position_id}, alpaca_order_id={alpaca_order_id}")
+    if note:
+        reasoning += f" ({note})"
+    insert_decision(conn, ticket_id, "EXECUTED", reasoning)
+    log_system_event(conn, "INFO", "execution_engine",
+                     f"Executed {symbol} ({asset_type}) — {direction}",
+                     {"ticket_id": ticket_id, "position_id": position_id,
+                      "fill_price": fill_price, "slippage": slippage,
+                      "strategy_id": payload.get("strategy_id")})
+    logger.info("Ticket %s EXECUTED: position_id=%s fill=%.4f slippage=%.4f",
+                ticket_id, position_id, fill_price, slippage)
+
+
 def process_ticket(conn, ticket: dict, directives: dict) -> None:
     ticket_id = str(ticket["ticket_id"])
     payload = ticket.get("payload") or {}
@@ -1328,9 +1720,10 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     existing_order = find_order_by_client_order_id(client_order_id)
     if existing_order:
         # A process crash between "Alpaca accepted this order" and "we
-        # recorded that anywhere" is the one class of duplicate-order risk
-        # no claim/lease sequencing on our side can fully close — recover
-        # the original order instead of ever attempting to resubmit it.
+        # recorded that anywhere" (including as an in-flight row) is the
+        # one class of duplicate-order risk neither claim/lease sequencing
+        # nor in-flight tracking alone can fully close — recover the
+        # original order instead of ever attempting to resubmit it.
         logger.warning(
             "Ticket %s: order with client_order_id=%s already exists at broker "
             "(id=%s, status=%s) — recovering instead of resubmitting",
@@ -1362,104 +1755,82 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
 
     alpaca_order_id = order["id"]
 
+    # From this point on the order EXISTS at Alpaca. Every path below must
+    # end in exactly one of: EXECUTED (fill recorded), FAILED (order verified
+    # dead), or SUBMITTED + nwt_inflight_orders row (order still live, the
+    # resolver owns it now). Marking FAILED while the order is still working
+    # is how the 2026-07-16 untracked-position incident happened.
+    #
+    # The claim lease MUST be renewed here and its result checked: the order
+    # above has already reached the broker for real, so if we've lost the
+    # claim (another worker's lease outlived ours and reclaimed it), that
+    # worker may be concurrently processing the same ticket — raising
+    # ClaimLostError (rather than treating this as an ordinary poll
+    # failure) is what stops us from also writing a decision/inflight row
+    # that could race with theirs.
+    if not renew_ticket_claim(conn, ticket_id, WORKER_ID):
+        raise ClaimLostError(
+            f"Lost claim ownership for ticket {ticket_id} after order {alpaca_order_id} "
+            f"was already submitted — another worker may already be processing it"
+        )
+
     try:
-        # See the identical note in process_close_ticket — renew before the
-        # poll loop's own ~180s worst case. Return value MUST be checked:
-        # the order above has already reached the broker for real by this
-        # point, so a lost claim here must not be treated as an ordinary
-        # "poll failed" -> FAILED decision.
-        if not renew_ticket_claim(conn, ticket_id, WORKER_ID):
-            raise ClaimLostError(
-                f"Lost claim ownership for ticket {ticket_id} after order {alpaca_order_id} "
-                f"was already submitted — another worker may already be processing it"
-            )
         filled_order = poll_order_until_filled(alpaca_order_id)
-    except ClaimLostError:
-        raise  # propagate untouched — see ClaimLostError's docstring
     except Exception as exc:
-        reason = f"Order poll failed: {exc}"
-        insert_decision(conn, ticket_id, "FAILED", reason)
-        log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+        record_inflight_order(conn, ticket_id, alpaca_order_id, "entry", payload)
+        reason = (f"Order poll failed ({exc}) — order {alpaca_order_id} recorded "
+                  f"in-flight for resolution next cycle")
+        insert_decision(conn, ticket_id, "SUBMITTED", reason)
+        log_system_event(conn, "WARNING", "execution_engine", reason, {"ticket_id": ticket_id})
         return
 
     fill_status = filled_order.get("status", "")
     fill_price_str = filled_order.get("filled_avg_price")
     fill_price = float(fill_price_str) if fill_price_str else None
 
-    # mleg orders report per-leg fills; the top-level price is the net debit/
-    # credit and may legitimately be absent — status alone decides for spreads
-    if fill_status != "filled" or (fill_price is None and not legs):
-        reason = f"Order did not fill — final status={fill_status}"
+    if fill_status in ORDER_TERMINAL_DEAD:
+        filled_qty = float(filled_order.get("filled_qty") or 0)
+        if filled_qty > 0 and fill_price:
+            # Partially filled before dying — those shares/contracts are a
+            # real position and MUST hit the ledger.
+            try:
+                record_entry_fill(conn, ticket_id, payload, filled_order, alpaca_order_id,
+                                  expected_price=expected_price,
+                                  entry_bid=entry_bid, entry_ask=entry_ask,
+                                  note=f"partial fill, order {fill_status}")
+            except Exception as exc:
+                reason = f"Ledger insert failed on partial fill: {exc}"
+                insert_decision(conn, ticket_id, "FAILED", reason)
+                log_system_event(conn, "ERROR", "execution_engine", reason,
+                                 {"ticket_id": ticket_id})
+            return
+        reason = f"Order did not fill — terminal status={fill_status}"
         insert_decision(conn, ticket_id, "FAILED", reason)
         log_system_event(conn, "WARNING", "execution_engine", reason,
                          {"ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id})
         return
 
-    if asset_type == "option" and legs:
-        try:
-            insert_spread_ledger_rows(conn, ticket_id, payload, filled_order, alpaca_order_id)
-        except Exception as exc:
-            reason = f"Ledger insert failed: {exc}"
-            insert_decision(conn, ticket_id, "FAILED", reason)
-            log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+    # mleg orders report per-leg fills; the top-level price is the net debit/
+    # credit and may legitimately be absent — status alone decides for spreads
+    if fill_status != "filled" or (fill_price is None and not legs):
+        record_inflight_order(conn, ticket_id, alpaca_order_id, "entry", payload)
+        reason = (f"Order still working after poll window (status={fill_status}) — "
+                  f"recorded in-flight for resolution next cycle")
+        insert_decision(conn, ticket_id, "SUBMITTED", reason)
+        log_system_event(conn, "INFO", "execution_engine", reason,
+                         {"ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id})
+        logger.info("Ticket %s SUBMITTED (in-flight): order=%s status=%s",
+                    ticket_id, alpaca_order_id, fill_status)
         return
 
-    filled_qty_str = filled_order.get("filled_qty")
-    filled_qty = float(filled_qty_str) if filled_qty_str else float(payload.get("qty", 1))
-
-    slippage = (abs(fill_price - expected_price) / expected_price
-                if expected_price and expected_price > 0 else 0.0)
-
-    if asset_type == "option":
-        # Single-leg options are always bought (long premium) — engine.py's
-        # place_options_order never sells outside a multi-leg order. The
-        # ledger direction is the INSTRUMENT direction (drives close side
-        # and PnL sign), not the market thesis: a long put is a bearish
-        # position we nonetheless own, and sell to close. delta_exposure
-        # carries the thesis sign via option_type instead.
-        ledger_direction = "long"
-        base_delta = 0.5 if payload.get("option_type", "call") == "call" else -0.5
-        delta_exposure = payload.get("delta_exposure", base_delta)
-    else:
-        ledger_direction = direction
-        delta_exposure = 1.0 if direction == "long" else -1.0
-
-    ledger_data = {
-        "bot_source": payload["bot_source"],
-        "strategy_id": payload.get("strategy_id"),
-        "asset": payload.get("option_symbol", symbol) if asset_type == "option" else symbol,
-        "asset_type": asset_type,
-        "direction": ledger_direction,
-        "delta_exposure": delta_exposure,
-        "notional_risk": sized_notional,
-        "qty": filled_qty,
-        "entry_price": fill_price,
-        "entry_time": datetime.now(timezone.utc),
-        "entry_bid": entry_bid,
-        "entry_ask": entry_ask,
-        "alpaca_order_id": alpaca_order_id,
-        "stop_pct": payload.get("stop_pct"),
-        "target_pct": payload.get("target_pct"),
-    }
-
     try:
-        position_id = insert_position(conn, ledger_data)
+        record_entry_fill(conn, ticket_id, payload, filled_order, alpaca_order_id,
+                          expected_price=expected_price,
+                          entry_bid=entry_bid, entry_ask=entry_ask)
     except Exception as exc:
         reason = f"Ledger insert failed: {exc}"
         insert_decision(conn, ticket_id, "FAILED", reason)
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
-        return
-
-    reasoning = (f"Filled at {fill_price:.4f}, slippage={slippage:.4f}, "
-                 f"position_id={position_id}, alpaca_order_id={alpaca_order_id}")
-    insert_decision(conn, ticket_id, "EXECUTED", reasoning)
-    log_system_event(conn, "INFO", "execution_engine",
-                     f"Executed {symbol} ({asset_type}) — {direction}",
-                     {"ticket_id": ticket_id, "position_id": position_id,
-                      "fill_price": fill_price, "slippage": slippage,
-                      "strategy_id": payload.get("strategy_id")})
-    logger.info("Ticket %s EXECUTED: position_id=%s fill=%.4f slippage=%.4f",
-                ticket_id, position_id, fill_price, slippage)
 
 
 # ---------------------------------------------------------------------------
@@ -1473,26 +1844,22 @@ def main() -> None:
     try:
         upsert_heartbeat(conn)
 
-        halted, halt_reason = check_no_trade_mode(conn)
-        if halted:
-            logger.warning("no_trade_mode is SET: %s — engine exiting without trading", halt_reason)
-            log_system_event(conn, "WARNING", "execution_engine",
-                             f"no_trade_mode halted engine: {halt_reason}")
-            return
-
+        # In-flight orders are resolved EVERY run, no_trade_mode or not —
+        # these orders already exist at Alpaca; recording their fills is
+        # risk accounting, not new trading. Skipping this while halted is
+        # how untracked positions accumulate during an incident.
         try:
-            directives = load_master_directives()
+            resolve_inflight_orders(conn)
         except Exception as exc:
-            logger.error("Cannot load master-directives.json: %s", exc)
-            sys.exit(1)
-
-        try:
-            run_equity_position_monitor(conn)
-        except Exception as exc:
-            logger.error("Position monitor error: %s", exc)
+            logger.error("In-flight resolver error: %s", exc)
             log_system_event(conn, "ERROR", "execution_engine",
-                             f"Position monitor failed: {exc}")
+                             f"In-flight resolver failed: {exc}")
 
+        # Closes (FORCE_CLOSE / CLOSE_REQUEST) also run while halted:
+        # no_trade_mode means no NEW positions, but the Risk Agent's
+        # liquidation authority must still be executable — otherwise a Rule
+        # 12 hard close for an expiring option piles up unexecuted for
+        # exactly as long as the halt lasts (2026-07-16: AAPL 260717 call).
         close_tickets = fetch_force_close_tickets(conn)
         if close_tickets:
             logger.info("Found %d force-close tickets", len(close_tickets))
@@ -1518,8 +1885,6 @@ def main() -> None:
                     # NOT write a decision (would tell the system "nothing
                     # happened" when something might have) and do NOT
                     # release (the ownership guard makes it a no-op anyway).
-                    # This needs a human to reconcile against Alpaca order
-                    # history for this ticket_id.
                     conn.rollback()
                     logger.critical("Ticket %s: %s", ticket_id, exc)
                     log_system_event(conn, "CRITICAL", "execution_engine", str(exc), {"ticket_id": ticket_id})
@@ -1527,11 +1892,42 @@ def main() -> None:
                     logger.error("Unhandled error in close ticket %s: %s", ticket_id, exc)
                     release_ticket_claim(conn, ticket_id, WORKER_ID, status="failed")
 
+        halted, halt_reason = check_no_trade_mode(conn)
+        if halted:
+            logger.warning("no_trade_mode is SET: %s — closes/in-flight processed, "
+                           "no new entries, monitor skipped", halt_reason)
+            log_system_event(conn, "WARNING", "execution_engine",
+                             f"no_trade_mode: engine ran close-only cycle: {halt_reason}")
+            return
+
+        try:
+            directives = load_master_directives()
+        except Exception as exc:
+            logger.error("Cannot load master-directives.json: %s", exc)
+            sys.exit(1)
+
+        try:
+            run_equity_position_monitor(conn)
+        except Exception as exc:
+            logger.error("Position monitor error: %s", exc)
+            log_system_event(conn, "ERROR", "execution_engine",
+                             f"Position monitor failed: {exc}")
+
         pending = fetch_pending_tickets(conn)
         logger.info("Found %d pending TRADE_REQUEST tickets", len(pending))
 
         if not pending:
             logger.info("No pending tickets — exiting")
+            return
+
+        # New entries only go out while the market is open. A market order
+        # placed into a closed market (Track A executors run hours before
+        # the US open) cannot fill inside the poll window; deferring the
+        # ticket to a later cycle costs 5 minutes and keeps every order
+        # observable end-to-end. Tickets stay pending — no decision written.
+        if not market_is_open():
+            logger.info("Market closed — deferring %d pending entry ticket(s) to a later cycle",
+                        len(pending))
             return
 
         for ticket in pending:
