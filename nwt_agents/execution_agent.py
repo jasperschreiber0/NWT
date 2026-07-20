@@ -37,6 +37,7 @@ from shared_context import (
     option_dte,
     pre_trade_veto,
     release_ticket_claim,
+    renew_ticket_claim,
 )
 
 logging.basicConfig(
@@ -534,6 +535,220 @@ def monitor_options_positions(conn) -> None:
                     gid, len(legs), exit_reason)
 
 
+def _process_approved_proposal(conn, ticket: dict, ticket_id: str) -> bool:
+    """
+    Everything about turning one approved TRADE_PROPOSAL into a submitted
+    TRADE_REQUEST (or a handled VETOED/FAILED decision). Returns True if a
+    TRADE_REQUEST was submitted, False for a handled veto/resolution failure.
+
+    Deliberately raises on anything NOT already handled here (a malformed
+    payload field, an unexpected pre_trade_veto error, etc.) — the caller,
+    _handle_one_proposal, is the single place responsible for turning any
+    such exception into a terminal FAILED decision instead of letting it
+    escape and crash the whole run.
+    """
+    payload = ticket.get("payload") or {}
+
+    symbol = payload.get("symbol", "")
+    strategy_type = payload.get("strategy_type", "long_call")
+    direction = payload.get("direction", "long")
+    strategy_id = payload.get("strategy_id", "")
+    sized_notional = float(payload.get("sized_notional", 0))
+
+    # Apply RISK_AGENT's sizing_multiplier (Rules 3/7 — slippage
+    # expansion, regime confidence < 0.4) if it set one. This is the
+    # actual sizing reduction those rules are supposed to cause; the
+    # rules used to only log a WARNING with no downstream effect.
+    sizing_multiplier = ticket.get("sizing_multiplier")
+    if sizing_multiplier is not None and float(sizing_multiplier) < 1.0:
+        sizing_multiplier = float(sizing_multiplier)
+        original_notional = sized_notional
+        sized_notional = round(sized_notional * sizing_multiplier, 2)
+        logger.info(
+            "Ticket %s: sizing_multiplier=%.2f applied — sized_notional %.2f -> %.2f",
+            ticket_id, sizing_multiplier, original_notional, sized_notional,
+        )
+
+    dte_min = int(payload.get("dte_min", 7))
+    dte_max = int(payload.get("dte_max", 21))
+    strike_preference = payload.get("strike_preference", "ATM")
+    stop_pct = -abs(float(payload.get("stop_loss_pct", 0.50)))
+    target_pct = float(payload.get("profit_target_pct", 0.50))
+    regime = payload.get("regime_at_decision", {})
+
+    # Determine bot_source from track
+    from_track = payload.get("from_track", "")
+    bot_source_map = {"C": "NWT_TRACK_C", "D": "NWT_TRACK_D", "E": "NWT_TRACK_E"}
+    bot_source = bot_source_map.get(from_track, f"NWT_TRACK_{from_track}")
+
+    # Synchronous risk gate — the risk agent's APPROVED decision may be
+    # minutes old; re-check kill switch / cooling-off / entry cutoff NOW,
+    # before this proposal becomes an order.
+    vetoed, veto_reason = pre_trade_veto(conn, from_track)
+    if vetoed:
+        logger.warning("Ticket %s vetoed at submission: %s", ticket_id, veto_reason)
+        insert_decision(conn, ticket_id, "VETOED", veto_reason, "NWT_EXECUTION_AGENT")
+        log_system_event(conn, "WARNING", "execution_agent", veto_reason, {"ticket_id": ticket_id})
+        return False
+
+    # Base execution payload; leg/contract fields filled in per branch below.
+    # direction is the market thesis, carried through for attribution —
+    # the engine derives actual order sides itself (single-leg always
+    # buys; only a spread's short leg can sell, always paired with a
+    # long leg that bounds the risk).
+    execution_payload = {
+        "approved": True,
+        "bot_source": bot_source,
+        "symbol": symbol,
+        "direction": direction,
+        "strategy_id": strategy_id,
+        "archetype": payload.get("archetype", ""),
+        "sized_notional": sized_notional,
+        "asset_type": "option",
+        "time_in_force": "day",
+        "stop_pct": stop_pct,
+        "target_pct": target_pct,
+        "strategy_type": strategy_type,
+        "regime_at_decision": regime,
+        "source_proposal_ticket_id": ticket_id,
+    }
+
+    # A fresh lease before the slowest work in this function (up to 2 chain
+    # fetches + a spot fetch + up to 4 per-leg price fetches for a spread,
+    # each with a 15-20s timeout — ~100-115s worst case) so a legitimate
+    # slow run doesn't have its claim lease expire out from under it and
+    # get reclaimed by an overlapping worker mid-resolution.
+    renew_ticket_claim(conn, ticket_id, WORKER_ID)
+
+    if strategy_type in SPREAD_STRATEGIES:
+        # Defined-risk structure — resolve all legs, submit as one mleg order
+        legs = resolve_spread_legs(symbol, strategy_type, dte_min, dte_max)
+        if not legs:
+            reason = f"Could not resolve {strategy_type} legs for {symbol}"
+            logger.error("Ticket %s: %s", ticket_id, reason)
+            insert_decision(conn, ticket_id, "FAILED", reason, "NWT_EXECUTION_AGENT")
+            log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
+            return False
+        execution_payload["legs"] = legs
+        execution_payload["qty"] = size_spread_qty(legs, sized_notional)
+        option_symbol = "/".join(l["option_symbol"] for l in legs)
+    else:
+        # Single-leg — always long premium (engine buys to open)
+        contract = resolve_option_contract(
+            symbol=symbol,
+            direction=direction,
+            strategy_type=strategy_type,
+            dte_min=dte_min,
+            dte_max=dte_max,
+            strike_preference=strike_preference,
+        )
+
+        if contract is None:
+            reason = f"Could not resolve option contract for {symbol} {strategy_type}"
+            logger.error("Ticket %s: %s", ticket_id, reason)
+            insert_decision(conn, ticket_id, "FAILED", reason, "NWT_EXECUTION_AGENT")
+            log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
+            return False
+
+        option_symbol = contract["option_symbol"]
+        option_price = _get_option_price(option_symbol)
+        if option_price and option_price > 0:
+            qty = compute_qty_from_notional(sized_notional, option_price)
+        else:
+            logger.warning(
+                "Ticket %s: could not fetch live price for %s — falling back to "
+                "conservative $200/contract estimate", ticket_id, option_symbol,
+            )
+            qty = max(int(sized_notional / 200), 1)
+
+        execution_payload.update({
+            "option_symbol": option_symbol,
+            "qty": qty,
+            "strike_price": contract["strike_price"],
+            "expiration_date": contract["expiration_date"],
+            "option_type": contract["option_type"],
+        })
+
+    exec_ticket_id = insert_ticket(
+        conn,
+        from_agent="NWT_EXECUTION_AGENT",
+        to_agent="EXECUTION_ENGINE",
+        type_="TRADE_REQUEST",
+        payload=execution_payload,
+    )
+    logger.info(
+        "Submitted TRADE_REQUEST %s for %s (%s %s) — source proposal %s",
+        exec_ticket_id, symbol, option_symbol, strategy_type, ticket_id,
+    )
+
+    # Mark original proposal ticket as SUBMITTED
+    insert_decision(
+        conn,
+        ticket_id,
+        "SUBMITTED",
+        f"Execution ticket {exec_ticket_id} submitted for {option_symbol}",
+        "NWT_EXECUTION_AGENT",
+    )
+    return True
+
+
+def _handle_one_proposal(conn, ticket: dict) -> str:
+    """
+    Claim, process, and terminate one approved proposal ticket, whatever
+    happens. Returns 'submitted' | 'handled_failure' | 'unhandled_error' |
+    'not_claimed'.
+
+    The try/except here is deliberately a catch-all around
+    _process_approved_proposal — anything that function doesn't handle
+    itself (a malformed numeric payload field, pre_trade_veto raising on a
+    corrupt master-directives.json or a DB error, or any other unexpected
+    failure) must still end in a terminal FAILED decision and a released
+    claim, never in an uncaught exception. Without this, a single bad
+    ticket propagates out of the loop in main(), which has no outer
+    exception handler — killing the whole run before any other approved
+    proposal in the batch is even reached, and since the crashing ticket is
+    always the oldest unprocessed one (ORDER BY created_at ASC) and never
+    gets a decision written, it repeats identically every single cron
+    cycle, permanently starving everything behind it.
+    """
+    ticket_id = str(ticket["ticket_id"])
+
+    # Atomic claim before any slow external work (option chain
+    # resolution, quote fetches) — see
+    # db/migrate_2026_07_execution_safety.sql. crontab.txt has no
+    # overlap guard, so without this a second concurrent
+    # execution_agent.py run could select and submit this same
+    # approved proposal a second time, producing two TRADE_REQUEST
+    # tickets (and, downstream, two real broker orders) for one
+    # decision.
+    if not claim_ticket(conn, ticket_id, WORKER_ID):
+        logger.info("Ticket %s: not claimed (already owned by another worker) — skipping", ticket_id)
+        return "not_claimed"
+
+    try:
+        submitted = _process_approved_proposal(conn, ticket, ticket_id)
+        release_ticket_claim(conn, ticket_id, status="done")
+        return "submitted" if submitted else "handled_failure"
+    except Exception as exc:
+        # A raised exception may have left the connection's current
+        # transaction aborted (e.g. a psycopg2 error) — roll back first so
+        # the FAILED decision / log / release below can actually execute
+        # instead of also failing with "transaction is aborted".
+        conn.rollback()
+        reason = f"Unhandled error processing ticket: {exc}"
+        logger.error("Ticket %s: %s", ticket_id, reason)
+        try:
+            insert_decision(conn, ticket_id, "FAILED", reason, "NWT_EXECUTION_AGENT")
+        except Exception:
+            logger.error("Ticket %s: also failed to write a FAILED decision", ticket_id)
+        try:
+            log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
+        except Exception:
+            pass
+        release_ticket_claim(conn, ticket_id, status="failed")
+        return "unhandled_error"
+
+
 def main() -> None:
     conn = get_db()
 
@@ -575,172 +790,12 @@ def main() -> None:
         failed_count = 0
 
         for ticket in approved_proposals:
-            ticket_id = str(ticket["ticket_id"])
-
-            # Atomic claim before any slow external work (option chain
-            # resolution, quote fetches) — see
-            # db/migrate_2026_07_execution_safety.sql. crontab.txt has no
-            # overlap guard, so without this a second concurrent
-            # execution_agent.py run could select and submit this same
-            # approved proposal a second time, producing two TRADE_REQUEST
-            # tickets (and, downstream, two real broker orders) for one
-            # decision.
-            if not claim_ticket(conn, ticket_id, WORKER_ID):
-                logger.info("Ticket %s: not claimed (already owned by another worker) — skipping", ticket_id)
-                continue
-
-            payload = ticket.get("payload") or {}
-
-            symbol = payload.get("symbol", "")
-            strategy_type = payload.get("strategy_type", "long_call")
-            direction = payload.get("direction", "long")
-            strategy_id = payload.get("strategy_id", "")
-            sized_notional = float(payload.get("sized_notional", 0))
-
-            # Apply RISK_AGENT's sizing_multiplier (Rules 3/7 — slippage
-            # expansion, regime confidence < 0.4) if it set one. This is the
-            # actual sizing reduction those rules are supposed to cause; the
-            # rules used to only log a WARNING with no downstream effect.
-            sizing_multiplier = ticket.get("sizing_multiplier")
-            if sizing_multiplier is not None and float(sizing_multiplier) < 1.0:
-                sizing_multiplier = float(sizing_multiplier)
-                original_notional = sized_notional
-                sized_notional = round(sized_notional * sizing_multiplier, 2)
-                logger.info(
-                    "Ticket %s: sizing_multiplier=%.2f applied — sized_notional %.2f -> %.2f",
-                    ticket_id, sizing_multiplier, original_notional, sized_notional,
-                )
-
-            dte_min = int(payload.get("dte_min", 7))
-            dte_max = int(payload.get("dte_max", 21))
-            strike_preference = payload.get("strike_preference", "ATM")
-            stop_pct = -abs(float(payload.get("stop_loss_pct", 0.50)))
-            target_pct = float(payload.get("profit_target_pct", 0.50))
-            regime = payload.get("regime_at_decision", {})
-
-            # Determine bot_source from track
-            from_track = payload.get("from_track", "")
-            bot_source_map = {"C": "NWT_TRACK_C", "D": "NWT_TRACK_D", "E": "NWT_TRACK_E"}
-            bot_source = bot_source_map.get(from_track, f"NWT_TRACK_{from_track}")
-
-            # Synchronous risk gate — the risk agent's APPROVED decision may be
-            # minutes old; re-check kill switch / cooling-off / entry cutoff NOW,
-            # before this proposal becomes an order.
-            vetoed, veto_reason = pre_trade_veto(conn, from_track)
-            if vetoed:
-                logger.warning("Ticket %s vetoed at submission: %s", ticket_id, veto_reason)
-                insert_decision(conn, ticket_id, "VETOED", veto_reason, "NWT_EXECUTION_AGENT")
-                log_system_event(conn, "WARNING", "execution_agent", veto_reason, {"ticket_id": ticket_id})
-                failed_count += 1
-                release_ticket_claim(conn, ticket_id, status="done")
-                continue
-
-            # Base execution payload; leg/contract fields filled in per branch below.
-            # direction is the market thesis, carried through for attribution —
-            # the engine derives actual order sides itself (single-leg always
-            # buys; only a spread's short leg can sell, always paired with a
-            # long leg that bounds the risk).
-            execution_payload = {
-                "approved": True,
-                "bot_source": bot_source,
-                "symbol": symbol,
-                "direction": direction,
-                "strategy_id": strategy_id,
-                "archetype": payload.get("archetype", ""),
-                "sized_notional": sized_notional,
-                "asset_type": "option",
-                "time_in_force": "day",
-                "stop_pct": stop_pct,
-                "target_pct": target_pct,
-                "strategy_type": strategy_type,
-                "regime_at_decision": regime,
-                "source_proposal_ticket_id": ticket_id,
-            }
-
-            if strategy_type in SPREAD_STRATEGIES:
-                # Defined-risk structure — resolve all legs, submit as one mleg order
-                legs = resolve_spread_legs(symbol, strategy_type, dte_min, dte_max)
-                if not legs:
-                    reason = f"Could not resolve {strategy_type} legs for {symbol}"
-                    logger.error("Ticket %s: %s", ticket_id, reason)
-                    insert_decision(conn, ticket_id, "FAILED", reason, "NWT_EXECUTION_AGENT")
-                    log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
-                    failed_count += 1
-                    release_ticket_claim(conn, ticket_id, status="failed")
-                    continue
-                execution_payload["legs"] = legs
-                execution_payload["qty"] = size_spread_qty(legs, sized_notional)
-                option_symbol = "/".join(l["option_symbol"] for l in legs)
-            else:
-                # Single-leg — always long premium (engine buys to open)
-                contract = resolve_option_contract(
-                    symbol=symbol,
-                    direction=direction,
-                    strategy_type=strategy_type,
-                    dte_min=dte_min,
-                    dte_max=dte_max,
-                    strike_preference=strike_preference,
-                )
-
-                if contract is None:
-                    reason = f"Could not resolve option contract for {symbol} {strategy_type}"
-                    logger.error("Ticket %s: %s", ticket_id, reason)
-                    insert_decision(conn, ticket_id, "FAILED", reason, "NWT_EXECUTION_AGENT")
-                    log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
-                    failed_count += 1
-                    release_ticket_claim(conn, ticket_id, status="failed")
-                    continue
-
-                option_symbol = contract["option_symbol"]
-                option_price = _get_option_price(option_symbol)
-                if option_price and option_price > 0:
-                    qty = compute_qty_from_notional(sized_notional, option_price)
-                else:
-                    logger.warning(
-                        "Ticket %s: could not fetch live price for %s — falling back to "
-                        "conservative $200/contract estimate", ticket_id, option_symbol,
-                    )
-                    qty = max(int(sized_notional / 200), 1)
-
-                execution_payload.update({
-                    "option_symbol": option_symbol,
-                    "qty": qty,
-                    "strike_price": contract["strike_price"],
-                    "expiration_date": contract["expiration_date"],
-                    "option_type": contract["option_type"],
-                })
-
-            try:
-                exec_ticket_id = insert_ticket(
-                    conn,
-                    from_agent="NWT_EXECUTION_AGENT",
-                    to_agent="EXECUTION_ENGINE",
-                    type_="TRADE_REQUEST",
-                    payload=execution_payload,
-                )
-                logger.info(
-                    "Submitted TRADE_REQUEST %s for %s (%s %s) — source proposal %s",
-                    exec_ticket_id, symbol, option_symbol, strategy_type, ticket_id,
-                )
-
-                # Mark original proposal ticket as SUBMITTED
-                insert_decision(
-                    conn,
-                    ticket_id,
-                    "SUBMITTED",
-                    f"Execution ticket {exec_ticket_id} submitted for {option_symbol}",
-                    "NWT_EXECUTION_AGENT",
-                )
+            outcome = _handle_one_proposal(conn, ticket)
+            if outcome == "submitted":
                 submitted_count += 1
-                release_ticket_claim(conn, ticket_id, status="done")
-
-            except Exception as exc:
-                reason = f"Failed to submit execution ticket: {exc}"
-                logger.error("Ticket %s: %s", ticket_id, reason)
-                insert_decision(conn, ticket_id, "FAILED", reason, "NWT_EXECUTION_AGENT")
-                log_system_event(conn, "ERROR", "execution_agent", reason, {"ticket_id": ticket_id})
+            elif outcome in ("handled_failure", "unhandled_error"):
                 failed_count += 1
-                release_ticket_claim(conn, ticket_id, status="failed")
+            # "not_claimed" counts toward neither — another worker owns it.
 
         log_system_event(
             conn,

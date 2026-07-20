@@ -34,6 +34,7 @@ from ledger import (
     log_system_event,
     record_force_close_outcome,
     release_ticket_claim,
+    renew_ticket_claim,
 )
 
 _here = Path(__file__).parent
@@ -741,6 +742,11 @@ def process_close_ticket(conn, ticket: dict) -> None:
 
     try:
         order = place_close_order(symbol, qty, asset_type, side=close_side)
+        # Fresh lease before the poll loop — poll_order_until_filled's own
+        # worst case (POLL_MAX x (POLL_INTERVAL + timeout) = 180s) can equal
+        # or exceed the base claim lease; renewing here means a legitimately
+        # slow fill doesn't lose the claim to an overlapping worker mid-poll.
+        renew_ticket_claim(conn, ticket_id, WORKER_ID)
         filled = poll_order_until_filled(order["id"])
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
@@ -879,6 +885,9 @@ def process_force_close(conn, ticket: dict) -> None:
 
     alpaca_order_id = order.get("id", "")
     try:
+        # See the identical note in process_close_ticket — renew before the
+        # poll loop's own ~180s worst case.
+        renew_ticket_claim(conn, ticket_id, WORKER_ID)
         filled_order = poll_order_until_filled(alpaca_order_id) if alpaca_order_id else order
     except Exception as exc:
         reason = f"FORCE_CLOSE: order poll failed: {exc}"
@@ -902,8 +911,29 @@ def process_force_close(conn, ticket: dict) -> None:
         return
 
     slippage = abs(fill_price - expected_price) / expected_price if expected_price and expected_price > 0 else 0.0
-    close_position(conn, position_id, fill_price, slippage, "hard_close",
-                   exit_bid=exit_bid, exit_ask=exit_ask)
+    actually_closed = close_position(conn, position_id, fill_price, slippage, "hard_close",
+                                     exit_bid=exit_bid, exit_ask=exit_ask)
+    record_force_close_outcome(conn, position_id, success=True)
+
+    if not actually_closed:
+        # A real order filled at the broker just now, but the ledger row was
+        # already 'closed' — a second FORCE_CLOSE ticket for the same
+        # position beat this one to it (see risk_agent.py's
+        # has_pending_force_close_ticket for the primary fix). This is a
+        # genuine double-execution at the broker, not just a ledger race —
+        # worth its own log line, distinct from "no-op, nothing to do".
+        reasoning = (
+            f"FORCE_CLOSE order filled at {fill_price:.4f} but ledger position "
+            f"{position_id} was already closed by another attempt — exit data NOT "
+            f"overwritten; a duplicate closing order reached the broker"
+        )
+        insert_decision(conn, ticket_id, "EXECUTED_DUPLICATE", reasoning)
+        log_system_event(conn, "WARNING", "execution_engine", reasoning,
+                         {"ticket_id": ticket_id, "position_id": position_id,
+                          "alpaca_order_id": alpaca_order_id, "fill_price": fill_price})
+        logger.warning("Ticket %s: %s", ticket_id, reasoning)
+        return
+
     reasoning = (
         f"FORCE_CLOSE filled at {fill_price:.4f}, slippage={slippage:.4f}, "
         f"position_id={position_id}, alpaca_order_id={alpaca_order_id}"
@@ -914,7 +944,6 @@ def process_force_close(conn, ticket: dict) -> None:
                      {"ticket_id": ticket_id, "position_id": position_id,
                       "alpaca_order_id": alpaca_order_id, "fill_price": fill_price,
                       "slippage": slippage})
-    record_force_close_outcome(conn, position_id, success=True)
     logger.info("Ticket %s FORCE_CLOSE EXECUTED: position=%s fill=%.4f", ticket_id, position_id, fill_price)
 
 
@@ -1058,6 +1087,9 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     alpaca_order_id = order["id"]
 
     try:
+        # See the identical note in process_close_ticket — renew before the
+        # poll loop's own ~180s worst case.
+        renew_ticket_claim(conn, ticket_id, WORKER_ID)
         filled_order = poll_order_until_filled(alpaca_order_id)
     except Exception as exc:
         reason = f"Order poll failed: {exc}"

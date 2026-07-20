@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from shared_context import claim_ticket, release_ticket_claim  # noqa: E402
+from shared_context import claim_ticket, release_ticket_claim, renew_ticket_claim  # noqa: E402
 
 
 def _insert_ticket(conn, ticket_type="TRADE_REQUEST"):
@@ -151,6 +151,64 @@ def test_live_lease_is_not_reclaimable_before_expiry(conn):
 # instant. This is the strongest evidence available that the atomicity
 # comes from Postgres's row lock, not from Python-level call ordering.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Lease renewal — deployment-readiness audit fix: a fixed, un-renewed lease
+# is close to or below the worst-case processing time of the very
+# operations it protects (engine.py's poll_order_until_filled can take up
+# to ~180s). renew_ticket_claim() lets a legitimately slow, still-owning
+# worker extend its own lease instead of relying solely on picking a big
+# enough constant.
+# ---------------------------------------------------------------------------
+
+def test_renew_extends_lease_for_the_owning_worker(conn):
+    ticket_id = _insert_ticket(conn)
+    claim_ticket(conn, ticket_id, worker_id="worker-a", lease_seconds=5)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT lease_expires_at FROM nwt_ticket_claims WHERE ticket_id = %s", (ticket_id,))
+        (before,) = cur.fetchone()
+
+    renewed = renew_ticket_claim(conn, ticket_id, worker_id="worker-a", lease_seconds=600)
+
+    assert renewed is True
+    with conn.cursor() as cur:
+        cur.execute("SELECT lease_expires_at FROM nwt_ticket_claims WHERE ticket_id = %s", (ticket_id,))
+        (after,) = cur.fetchone()
+    assert after > before + timedelta(seconds=500)
+
+
+def test_renew_prevents_lease_expiry_from_letting_a_second_worker_in(conn, conn2):
+    """
+    The exact scenario the fix targets: a slow-but-alive worker renews
+    before its original lease would have expired, so a second worker that
+    shows up afterward still cannot claim the ticket.
+    """
+    ticket_id = _insert_ticket(conn)
+    claim_ticket(conn, ticket_id, worker_id="worker-a", lease_seconds=2)
+
+    time.sleep(1)  # partway through the short lease, but not expired yet
+    renewed = renew_ticket_claim(conn, ticket_id, worker_id="worker-a", lease_seconds=600)
+    assert renewed is True
+
+    time.sleep(2)  # past the ORIGINAL 2s lease, well within the renewed one
+
+    stolen = claim_ticket(conn2, ticket_id, worker_id="worker-b")
+    assert stolen is False  # worker-a's renewed lease is still live
+
+
+def test_renew_fails_for_a_worker_that_already_lost_the_claim(conn, conn2):
+    """A worker whose lease already expired and got reclaimed elsewhere must
+    not be able to renew its way back into ownership."""
+    ticket_id = _insert_ticket(conn)
+    claim_ticket(conn, ticket_id, worker_id="worker-a", lease_seconds=1)
+    time.sleep(1.2)
+    claim_ticket(conn2, ticket_id, worker_id="worker-b")  # worker-b now owns it
+
+    renewed = renew_ticket_claim(conn, ticket_id, worker_id="worker-a")
+
+    assert renewed is False
+
 
 def test_concurrent_threads_racing_on_first_claim_only_one_wins(conn, conn2):
     ticket_id = _insert_ticket(conn)

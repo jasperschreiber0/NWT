@@ -32,6 +32,7 @@ from shared_context import (  # noqa: E402
     FORCE_CLOSE_BACKOFF_MINUTES,
     FORCE_CLOSE_MAX_ATTEMPTS,
     get_force_close_state,
+    has_pending_force_close_ticket,
     schedule_force_close_attempt,
 )
 
@@ -48,7 +49,7 @@ os.environ.setdefault("NWT_DB_DSN", "postgresql://unused/unused")
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "execution"))
 from engine import _classify_force_close_failure, _option_dte  # noqa: E402
-from ledger import record_force_close_outcome  # noqa: E402
+from ledger import close_position, record_force_close_outcome  # noqa: E402
 
 
 def _insert_position(conn, asset="SPY260101C00500000"):
@@ -348,3 +349,143 @@ def test_option_dte_negative_for_expired_symbol():
 
 def test_option_dte_none_for_unparseable_symbol():
     assert _option_dte("AAPL") is None
+
+
+# ---------------------------------------------------------------------------
+# Deployment-readiness audit fix: a second FORCE_CLOSE ticket for the same
+# position must never be created while a first one is still outstanding,
+# no matter how long it takes engine.py to actually consume it — the
+# ATTEMPTING cooldown alone can't tell "abandoned" apart from "still
+# queued, just slow".
+# ---------------------------------------------------------------------------
+
+def _insert_force_close_ticket(conn, position_id, decided=False):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO nwt_tickets (from_agent, to_agent, type, payload) "
+            "VALUES ('RISK_AGENT', 'EXECUTION_ENGINE', 'FORCE_CLOSE', %s) RETURNING ticket_id",
+            (f'{{"position_id": "{position_id}"}}',),
+        )
+        ticket_id = str(cur.fetchone()[0])
+    if decided:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO nwt_ticket_decisions (ticket_id, decision, decided_by) "
+                "VALUES (%s, 'EXECUTED', 'EXECUTION_ENGINE')",
+                (ticket_id,),
+            )
+    conn.commit()
+    return ticket_id
+
+
+def test_has_pending_force_close_ticket_true_for_undecided_ticket(conn):
+    position_id = _insert_position(conn)
+    _insert_force_close_ticket(conn, position_id, decided=False)
+
+    assert has_pending_force_close_ticket(conn, position_id) is True
+
+
+def test_has_pending_force_close_ticket_false_once_decided(conn):
+    position_id = _insert_position(conn)
+    _insert_force_close_ticket(conn, position_id, decided=True)
+
+    assert has_pending_force_close_ticket(conn, position_id) is False
+
+
+def test_has_pending_force_close_ticket_false_with_no_ticket(conn):
+    position_id = _insert_position(conn)
+    assert has_pending_force_close_ticket(conn, position_id) is False
+
+
+def test_outstanding_ticket_blocks_scheduling_even_past_the_attempting_cooldown(conn):
+    """
+    The exact bug: engine.py falls behind, the first FORCE_CLOSE ticket sits
+    unconsumed for longer than FORCE_CLOSE_ATTEMPTING_COOLDOWN_MINUTES, and
+    the old cooldown-only logic would let a second ticket be scheduled for
+    the same still-open position. has_pending_force_close_ticket must stop
+    this regardless of how stale last_attempt_at looks.
+    """
+    position_id = _insert_position(conn)
+    asset = "SPY260101C00500000"
+    _seed_state(
+        conn, position_id, asset,
+        state="ATTEMPTING", attempt_count=1,
+        last_attempt_at=datetime.now(timezone.utc) - timedelta(hours=2),  # way past cooldown
+    )
+    _insert_force_close_ticket(conn, position_id, decided=False)  # still outstanding
+
+    should_attempt = schedule_force_close_attempt(conn, position_id, asset)
+
+    assert should_attempt is False
+    # And the state machine must not have been touched either — no phantom
+    # attempt_count bump for a ticket that never actually got created.
+    assert get_force_close_state(conn, position_id)["attempt_count"] == 1
+
+
+def test_scheduling_resumes_once_the_outstanding_ticket_is_decided(conn):
+    position_id = _insert_position(conn)
+    asset = "SPY260101C00500000"
+    _seed_state(
+        conn, position_id, asset,
+        state="FAILED_RETRYABLE", attempt_count=1,
+        next_retry_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    ticket_id = _insert_force_close_ticket(conn, position_id, decided=False)
+
+    # Still outstanding — must not schedule a second one.
+    assert schedule_force_close_attempt(conn, position_id, asset) is False
+
+    # Simulate engine.py finally consuming it.
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO nwt_ticket_decisions (ticket_id, decision, decided_by) "
+            "VALUES (%s, 'FAILED', 'EXECUTION_ENGINE')",
+            (ticket_id,),
+        )
+    conn.commit()
+
+    assert schedule_force_close_attempt(conn, position_id, asset) is True
+
+
+# ---------------------------------------------------------------------------
+# close_position idempotency — deployment-readiness audit fix: the UPDATE
+# now guards WHERE status='open' and reports whether it actually changed
+# anything, so a second close attempt on an already-closed position (e.g.
+# from a duplicate ticket that slipped through) is a safe no-op instead of
+# silently overwriting correct exit data.
+# ---------------------------------------------------------------------------
+
+def test_first_close_position_call_succeeds_and_returns_true(conn):
+    position_id = _insert_position(conn)
+
+    actually_closed = close_position(conn, position_id, exit_price=5.0, slippage=0.01, exit_reason="target")
+
+    assert actually_closed is True
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, exit_price FROM nwt_portfolio_ledger WHERE position_id = %s", (position_id,))
+        status, exit_price = cur.fetchone()
+    assert status == "closed"
+    assert float(exit_price) == 5.0
+
+
+def test_second_close_position_call_is_a_noop_and_does_not_overwrite(conn):
+    position_id = _insert_position(conn)
+
+    first = close_position(conn, position_id, exit_price=5.0, slippage=0.01, exit_reason="target")
+    second = close_position(conn, position_id, exit_price=0.0, slippage=0.0, exit_reason="already_closed_at_broker")
+
+    assert first is True
+    assert second is False  # must report it did NOT actually close anything
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT exit_price, exit_reason FROM nwt_portfolio_ledger WHERE position_id = %s", (position_id,))
+        exit_price, exit_reason = cur.fetchone()
+    # The correct first close's data must survive — not overwritten with the
+    # second call's fallback 0.0 price.
+    assert float(exit_price) == 5.0
+    assert exit_reason == "target"
+
+
+def test_close_position_on_nonexistent_position_returns_false(conn):
+    fake_id = str(uuid.uuid4())
+    assert close_position(conn, fake_id, exit_price=1.0, slippage=0.0) is False

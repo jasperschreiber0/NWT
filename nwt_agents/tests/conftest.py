@@ -23,6 +23,9 @@ DROP TABLE IF EXISTS nwt_trade_outcomes;
 DROP TABLE IF EXISTS nwt_portfolio_ledger;
 DROP TABLE IF EXISTS nwt_system_log;
 
+-- Mirrors db/schema.sql + migrate_phase0.sql's exit_reason +
+-- migrate_2026_07_audit_fixes.sql's stop_pct/target_pct — kept in sync so
+-- tests exercise the real production column set, not an approximation.
 CREATE TABLE nwt_portfolio_ledger (
     position_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     bot_source TEXT NOT NULL,
@@ -30,8 +33,25 @@ CREATE TABLE nwt_portfolio_ledger (
     asset TEXT NOT NULL,
     asset_type TEXT NOT NULL,
     direction TEXT,
+    delta_exposure NUMERIC,
+    notional_risk NUMERIC,
+    qty NUMERIC,
+    entry_price NUMERIC,
+    entry_time TIMESTAMPTZ,
+    entry_bid NUMERIC,
+    entry_ask NUMERIC,
+    exit_price NUMERIC,
+    exit_time TIMESTAMPTZ,
+    exit_bid NUMERIC,
+    exit_ask NUMERIC,
+    realized_slippage NUMERIC,
+    exit_reason TEXT,
+    stop_pct NUMERIC,
+    target_pct NUMERIC,
     status TEXT DEFAULT 'open',
-    spread_group_id UUID
+    alpaca_order_id TEXT,
+    spread_group_id UUID,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE nwt_trade_outcomes (

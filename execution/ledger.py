@@ -84,11 +84,27 @@ def close_position(
     exit_reason: str = "unknown",
     exit_bid: Optional[float] = None,
     exit_ask: Optional[float] = None,
-) -> None:
+) -> bool:
     """
     UPDATE nwt_portfolio_ledger: set status='closed', exit_price, exit_time,
     realized_slippage, exit_reason, and exit NBBO (feeds the pnl_adjusted haircut).
     exit_reason: target | stop | hard_close | max_hold | kill_switch | manual
+
+    WHERE status = 'open' makes this idempotent: if two FORCE_CLOSE tickets
+    for the same position both reach this call (possible if a second ticket
+    got created for a position whose first ticket was still queued — see
+    risk_agent.py's schedule_force_close_attempt / has_pending_force_close_ticket
+    for the primary fix), only the first one to actually run this UPDATE
+    changes anything. Without this guard a second, later close (e.g. via
+    the 404-already-closed fallback path, which can use a 0.0 price when no
+    quote is available) could silently overwrite a correct exit_price with
+    a wrong one.
+
+    Returns True if this call actually closed the position (a row matched
+    WHERE status='open'), False if it was already closed by someone else —
+    callers that need to know whether THEY caused the close (e.g. to decide
+    whether to write a trade outcome) must check this, not just the absence
+    of an exception.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -101,15 +117,22 @@ def close_position(
                 exit_reason = %s,
                 exit_bid = %s,
                 exit_ask = %s
-            WHERE position_id = %s
+            WHERE position_id = %s AND status = 'open'
             """,
             (exit_price, datetime.now(timezone.utc), slippage, exit_reason, exit_bid, exit_ask, position_id),
         )
-        if cur.rowcount == 0:
-            logger.warning("close_position: no rows updated for position_id=%s", position_id)
+        actually_closed = cur.rowcount > 0
+        if not actually_closed:
+            logger.warning(
+                "close_position: position_id=%s was not 'open' (already closed by another "
+                "attempt, or does not exist) — no-op, not overwriting the existing exit data",
+                position_id,
+            )
     conn.commit()
-    logger.info("Closed position %s at %.4f slippage=%.4f reason=%s",
-                position_id, exit_price, slippage, exit_reason)
+    if actually_closed:
+        logger.info("Closed position %s at %.4f slippage=%.4f reason=%s",
+                    position_id, exit_price, slippage, exit_reason)
+    return actually_closed
 
 
 def get_open_positions(conn, bot_source: Optional[str] = None) -> list:
@@ -159,7 +182,11 @@ def log_system_event(
 # db/migrate_2026_07_execution_safety.sql for the schema and rationale.
 # ---------------------------------------------------------------------------
 
-TICKET_CLAIM_LEASE_SECONDS = 180
+TICKET_CLAIM_LEASE_SECONDS = 300  # must match shared_context.py — see its own note:
+# 300s is a starting margin, not a substitute for renewal. poll_order_until_filled
+# in engine.py alone has a worst case of POLL_MAX(10) x (POLL_INTERVAL(3s) +
+# alpaca_get's 15s timeout) = 180s — renew_ticket_claim() below is called right
+# before that poll starts so it always gets a fresh full budget.
 
 
 def claim_ticket(conn, ticket_id: str, worker_id: str,
@@ -199,6 +226,29 @@ def release_ticket_claim(conn, ticket_id: str, status: str = "done") -> None:
             (status, ticket_id),
         )
     conn.commit()
+
+
+def renew_ticket_claim(conn, ticket_id: str, worker_id: str,
+                        lease_seconds: int = TICKET_CLAIM_LEASE_SECONDS) -> bool:
+    """
+    Extend the lease on a claim this worker still holds. See
+    shared_context.renew_ticket_claim for the full rationale — identical
+    mechanism, same table. Only renews a claim this exact worker_id still
+    owns with status='in_progress'; returns False (and the caller must stop)
+    if the claim was already lost to lease expiry and reclaimed elsewhere.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE nwt_ticket_claims
+            SET lease_expires_at = NOW() + (%s * INTERVAL '1 second'), updated_at = NOW()
+            WHERE ticket_id = %s AND claimed_by = %s AND status = 'in_progress'
+            """,
+            (lease_seconds, ticket_id, worker_id),
+        )
+        renewed = cur.rowcount > 0
+    conn.commit()
+    return renewed
 
 
 # ---------------------------------------------------------------------------
