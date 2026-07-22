@@ -291,6 +291,45 @@ def resolve_ledger_not_alpaca(conn, row: dict) -> str:
 # Case: broker position exists, ledger missing — autonomous reconstruction
 # ---------------------------------------------------------------------------
 
+def _mark_unknown_broker_position_resolved(conn, symbol: str, apos: dict, resolution: str,
+                                            position_id: str) -> None:
+    """
+    Mark the current unresolved nwt_unknown_broker_positions row for this
+    symbol as resolved — or insert one already-resolved if none was being
+    tracked yet (e.g. resolved on the very first recon pass, before any
+    unresolved row ever existed).
+
+    NOT an INSERT ... ON CONFLICT (symbol) WHERE NOT resolved DO UPDATE:
+    that looked correct but silently inserted a duplicate row instead of
+    updating the existing one — the new row's own resolved=TRUE value falls
+    outside the partial unique index's domain (WHERE NOT resolved), so
+    Postgres never detects a conflict against the existing FALSE row at
+    all. UPDATE-then-insert-if-nothing-matched is the correct pattern here.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE nwt_unknown_broker_positions
+            SET resolved = TRUE, resolution = %s, resolved_at = NOW(),
+                reconstructed_position_id = %s
+            WHERE symbol = %s AND NOT resolved
+            """,
+            (resolution, position_id, symbol),
+        )
+        updated = cur.rowcount > 0
+        if not updated:
+            cur.execute(
+                """
+                INSERT INTO nwt_unknown_broker_positions
+                  (symbol, qty, side, avg_price, resolved, resolution, resolved_at, reconstructed_position_id)
+                VALUES (%s, %s, %s, %s, TRUE, %s, NOW(), %s)
+                """,
+                (symbol, apos.get("qty", 0), apos.get("side", "long"), apos.get("avg_entry", 0),
+                 resolution, position_id),
+            )
+    conn.commit()
+
+
 def resolve_alpaca_not_ledger(conn, symbol: str, apos: dict) -> str | None:
     """
     Returns the new position_id (str) if the position was reconstructed
@@ -347,20 +386,9 @@ def resolve_alpaca_not_ledger(conn, symbol: str, apos: dict) -> str | None:
             )
         conn.commit()
 
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO nwt_unknown_broker_positions
-                  (symbol, qty, side, avg_price, order_history, resolved, resolution,
-                   resolved_at, reconstructed_position_id)
-                VALUES (%s, %s, %s, %s, %s, TRUE, 'auto_reconstructed', NOW(), %s)
-                ON CONFLICT (symbol) WHERE NOT resolved DO UPDATE SET
-                  resolved = TRUE, resolution = 'auto_reconstructed', resolved_at = NOW(),
-                  reconstructed_position_id = %s, last_seen_at = NOW()
-                """,
-                (symbol, apos["qty"], apos["side"], apos["avg_entry"], None, position_id, position_id),
-            )
-        conn.commit()
+        _mark_unknown_broker_position_resolved(
+            conn, symbol, apos, "auto_reconstructed", position_id,
+        )
         logger.info("recon: %s auto-reconstructed as position_id=%s from matched order", symbol, position_id)
         return position_id
 
@@ -619,7 +647,11 @@ def adopt_untracked(conn) -> int:
         return 0
 
     for p in untracked:
-        _import_alpaca_position(conn, p)
+        position_id = _import_alpaca_position(conn, p)
+        qty = float(p.get("qty", 0))
+        apos = {"qty": qty, "side": "long" if qty > 0 else "short",
+               "avg_entry": float(p.get("avg_entry_price", 0))}
+        _mark_unknown_broker_position_resolved(conn, p.get("symbol", ""), apos, "human_cleared", position_id)
 
     insert_ticket(conn, "RECON_AGENT", "SYSTEM", "untracked_adopted", {
         "adopted": len(untracked),

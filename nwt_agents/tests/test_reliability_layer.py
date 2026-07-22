@@ -350,6 +350,32 @@ def test_recon_broker_only_position_unresolved_tracked_not_silently_dropped(conn
     assert first_seen_again == first_seen  # but first_seen_at persists
 
 
+def test_adopt_untracked_marks_unknown_broker_position_resolved(conn, monkeypatch):
+    """
+    Regression: adopt_untracked() imported the position into the ledger but
+    never marked the corresponding nwt_unknown_broker_positions row
+    resolved — system_health.py's report kept listing it as an unresolved
+    broker-only position forever, even after a human had already cleared it.
+    """
+    apos = {"symbol": "AAPL", "qty": "300", "avg_entry_price": "317.5", "asset_class": "us_equity"}
+    monkeypatch.setattr(recon_agent, "fetch_alpaca_positions", lambda: [apos])
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO nwt_unknown_broker_positions (symbol, qty, side, avg_price, resolved) "
+            "VALUES ('AAPL', 300, 'long', 317.5, FALSE)"
+        )
+    conn.commit()
+
+    adopted = recon_agent.adopt_untracked(conn)
+    assert adopted == 1
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT resolved, resolution FROM nwt_unknown_broker_positions WHERE symbol='AAPL'")
+        resolved, resolution = cur.fetchone()
+    assert resolved is True
+    assert resolution == "human_cleared"
+
+
 def test_run_recon_no_trade_mode_only_cites_unresolved_mismatches(conn, monkeypatch):
     """After auto-resolving the AAPL broker-only position, no_trade_mode
     must NOT be set for it — only genuinely unresolved mismatches should
