@@ -986,17 +986,19 @@ def has_pending_force_close_ticket(conn, position_id: str) -> bool:
 
 def schedule_force_close_attempt(conn, position_id: str, asset: str) -> bool:
     """
-    Single atomic decision: should a new FORCE_CLOSE ticket be created for
-    this position right now? If yes, this call also records the attempt
+    Single atomic decision: should a new close-type ticket (FORCE_CLOSE OR
+    CLOSE_REQUEST — this is the shared per-position close-attempt gate for
+    both, not FORCE_CLOSE-specific despite the name) be created for this
+    position right now? If yes, this call also records the attempt
     (state=ATTEMPTING, attempt_count+1, last_attempt_at=NOW()) in the same
     statement — there is no separate read-then-write step, so two
     overlapping risk_agent.py runs (crontab has no flock) cannot both decide
     to retry the same position in the same window.
 
-    Returns True  -> caller should create a FORCE_CLOSE ticket now.
-    Returns False -> caller must NOT create a ticket: a FORCE_CLOSE ticket
-                      for this position is already outstanding
-                      (has_pending_force_close_ticket), the position is
+    Returns True  -> caller should create a ticket now.
+    Returns False -> caller must NOT create a ticket: a close-type ticket
+                      for this position is already outstanding (either
+                      FORCE_CLOSE or CLOSE_REQUEST), the position is
                       already terminal (SUCCESS/FAILED_TERMINAL/
                       FAILED_REQUIRES_HUMAN), still inside its backoff
                       cooldown, or a prior attempt may still be in flight.
@@ -1005,7 +1007,14 @@ def schedule_force_close_attempt(conn, position_id: str, asset: str) -> bool:
                       FAILED_REQUIRES_HUMAN and logs CRITICAL once — the
                       caller still gets False and must not create a ticket.
     """
-    if has_pending_force_close_ticket(conn, position_id):
+    # Shared per-position backoff clock: a pending CLOSE_REQUEST represents
+    # an in-flight attempt to close this exact position just as much as a
+    # pending FORCE_CLOSE does (both feed process_close_ticket /
+    # process_force_close in execution/engine.py, and both write outcomes
+    # into this same nwt_force_close_state row). Without checking both, a
+    # position mid-backoff on one ticket type could still get a fresh
+    # attempt from the other, defeating the whole point of the backoff.
+    if has_pending_force_close_ticket(conn, position_id) or has_pending_close_ticket(conn, position_id):
         return False
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -1057,8 +1066,8 @@ def schedule_force_close_attempt(conn, position_id: str, asset: str) -> bool:
 
     if row["state"] == "FAILED_REQUIRES_HUMAN":
         log_system_event(
-            conn, "CRITICAL", "risk_agent",
-            f"FORCE_CLOSE exhausted {FORCE_CLOSE_MAX_ATTEMPTS} attempts for {asset} "
+            conn, "CRITICAL", "close_attempt_scheduler",
+            f"Close attempts exhausted ({FORCE_CLOSE_MAX_ATTEMPTS}) for {asset} "
             f"(position_id={position_id}) — escalated to FAILED_REQUIRES_HUMAN, "
             f"no further automatic retries. Needs manual intervention.",
             {"position_id": position_id, "asset": asset, "attempt_count": row["attempt_count"]},

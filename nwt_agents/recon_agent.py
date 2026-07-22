@@ -31,8 +31,12 @@ Logic:
        Unresolved: CRITICAL, no_trade_mode set, tracked in
        nwt_unknown_broker_positions for human review with full context
        already gathered.
-     - qty_mismatch         → CRITICAL: set no_trade_mode. No auto-resolution
-       (options only; adjusting a quantity automatically risks masking a
+     - qty_mismatch         → CRITICAL: set no_trade_mode. Compares SIGNED
+       net exposure (long positive, short negative) per symbol, not raw
+       summed qty — two legitimate opposite-direction strategies in the
+       same symbol (Alpaca nets them into one broker position) must never
+       false-positive. Applies to every asset_type, not just options. No
+       auto-resolution (adjusting a quantity automatically risks masking a
        real problem rather than fixing one).
      - in_ledger_not_alpaca → attempt automatic resolution: a matching
        closing order at the broker → CLOSED (real exit price); an option
@@ -483,16 +487,30 @@ def run_recon(conn, mode: str) -> bool:
 
     # 3: Qty mismatch — CRITICAL, no auto-resolution (adjusting a quantity
     # automatically risks masking a real problem rather than fixing one).
+    #
+    # Compares SIGNED net exposure (long positive, short negative), not raw
+    # summed qty — Alpaca nets opposite-direction positions in the same
+    # symbol into one broker-side position (e.g. one strategy long 5 shares
+    # + another strategy short 3 shares of the same equity = one broker
+    # position of +2). An unsigned qty sum would either false-positive on
+    # this completely legitimate case, or (for the equity check this
+    # replaces, which used to skip non-option assets entirely) never catch
+    # a real drift at all. Applies to every asset_type now — this used to
+    # be `if asset_type != "option": continue`, which is exactly why the
+    # QQQ long(5)/short(3) vs broker(+2) situation was invisible to recon:
+    # equities were never qty-checked at all, signed or otherwise.
     for sym in set(alpaca_map) & set(ledger_map):
-        asset_type = ledger_map[sym][0].get("asset_type", "equity")
-        if asset_type != "option":
-            continue
-        alpaca_qty = alpaca_map[sym]["qty"]
-        ledger_qty = sum(float(row.get("qty") or 0) for row in ledger_map[sym])
-        if abs(alpaca_qty - ledger_qty) > 0.5:
+        alpaca_side = alpaca_map[sym]["side"]
+        broker_net = alpaca_map[sym]["qty"] * (1.0 if alpaca_side == "long" else -1.0)
+        ledger_net = sum(
+            float(row.get("qty") or 0) * (1.0 if row.get("direction") != "short" else -1.0)
+            for row in ledger_map[sym]
+        )
+        if abs(broker_net - ledger_net) > 0.5:
             entry = {"class": "qty_mismatch", "symbol": sym,
-                     "alpaca_qty": alpaca_qty, "ledger_qty": ledger_qty}
-            logger.error("CRITICAL qty mismatch: %s alpaca=%.0f ledger=%.0f", sym, alpaca_qty, ledger_qty)
+                     "broker_net_qty": broker_net, "ledger_net_qty": ledger_net}
+            logger.error("CRITICAL qty mismatch: %s broker_net=%.0f ledger_net=%.0f",
+                        sym, broker_net, ledger_net)
             mismatches.append(entry)
             critical = True
 

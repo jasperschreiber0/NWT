@@ -40,6 +40,7 @@ from shared_context import (
     pre_trade_veto,
     release_ticket_claim,
     renew_ticket_claim,
+    schedule_force_close_attempt,
 )
 
 logging.basicConfig(
@@ -359,16 +360,6 @@ def _get_option_price(option_symbol: str) -> float | None:
 
 
 def _position_qty(pos: dict) -> int:
-    """
-    The position's REAL contract count — the ledger qty column, which is the
-    actual Alpaca fill. The notional/entry_price fallback exists only for
-    legacy rows written before the qty column: deriving qty from notional on
-    a row that has real qty under-counted the AAPL260717C00312500 close
-    (sold 3 of 6 held contracts, the rest rode into expiry).
-    """
-    ledger_qty = pos.get("qty")
-    if ledger_qty:
-        return max(int(float(ledger_qty)), 1)
     entry_price = float(pos.get("entry_price") or 0)
     notional = float(pos.get("notional_risk") or 0)
     return max(int(round(notional / (entry_price * 100))) if entry_price > 0 else 1, 1)
@@ -396,9 +387,19 @@ def _emit_close_request(conn, pos: dict, exit_reason: str) -> None:
     engine's process_close_ticket looks this up again from the ledger before
     choosing buy-vs-sell to close, but carrying it here too keeps the ticket
     payload self-describing.
+
+    Gated by schedule_force_close_attempt (the shared per-position
+    close-attempt state machine — despite the name, it governs CLOSE_REQUEST
+    too, see its docstring): a position that keeps failing to close gets
+    bounded retries with backoff instead of a fresh ticket every monitor
+    cycle forever.
     """
     position_id = str(pos["position_id"])
     symbol = pos.get("asset", "")
+    if not schedule_force_close_attempt(conn, position_id, symbol):
+        logger.info("Close for %s (position_id=%s) not scheduled — terminal, cooling off, "
+                    "or already in flight", symbol, position_id)
+        return
     try:
         insert_ticket(
             conn,

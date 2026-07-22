@@ -43,6 +43,7 @@ from ledger import (
     release_advisory_lock,
     release_ticket_claim,
     renew_ticket_claim,
+    schedule_close_attempt,
     transition_position_state,
     try_advisory_lock,
 )
@@ -1101,7 +1102,20 @@ def _emit_equity_close_request(conn, pos: dict, position_id: str, symbol: str,
     filled qty over a notional/entry_price recomputation — the same fix
     that keeps process_close_ticket from under-selling a position whose
     entry qty was rounded.
+
+    Gated by schedule_close_attempt: a position that keeps failing to close
+    (e.g. Alpaca rejects the qty — a long/short netting collision in the
+    same symbol, or genuine ledger/broker drift) gets bounded retries with
+    backoff instead of a fresh CLOSE_REQUEST every single monitor cycle
+    forever. See db/migrate_2026_07_execution_safety.sql's
+    nwt_force_close_state — this is the same state machine FORCE_CLOSE
+    already uses, shared per position_id regardless of ticket type.
     """
+    if not schedule_close_attempt(conn, position_id, symbol):
+        logger.info("Equity close for %s (position_id=%s) not scheduled — terminal, cooling "
+                    "off, or already in flight", symbol, position_id)
+        return
+
     ledger_qty = pos.get("qty")
     qty = int(float(ledger_qty)) if ledger_qty else compute_qty_from_notional(notional, entry_price)
     try:
@@ -1203,6 +1217,13 @@ def process_close_ticket(conn, ticket: dict) -> None:
         # note in process_ticket for why the claim MUST be renewed and
         # checked here, before polling.
         if not renew_ticket_claim(conn, ticket_id, WORKER_ID):
+            # Mirrors process_force_close's identical handling: the order
+            # above is already real at the broker, so losing the claim here
+            # means the outcome is genuinely unknown, not FAILED — a human
+            # or reconcile_unknown_force_close must resolve it against live
+            # broker state before anything retries.
+            if position_id:
+                record_force_close_unknown(conn, position_id, symbol, ticket_id, WORKER_ID)
             raise ClaimLostError(
                 f"Lost claim ownership for ticket {ticket_id} after close order was already "
                 f"submitted — another worker may already be processing it"
@@ -1244,6 +1265,8 @@ def process_close_ticket(conn, ticket: dict) -> None:
                          f"Close executed: {symbol} at {fill_price:.4f}",
                          {"ticket_id": ticket_id, "exit_reason": exit_reason,
                           "position_id": position_id})
+        if fully_closed and position_id:
+            record_force_close_outcome(conn, position_id, success=True)
     except ClaimLostError:
         raise  # propagate untouched — see ClaimLostError's docstring
     except Exception as exc:
@@ -1251,6 +1274,63 @@ def process_close_ticket(conn, ticket: dict) -> None:
         logger.error("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "FAILED", reason)
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+        if position_id:
+            terminal, class_reason = _classify_close_order_failure(symbol, asset_type, exc)
+            record_force_close_outcome(conn, position_id, success=False, error=str(exc),
+                                       terminal=terminal, terminal_reason=class_reason if terminal else None)
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        record_execution_attempt(conn, ticket_id, "submit_close", "error",
+                                 client_order_id=client_order_id,
+                                 error_state=str(status_code or type(exc).__name__),
+                                 payload={"symbol": symbol, "qty": qty})
+
+
+def _is_broker_qty_mismatch_error(exc: Exception) -> bool:
+    """
+    True if this exception is Alpaca's specific "insufficient qty available"
+    rejection (code 40310000) on a POST /v2/orders close attempt — most
+    commonly a long/short netting collision (Alpaca nets opposite-direction
+    ledger positions in the same symbol into one broker-side position, so
+    closing the larger leg while the smaller opposite leg is still open can
+    transiently fail) but can also indicate genuine ledger/broker qty drift.
+    Either way it needs a distinct, searchable label rather than being
+    lumped in with generic order-placement failures — see
+    recon_agent.py's signed net-exposure check for the actual disambiguation.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return False
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    if isinstance(body, dict) and body.get("code") == 40310000:
+        return True
+    text = (getattr(resp, "text", "") or "").lower()
+    return "insufficient qty available" in text
+
+
+def _classify_close_order_failure(asset: str, asset_type: str, exc: Exception) -> tuple:
+    """
+    Decide whether a failed CLOSE_REQUEST order submission (POST
+    /v2/orders) is terminal or retryable. Distinct from
+    _classify_force_close_failure (below): that one is written for the
+    FORCE_CLOSE DELETE endpoint, where a 404 specifically means "already
+    closed" — that doesn't hold for POST /orders, where a 404 would mean
+    something else entirely (bad symbol), so the two are not
+    interchangeable despite similar shape.
+    Returns (terminal: bool, reason: str).
+    """
+    if _is_broker_qty_mismatch_error(exc):
+        # Retryable, not terminal — schedule_close_attempt's own backoff and
+        # FORCE_CLOSE_MAX_ATTEMPTS ceiling (not this function) decide when to
+        # stop retrying and escalate to FAILED_REQUIRES_HUMAN.
+        return False, "BROKER_QTY_MISMATCH: insufficient qty available at broker — possible long/short netting collision or ledger drift, see recon"
+    if asset_type == "option":
+        dte = _option_dte(asset)
+        if dte is not None and dte < 0:
+            return True, f"Option expired {abs(dte)}d ago — awaiting broker auto-settlement"
+    return False, str(exc)
 
 
 def _classify_force_close_failure(asset: str, asset_type: str, exc: Exception) -> tuple:
