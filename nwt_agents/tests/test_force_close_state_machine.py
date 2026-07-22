@@ -196,7 +196,7 @@ def test_escalates_to_failed_requires_human_after_max_attempts(conn):
 
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT COUNT(*) FROM nwt_system_log WHERE level = 'CRITICAL' AND component = 'risk_agent'"
+            "SELECT COUNT(*) FROM nwt_system_log WHERE level = 'CRITICAL' AND component = 'close_attempt_scheduler'"
         )
         (critical_count,) = cur.fetchone()
     assert critical_count >= 1

@@ -40,6 +40,7 @@ from shared_context import (
     pre_trade_veto,
     release_ticket_claim,
     renew_ticket_claim,
+    schedule_force_close_attempt,
 )
 
 logging.basicConfig(
@@ -386,9 +387,19 @@ def _emit_close_request(conn, pos: dict, exit_reason: str) -> None:
     engine's process_close_ticket looks this up again from the ledger before
     choosing buy-vs-sell to close, but carrying it here too keeps the ticket
     payload self-describing.
+
+    Gated by schedule_force_close_attempt (the shared per-position
+    close-attempt state machine — despite the name, it governs CLOSE_REQUEST
+    too, see its docstring): a position that keeps failing to close gets
+    bounded retries with backoff instead of a fresh ticket every monitor
+    cycle forever.
     """
     position_id = str(pos["position_id"])
     symbol = pos.get("asset", "")
+    if not schedule_force_close_attempt(conn, position_id, symbol):
+        logger.info("Close for %s (position_id=%s) not scheduled — terminal, cooling off, "
+                    "or already in flight", symbol, position_id)
+        return
     try:
         insert_ticket(
             conn,

@@ -613,3 +613,114 @@ def has_pending_close_ticket(conn, position_id: str) -> bool:
         )
         (exists,) = cur.fetchone()
     return bool(exists)
+
+
+def has_pending_force_close_ticket(conn, position_id: str) -> bool:
+    """Duplicated from nwt_agents/shared_context.py's twin function — see
+    there for the full rationale (state-based, not time-window, dedup)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM nwt_tickets t
+              WHERE t.type = 'FORCE_CLOSE'
+                AND t.payload->>'position_id' = %s
+                AND NOT EXISTS (
+                  SELECT 1 FROM nwt_ticket_decisions d
+                  WHERE d.ticket_id = t.ticket_id AND d.decided_by = 'EXECUTION_ENGINE'
+                )
+            )
+            """,
+            (position_id,),
+        )
+        (exists,) = cur.fetchone()
+    return bool(exists)
+
+
+# ---------------------------------------------------------------------------
+# Close-attempt scheduler — duplicated from
+# nwt_agents/shared_context.schedule_force_close_attempt (same mechanism,
+# same table, same pattern as everything else in this file). engine.py's
+# own equity position monitor (run_equity_position_monitor /
+# _emit_equity_close_request) calls this in-process, the same way
+# risk_agent.py and execution_agent.py call the shared_context.py copy —
+# both write into the SAME nwt_force_close_state row per position_id, so a
+# CLOSE_REQUEST and a FORCE_CLOSE for the same position share one backoff
+# clock regardless of which component or deployment unit created the
+# ticket.
+# ---------------------------------------------------------------------------
+
+FORCE_CLOSE_MAX_ATTEMPTS = len(FORCE_CLOSE_BACKOFF_MINUTES)
+FORCE_CLOSE_ATTEMPTING_COOLDOWN_MINUTES = 15
+
+
+def schedule_close_attempt(conn, position_id: str, asset: str) -> bool:
+    """
+    Single atomic decision: should a new close-type ticket (CLOSE_REQUEST or
+    FORCE_CLOSE) be created for this position right now? See
+    shared_context.schedule_force_close_attempt for the full rationale —
+    identical logic, same nwt_force_close_state table, kept in sync
+    manually (same duplication pattern as claim_ticket/release_ticket_claim
+    elsewhere in this file).
+    """
+    if has_pending_force_close_ticket(conn, position_id) or has_pending_close_ticket(conn, position_id):
+        return False
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_force_close_state
+              (position_id, asset, state, attempt_count, last_attempt_at, updated_at)
+            VALUES (%(position_id)s, %(asset)s, 'ATTEMPTING', 1, NOW(), NOW())
+            ON CONFLICT (position_id) DO UPDATE SET
+              state = CASE
+                WHEN nwt_force_close_state.attempt_count + 1 > %(max_attempts)s
+                  THEN 'FAILED_REQUIRES_HUMAN'
+                ELSE 'ATTEMPTING'
+              END,
+              attempt_count = nwt_force_close_state.attempt_count + 1,
+              last_attempt_at = NOW(),
+              escalated_at = CASE
+                WHEN nwt_force_close_state.attempt_count + 1 > %(max_attempts)s THEN NOW()
+                ELSE nwt_force_close_state.escalated_at
+              END,
+              updated_at = NOW()
+            WHERE
+              nwt_force_close_state.state NOT IN ('SUCCESS', 'FAILED_TERMINAL', 'FAILED_REQUIRES_HUMAN')
+              AND (
+                nwt_force_close_state.state != 'FAILED_RETRYABLE'
+                OR nwt_force_close_state.next_retry_at IS NULL
+                OR nwt_force_close_state.next_retry_at <= NOW()
+              )
+              AND (
+                nwt_force_close_state.state != 'ATTEMPTING'
+                OR nwt_force_close_state.last_attempt_at IS NULL
+                OR nwt_force_close_state.last_attempt_at
+                   <= NOW() - (%(attempting_cooldown)s * INTERVAL '1 minute')
+              )
+            RETURNING state, attempt_count
+            """,
+            {
+                "position_id": position_id,
+                "asset": asset,
+                "max_attempts": FORCE_CLOSE_MAX_ATTEMPTS,
+                "attempting_cooldown": FORCE_CLOSE_ATTEMPTING_COOLDOWN_MINUTES,
+            },
+        )
+        row = cur.fetchone()
+    conn.commit()
+
+    if row is None:
+        return False
+
+    if row["state"] == "FAILED_REQUIRES_HUMAN":
+        log_system_event(
+            conn, "CRITICAL", "close_attempt_scheduler",
+            f"Close attempts exhausted ({FORCE_CLOSE_MAX_ATTEMPTS}) for {asset} "
+            f"(position_id={position_id}) — escalated to FAILED_REQUIRES_HUMAN, "
+            f"no further automatic retries. Needs manual intervention.",
+            {"position_id": position_id, "asset": asset, "attempt_count": row["attempt_count"]},
+        )
+        return False
+
+    return True

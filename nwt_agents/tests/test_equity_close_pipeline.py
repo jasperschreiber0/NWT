@@ -37,6 +37,7 @@ os.environ.setdefault("NWT_DB_DSN", "postgresql://unused/unused")
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "execution"))
 import engine  # noqa: E402
+import ledger  # noqa: E402
 
 from shared_context import has_pending_close_ticket as shared_has_pending_close_ticket  # noqa: E402
 
@@ -198,6 +199,18 @@ def test_dedup_survives_past_the_old_2_hour_window(conn, monkeypatch):
 
 
 def test_dedup_allows_a_new_ticket_once_the_prior_one_is_decided(conn, monkeypatch):
+    """
+    A decided (non-pending) ticket must not permanently block a position
+    from ever being retried — but it also must not be immediately
+    retryable the instant it's decided, which was the actual bug behind
+    the QQQ incident (a FAILED decision freed the position up for a brand
+    new CLOSE_REQUEST on literally the next 5-minute monitor cycle,
+    forever, with no backoff). schedule_close_attempt's bounded backoff
+    (see execution/ledger.py) now sits between "decided" and "retryable
+    again" — this test proves both halves: immediately after a FAILED
+    decision, no new ticket is created (still cooling off); once the
+    backoff window has passed, a new one is.
+    """
     position_id = _insert_equity_position(conn, entry_price=100.0, notional=1000.0,
                                           stop_pct=0.015, target_pct=0.025)
     monkeypatch.setattr(engine, "get_current_price", lambda symbol: 98.0)
@@ -213,9 +226,19 @@ def test_dedup_allows_a_new_ticket_once_the_prior_one_is_decided(conn, monkeypat
             (ticket_id,),
         )
     conn.commit()
+    ledger.record_force_close_outcome(conn, position_id, success=False, error="simulated failure")
 
-    engine.run_equity_position_monitor(conn)  # position is still open, still at stop
+    engine.run_equity_position_monitor(conn)  # still cooling off — must NOT create a second ticket
+    assert len(_fetch_close_request_tickets(conn, position_id)) == 1
 
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE nwt_force_close_state SET next_retry_at = NOW() - INTERVAL '1 second' "
+            "WHERE position_id = %s", (position_id,),
+        )
+    conn.commit()
+
+    engine.run_equity_position_monitor(conn)  # backoff has elapsed — now eligible again
     assert len(_fetch_close_request_tickets(conn, position_id)) == 2
 
 
