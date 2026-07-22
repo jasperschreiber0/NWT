@@ -5,6 +5,10 @@ Fires every 5 minutes 13:00-21:00 UTC via cron.
 
 Rules 0-13: veto individual trade proposals.
 Rules 14-17: system-level enforcement (heartbeat, drawdown, VIX, intraday PnL) — sets no_trade_mode.
+Rule 18: opposing same-symbol equity exposure — vetoes a proposal that
+would create opposite-direction exposure in a symbol another strategy
+already holds open, preventing Alpaca's broker-side same-symbol netting
+from colliding with two independently-tracked NWT positions on close.
 """
 
 import json
@@ -28,6 +32,7 @@ from shared_context import (
     get_db,
     get_disabled_tracks,
     get_distinct_trade_pnls,
+    has_opposing_symbol_exposure,
     insert_decision,
     insert_ticket,
     load_master_directives,
@@ -531,7 +536,20 @@ def evaluate_proposal(
     if from_track in disabled_tracks:
         return "VETOED", f"Rule 13: Track {from_track} is in cooling-off — proposals rejected", None
 
-    reasoning = "All 13 risk rules passed"
+    # Rule 18: Opposing same-symbol equity exposure. Prevents entering the
+    # state that caused the QQQ/AAPL "insufficient qty available" incidents
+    # — Alpaca nets same-symbol long/short exposure into one broker
+    # position regardless of which strategy NWT's ledger attributes it to.
+    # Options excluded — see has_opposing_symbol_exposure's docstring.
+    asset_type = (payload.get("asset_type") or "equity").lower()
+    if symbol and direction and has_opposing_symbol_exposure(conn, symbol, direction, asset_type):
+        return "VETOED", (
+            f"Rule 18: {symbol} already has open {('short' if direction != 'short' else 'long')} "
+            f"exposure from another strategy — opposing-direction entry rejected to avoid a "
+            f"broker-side netting collision on close"
+        ), None
+
+    reasoning = "All risk rules passed"
     if sizing_multiplier is not None:
         reasoning += f" (sizing_multiplier={sizing_multiplier})"
     return "APPROVED", reasoning, sizing_multiplier

@@ -1202,3 +1202,47 @@ def record_execution_attempt(conn, ticket_id: str, action: str, result: str,
              fill_state, error_state, json.dumps(payload) if payload is not None else None),
         )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Same-symbol opposing exposure guard — risk_agent.py Rule 18. Prevents the
+# QQQ/AAPL class of incident at the source: two independent strategies
+# taking opposite-direction positions in the same symbol, which NWT's
+# per-strategy ledger tracks separately but Alpaca nets into one broker
+# position. That netting is what caused "insufficient qty available" on
+# close, retried unboundedly before schedule_close_attempt existed. Rather
+# than build a portfolio-level netting/coordination layer (a much larger,
+# riskier change touching Portfolio Brain's ownership boundary), this stops
+# the dangerous state from being entered in the first place — CLAUDE.md's
+# own stated priority ("Bots silently converging... is the single most
+# dangerous failure mode") already favors isolation over strategy
+# independence when the two conflict.
+#
+# Scoped to equities only: nwt_portfolio_ledger.asset for an option row is
+# the OCC contract symbol (unique per strike/expiry), not the underlying,
+# so this exact-match check can't and shouldn't apply there — a strategy
+# legitimately holding both calls and puts on the same underlying is a
+# different, harder problem (multi-strike structures, underlying-level
+# delta) already partially owned by Portfolio Brain's net_delta_estimate,
+# not something to fold into this check.
+# ---------------------------------------------------------------------------
+
+def has_opposing_symbol_exposure(conn, symbol: str, direction: str, asset_type: str = "equity") -> bool:
+    """True if another OPEN equity position in this exact symbol already
+    holds the opposite direction. Only meaningful for equities — see
+    module note above for why options are out of scope."""
+    if asset_type != "equity" or not symbol:
+        return False
+    opposite = "short" if direction != "short" else "long"
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM nwt_portfolio_ledger
+              WHERE asset = %s AND asset_type = 'equity' AND status = 'open' AND direction = %s
+            )
+            """,
+            (symbol, opposite),
+        )
+        (exists,) = cur.fetchone()
+    return bool(exists)

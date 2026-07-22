@@ -216,7 +216,9 @@ CREATE TABLE nwt_inflight_orders (
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     resolved_at TIMESTAMPTZ,
-    resolution TEXT
+    resolution TEXT,
+    last_checked_at TIMESTAMPTZ,
+    stale_since TIMESTAMPTZ
 );
 
 -- Mirrors db/schema.sql — needed by run_equity_position_monitor()'s
