@@ -33,8 +33,10 @@ from shared_context import (
     load_master_directives,
     log_system_event,
     option_dte,
+    release_advisory_lock,
     schedule_force_close_attempt,
     set_no_trade_mode,
+    try_advisory_lock,
 )
 
 logging.basicConfig(
@@ -241,22 +243,15 @@ def fetch_vix_with_fallback(conn) -> tuple:
 
 
 def execution_engine_is_stale(conn) -> bool:
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT last_beat FROM nwt_heartbeat WHERE service = 'execution_engine'"
-        )
-        row = cur.fetchone()
-    if row:
-        age = (datetime.now(timezone.utc) - row[0].replace(tzinfo=timezone.utc)).total_seconds()
-        if age <= HEARTBEAT_STALE_MINUTES * 60:
-            # Engine is alive. A fresh heartbeat short-circuits the
-            # pending-ticket heuristic below, because the engine now
-            # legitimately defers entry tickets (no decision written) while
-            # the market is closed — old pending tickets with no recent
-            # decisions is the NORMAL pre-open state, not unresponsiveness.
-            return False
-        if _is_market_hours():
-            return True
+    if _is_market_hours():
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT last_beat FROM nwt_heartbeat WHERE service = 'execution_engine'"
+            )
+            row = cur.fetchone()
+        if row:
+            age = (datetime.now(timezone.utc) - row[0].replace(tzinfo=timezone.utc)).total_seconds()
+            return age > HEARTBEAT_STALE_MINUTES * 60
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=EXECUTION_STALE_MINUTES)
     with conn.cursor() as cur:
         cur.execute(
@@ -298,6 +293,13 @@ def get_positions_past_hard_close(conn) -> list:
     if datetime.now(timezone.utc) < hard_close:
         return []
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # status='open' also covers lifecycle_state RECON_PENDING/RECONCILING/
+        # UNKNOWN (see LEGACY_STATUS_FOR_LIFECYCLE in shared_context.py) — a
+        # position recon flagged as broker-missing-but-unresolved still gets
+        # swept here instead of becoming invisible. If it really is gone at
+        # the broker, process_force_close's pre-flight 404 check closes it
+        # cleanly; if recon's own resolver already closed/expired it, it's
+        # no longer status='open' and won't appear here at all.
         cur.execute(
             "SELECT * FROM nwt_portfolio_ledger WHERE status='open' AND asset_type='option'"
         )
@@ -591,7 +593,7 @@ def force_close_past_hard_close(conn, positions: list) -> None:
                     "option_symbol": asset,
                     "direction": "close",
                     "strategy_id": "FORCE_CLOSE",
-                    "sized_notional": float(pos.get("notional_risk", 0)),
+                    "sized_notional": float(pos.get("notional_risk") or 0),
                     "asset_type": "option",
                     "time_in_force": "day",
                     "exit_reason": "hard_close",
@@ -612,6 +614,10 @@ def force_close_past_hard_close(conn, positions: list) -> None:
 def main() -> None:
     conn = get_db()
     try:
+        if not try_advisory_lock(conn, "risk_agent"):
+            logger.warning("risk_agent: another instance is already running — skipping this invocation")
+            return
+
         halted, halt_reason = check_no_trade_mode(conn)
         if halted:
             logger.warning("no_trade_mode is SET: %s — system rules will still run", halt_reason)
@@ -680,6 +686,10 @@ def main() -> None:
         logger.info("Risk agent done — %d approved, %d vetoed", approved_count, vetoed_count)
 
     finally:
+        try:
+            release_advisory_lock(conn, "risk_agent")
+        except Exception:
+            pass
         conn.close()
 
 
