@@ -37,10 +37,14 @@ from ledger import (
     insert_ticket,
     log_system_event,
     record_client_order_id,
+    record_execution_attempt,
     record_force_close_outcome,
     record_force_close_unknown,
+    release_advisory_lock,
     release_ticket_claim,
     renew_ticket_claim,
+    transition_position_state,
+    try_advisory_lock,
 )
 
 _here = Path(__file__).parent
@@ -595,7 +599,23 @@ def resolve_inflight_orders(conn) -> None:
     INFLIGHT_ENTRY_CANCEL_AFTER_HOURS get a cancel request (the cancel drives
     them terminal on a later cycle). Close orders are never auto-canceled —
     a working close is still reducing risk.
+
+    Guarded by a process-level advisory lock: fetch_pending_inflight()'s row
+    fetch has no per-row claim, so two concurrent engine.py invocations
+    (crontab.txt has no flock) could otherwise both resolve the same
+    in-flight row. Skips this whole cycle's resolution (not fatal — the next
+    cron tick 5 minutes later retries) if another instance already holds it.
     """
+    if not try_advisory_lock(conn, "resolve_inflight_orders"):
+        logger.warning("resolve_inflight_orders: another instance already holds this lock — skipping this cycle")
+        return
+    try:
+        _resolve_inflight_orders_locked(conn)
+    finally:
+        release_advisory_lock(conn, "resolve_inflight_orders")
+
+
+def _resolve_inflight_orders_locked(conn) -> None:
     for row in fetch_pending_inflight(conn):
         inflight_id = str(row["id"])
         order_id = row["alpaca_order_id"]
@@ -956,6 +976,7 @@ def apply_close_fill(conn, pos: dict, filled_qty: float, fill_price: float,
         logger.warning("apply_close_fill: position %s was already closed by another attempt — "
                        "not writing a duplicate trade outcome", position_id)
         return True
+    transition_position_state(conn, position_id, "CLOSED", f"filled: {exit_reason}", "execution_engine")
     if pos.get("asset_type") == "option":
         write_trade_outcome(conn, pos, fill_price, exit_reason, strategy_id)
     return True
@@ -1175,6 +1196,9 @@ def process_close_ticket(conn, ticket: dict) -> None:
 
     try:
         order = existing_order or place_close_order(symbol, qty, asset_type, client_order_id, side=close_side)
+        record_execution_attempt(conn, ticket_id, "submit_close", "accepted",
+                                 client_order_id=client_order_id, broker_order_id=order.get("id"),
+                                 payload={"symbol": symbol, "qty": qty, "side": close_side})
         # The order above is real at the broker now — see the identical
         # note in process_ticket for why the claim MUST be renewed and
         # checked here, before polling.
@@ -1294,6 +1318,8 @@ def reconcile_unknown_force_close(conn, position_id: str, asset: str) -> str | N
         return "FAILED_RETRYABLE"
 
     close_position(conn, position_id, 0.0, 0.0, "already_closed_at_broker")
+    transition_position_state(conn, position_id, "CLOSED",
+                              "reconcile_unknown_force_close: broker confirms closed", "execution_engine")
     record_force_close_outcome(conn, position_id, success=True)
     logger.info("Reconciled position %s: broker confirms closed -> SUCCESS", position_id)
     return "SUCCESS"
@@ -1386,9 +1412,13 @@ def process_force_close(conn, ticket: dict) -> None:
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
         if status_code == 404:
             close_position(conn, position_id, 0.0, 0.0, "already_closed_at_broker")
+            transition_position_state(conn, position_id, "CLOSED",
+                                      "force_close pre-flight: no position at broker", "execution_engine")
             insert_decision(conn, ticket_id, "SKIPPED",
                             f"FORCE_CLOSE: pre-flight check found no position for {asset} — already closed")
             record_force_close_outcome(conn, position_id, success=True)
+            record_execution_attempt(conn, ticket_id, "preflight_check", "rejected",
+                                     error_state="404", payload={"asset": asset})
             logger.info("Ticket %s: pre-flight check found %s already closed — skipped DELETE", ticket_id, asset)
             return
         # Any other pre-flight failure (network blip, 5xx) — fall through
@@ -1401,13 +1431,19 @@ def process_force_close(conn, ticket: dict) -> None:
         order = alpaca_delete(f"/positions/{asset}")
     except Exception as exc:
         already_closed, terminal, class_reason = _classify_force_close_failure(asset, asset_type, exc)
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
 
         if already_closed:
             fallback_price = expected_price or 0.0
             close_position(conn, position_id, fallback_price, 0.0, "already_closed_at_broker",
                            exit_bid=exit_bid, exit_ask=exit_ask)
+            transition_position_state(conn, position_id, "CLOSED",
+                                      f"force_close: {class_reason}", "execution_engine")
             insert_decision(conn, ticket_id, "SKIPPED", f"FORCE_CLOSE: {class_reason}")
             record_force_close_outcome(conn, position_id, success=True)
+            record_execution_attempt(conn, ticket_id, "force_close", "rejected",
+                                     error_state=str(status_code or "already_closed"),
+                                     payload={"asset": asset, "reason": class_reason})
             logger.info("Ticket %s: %s — ledger closed to match", ticket_id, class_reason)
             return
 
@@ -1418,9 +1454,14 @@ def process_force_close(conn, ticket: dict) -> None:
                          {"ticket_id": ticket_id, "terminal": terminal})
         record_force_close_outcome(conn, position_id, success=False, error=str(exc),
                                    terminal=terminal, terminal_reason=class_reason if terminal else None)
+        record_execution_attempt(conn, ticket_id, "force_close", "error",
+                                 error_state=str(status_code or type(exc).__name__),
+                                 payload={"asset": asset, "terminal": terminal})
         return
 
     alpaca_order_id = order.get("id", "")
+    record_execution_attempt(conn, ticket_id, "force_close", "accepted",
+                             broker_order_id=alpaca_order_id, payload={"asset": asset})
     try:
         # Return value MUST be checked: the liquidation DELETE above has
         # already reached the broker for real by this point, so if we've
@@ -1486,7 +1527,12 @@ def process_force_close(conn, ticket: dict) -> None:
     slippage = abs(fill_price - expected_price) / expected_price if expected_price and expected_price > 0 else 0.0
     actually_closed = close_position(conn, position_id, fill_price, slippage, "hard_close",
                                      exit_bid=exit_bid, exit_ask=exit_ask)
+    if actually_closed:
+        transition_position_state(conn, position_id, "CLOSED", "force_close: filled", "execution_engine")
     record_force_close_outcome(conn, position_id, success=True)
+    record_execution_attempt(conn, ticket_id, "force_close", "accepted",
+                             broker_order_id=alpaca_order_id, fill_state="filled",
+                             payload={"asset": asset, "fill_price": fill_price})
 
     if not actually_closed:
         # A real order filled at the broker just now, but the ledger row

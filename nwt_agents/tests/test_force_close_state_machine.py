@@ -311,7 +311,12 @@ def test_classify_404_as_already_closed():
 
 
 def test_classify_expired_option_as_terminal():
-    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%y%m%d")
+    # _option_dte computes "today" in ET, not UTC (engine.py:88) — building
+    # "yesterday" from UTC is wrong for roughly 4-5 hours of every day
+    # (whenever UTC's calendar date has already advanced but ET's hasn't),
+    # making this test flaky by time of day rather than actually broken.
+    from zoneinfo import ZoneInfo
+    yesterday = (datetime.now(ZoneInfo("America/New_York")) - timedelta(days=1)).strftime("%y%m%d")
     expired_symbol = f"SPY{yesterday}C00500000"
 
     already_closed, terminal, reason = _classify_force_close_failure(

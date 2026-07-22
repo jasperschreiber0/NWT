@@ -20,6 +20,10 @@ DROP TABLE IF EXISTS nwt_inflight_orders;
 DROP TABLE IF EXISTS nwt_strategy_genome;
 DROP TABLE IF EXISTS nwt_force_close_state;
 DROP TABLE IF EXISTS nwt_ticket_claims;
+DROP TABLE IF EXISTS position_state_history;
+DROP TABLE IF EXISTS nwt_execution_history;
+DROP TABLE IF EXISTS nwt_unknown_broker_positions;
+DROP TABLE IF EXISTS nwt_system_flags;
 DROP TABLE IF EXISTS nwt_ticket_decisions;
 DROP TABLE IF EXISTS nwt_tickets;
 DROP TABLE IF EXISTS nwt_trade_outcomes;
@@ -54,6 +58,12 @@ CREATE TABLE nwt_portfolio_ledger (
     status TEXT DEFAULT 'open',
     alpaca_order_id TEXT,
     spread_group_id UUID,
+    lifecycle_state TEXT NOT NULL DEFAULT 'OPEN' CHECK (
+        lifecycle_state IN ('OPENING', 'OPEN', 'CLOSING', 'CLOSED', 'EXPIRED',
+                             'RECON_PENDING', 'RECONCILING', 'UNKNOWN')
+    ),
+    recon_attempts INTEGER NOT NULL DEFAULT 0,
+    last_recon_attempt_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -140,6 +150,58 @@ CREATE TABLE nwt_order_submissions (
     ticket_id UUID PRIMARY KEY REFERENCES nwt_tickets(ticket_id),
     client_order_id TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Mirrors db/migrate_2026_07_reliability_layer.sql
+CREATE TABLE position_state_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    position_id UUID NOT NULL REFERENCES nwt_portfolio_ledger(position_id),
+    previous_state TEXT,
+    new_state TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    source TEXT NOT NULL,
+    correlation_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE nwt_execution_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    ticket_id UUID REFERENCES nwt_tickets(ticket_id),
+    client_order_id TEXT,
+    broker_order_id TEXT,
+    action TEXT NOT NULL,
+    submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    result TEXT NOT NULL,
+    fill_state TEXT,
+    error_state TEXT,
+    payload JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE nwt_unknown_broker_positions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    symbol TEXT NOT NULL,
+    qty NUMERIC NOT NULL,
+    side TEXT NOT NULL,
+    avg_price NUMERIC NOT NULL,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    order_history JSONB,
+    resolved BOOLEAN NOT NULL DEFAULT FALSE,
+    resolution TEXT,
+    resolved_at TIMESTAMPTZ,
+    reconstructed_position_id UUID REFERENCES nwt_portfolio_ledger(position_id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX idx_unknown_broker_positions_open
+  ON nwt_unknown_broker_positions (symbol) WHERE NOT resolved;
+
+CREATE TABLE nwt_system_flags (
+    flag TEXT PRIMARY KEY,
+    value BOOLEAN NOT NULL DEFAULT FALSE,
+    reason TEXT,
+    set_by TEXT,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Mirrors db/migrate_2026_07_inflight_orders.sql

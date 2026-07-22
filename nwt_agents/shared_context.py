@@ -1066,3 +1066,130 @@ def schedule_force_close_attempt(conn, position_id: str, asset: str) -> bool:
         return False
 
     return True  # state == 'ATTEMPTING' — caller should create the ticket
+
+
+# ---------------------------------------------------------------------------
+# Position lifecycle state machine — see
+# db/migrate_2026_07_reliability_layer.sql. Duplicated in execution/ledger.py
+# (same pattern as everything else shared across the two deployment units).
+#
+# Replaces the ad-hoc status='suspect' dead end: recon_agent.py used to
+# UPDATE status directly and nothing ever read it back. lifecycle_state is
+# the explicit 8-value state; the legacy `status` column stays in sync via
+# LEGACY_STATUS_FOR_LIFECYCLE so every existing WHERE status='open' query
+# keeps working unmodified — critically, RECON_PENDING/RECONCILING/UNKNOWN
+# all map to status='open' (NOT 'suspect'), so a position recon can't yet
+# explain stays visible to risk_agent.py's Rule 12 and
+# execution_agent.py's options monitor instead of silently disappearing the
+# moment recon flags it.
+# ---------------------------------------------------------------------------
+
+LEGACY_STATUS_FOR_LIFECYCLE = {
+    "OPENING": "open", "OPEN": "open", "CLOSING": "open",
+    "RECON_PENDING": "open", "RECONCILING": "open", "UNKNOWN": "open",
+    "CLOSED": "closed", "EXPIRED": "closed",
+}
+
+
+def transition_position_state(conn, position_id: str, new_state: str, reason: str,
+                               source: str, expected_state: str = None,
+                               correlation_id: str = None) -> bool:
+    """
+    Atomically move a position to a new lifecycle_state, keep legacy status
+    in sync, and append a position_state_history row. Callers must never
+    UPDATE lifecycle_state directly.
+
+    expected_state, if given, makes this a compare-and-swap so two
+    concurrent resolvers racing on the same position can't both "win" and
+    both append contradictory history. Returns False (no-op) if the
+    position doesn't exist or expected_state no longer matches.
+    """
+    if new_state not in LEGACY_STATUS_FOR_LIFECYCLE:
+        raise ValueError(f"Unknown lifecycle_state: {new_state}")
+    legacy_status = LEGACY_STATUS_FOR_LIFECYCLE[new_state]
+
+    with conn.cursor() as cur:
+        if expected_state is not None:
+            cur.execute(
+                """
+                UPDATE nwt_portfolio_ledger SET lifecycle_state = %s, status = %s
+                WHERE position_id = %s AND lifecycle_state = %s
+                """,
+                (new_state, legacy_status, position_id, expected_state),
+            )
+            previous_state = expected_state
+        else:
+            cur.execute(
+                "SELECT lifecycle_state FROM nwt_portfolio_ledger WHERE position_id = %s FOR UPDATE",
+                (position_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            previous_state = row[0]
+            cur.execute(
+                "UPDATE nwt_portfolio_ledger SET lifecycle_state = %s, status = %s WHERE position_id = %s",
+                (new_state, legacy_status, position_id),
+            )
+        updated = cur.rowcount > 0
+
+    if not updated:
+        return False
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO position_state_history
+              (position_id, previous_state, new_state, reason, source, correlation_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (position_id, previous_state, new_state, reason, source, correlation_id),
+        )
+    conn.commit()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Process-level advisory locks — guards an entire cron-invoked script
+# against an overlapping second invocation, for workers that act on a whole
+# candidate set per run (recon_agent, risk_agent's Rule 12 sweep,
+# expiry_sweeper) rather than one claimable ticket at a time. Session-scoped:
+# released automatically when conn closes, or explicitly via
+# release_advisory_lock(). crontab.txt has no flock — this is the only guard
+# these whole-run workers have.
+# ---------------------------------------------------------------------------
+
+def try_advisory_lock(conn, lock_name: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(hashtext(%s)::bigint)", (lock_name,))
+        (acquired,) = cur.fetchone()
+    return bool(acquired)
+
+
+def release_advisory_lock(conn, lock_name: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(hashtext(%s)::bigint)", (lock_name,))
+        cur.fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Unified execution history — one row per broker action attempt. See
+# db/migrate_2026_07_reliability_layer.sql.
+# ---------------------------------------------------------------------------
+
+def record_execution_attempt(conn, ticket_id: str, action: str, result: str,
+                              client_order_id: str = None, broker_order_id: str = None,
+                              fill_state: str = None, error_state: str = None,
+                              payload: dict = None) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_execution_history
+              (ticket_id, client_order_id, broker_order_id, action, result,
+               fill_state, error_state, payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (ticket_id, client_order_id, broker_order_id, action, result,
+             fill_state, error_state, json.dumps(payload) if payload is not None else None),
+        )
+    conn.commit()
