@@ -539,6 +539,22 @@ def upsert_heartbeat(conn) -> None:
 ORDER_TERMINAL_DEAD = ("canceled", "expired", "rejected", "replaced", "stopped")
 INFLIGHT_ENTRY_CANCEL_AFTER_HOURS = 24
 
+# Close-order staleness — see db/migrate_2026_07_inflight_staleness.sql.
+# A close order that's accepted but never fills (the AAPL incident: a "day"
+# order submitted 2s after market close, queued indefinitely) used to sit
+# in nwt_inflight_orders as status='pending' forever, silently blocking
+# every future close attempt on that position via has_pending_inflight_close
+# with zero visibility. Two thresholds, not a new state machine: at STALE,
+# attempt one cancel and raise a visible WARNING ticket (the normal
+# terminal-order path resolves the row once the cancel takes effect); at
+# ESCALATE (cancel never took effect), give up waiting and retire the row,
+# handing the position back to schedule_close_attempt's own bounded
+# retry/FAILED_REQUIRES_HUMAN ceiling — nwt_force_close_state remains the
+# single source of truth for "does this position's close need a human",
+# this table never grows a second, parallel escalation state.
+INFLIGHT_CLOSE_STALE_MINUTES = 30
+INFLIGHT_CLOSE_ESCALATE_MINUTES = 120
+
 
 def record_inflight_order(conn, ticket_id: str, alpaca_order_id: str, kind: str,
                           payload: dict, position_id: str = None,
@@ -684,6 +700,10 @@ def _resolve_inflight_orders_locked(conn) -> None:
 
         # Still working. Entries that have been live too long get canceled —
         # a signal sized against yesterday's prices must not fill tomorrow.
+        with conn.cursor() as cur:
+            cur.execute("UPDATE nwt_inflight_orders SET last_checked_at = NOW() WHERE id = %s", (inflight_id,))
+        conn.commit()
+
         age_hours = (datetime.now(timezone.utc) - row["created_at"]).total_seconds() / 3600
         if row["kind"] == "entry" and age_hours > INFLIGHT_ENTRY_CANCEL_AFTER_HOURS:
             try:
@@ -695,6 +715,76 @@ def _resolve_inflight_orders_locked(conn) -> None:
                 # keep row pending: the cancel resolves it terminally next cycle
             except Exception as exc:
                 logger.warning("In-flight %s: cancel request failed: %s", inflight_id, exc)
+        elif row["kind"] == "close":
+            _handle_stale_close_inflight(conn, row, order, age_hours * 60)
+
+
+def _handle_stale_close_inflight(conn, row: dict, order: dict, age_minutes: float) -> None:
+    """
+    A close order is still working (not filled, not terminal) past
+    INFLIGHT_CLOSE_STALE_MINUTES. Two thresholds:
+
+      STALE (default 30 min): mark stale_since (once — this branch never
+      re-fires for the same row) and request ONE cancel. If the cancel
+      takes effect, the order goes terminal (canceled) and resolves through
+      the ORDER_TERMINAL_DEAD branch on a later poll exactly like any other
+      dead order — no special-casing needed there. A WARNING ticket makes
+      this visible immediately rather than waiting for that resolution.
+
+      ESCALATE (default 120 min): the cancel never took effect (or the
+      order is stuck in a state Alpaca itself won't move past). Stop
+      waiting — retire the row as dead/requires_human and record a
+      retryable failure against nwt_force_close_state, handing the
+      position back to schedule_close_attempt's own bounded ceiling rather
+      than inventing a second escalation path here.
+    """
+    inflight_id = str(row["id"])
+    ticket_id = str(row["ticket_id"]) if row.get("ticket_id") else None
+    position_id = row.get("position_id")
+    payload = row.get("payload") or {}
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    symbol = payload.get("symbol", "")
+    order_id = order.get("id", "")
+
+    if age_minutes >= INFLIGHT_CLOSE_ESCALATE_MINUTES:
+        reason = (f"Close order {order_id} for {symbol} pending {age_minutes:.0f}m with no fill "
+                 f"and no terminal status — giving up on this attempt, needs human review")
+        retire_inflight_order(conn, inflight_id, "dead", "requires_human_stale_timeout")
+        if position_id:
+            record_force_close_outcome(conn, position_id, success=False, error=reason)
+        insert_ticket(conn, "EXECUTION_ENGINE", "SYSTEM", "inflight_close_stuck", {
+            "inflight_id": inflight_id, "ticket_id": ticket_id, "position_id": position_id,
+            "symbol": symbol, "order_id": order_id, "age_minutes": round(age_minutes, 1),
+        })
+        log_system_event(conn, "CRITICAL", "execution_engine", reason,
+                         {"inflight_id": inflight_id, "position_id": position_id, "symbol": symbol})
+        logger.critical(reason)
+        return
+
+    if age_minutes >= INFLIGHT_CLOSE_STALE_MINUTES and row.get("stale_since") is None:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE nwt_inflight_orders SET stale_since = NOW() WHERE id = %s", (inflight_id,))
+        conn.commit()
+
+        cancel_ok = False
+        try:
+            url = f"{ALPACA_BASE_URL}/v2/orders/{order_id}"
+            resp = requests.delete(url, headers=ALPACA_HEADERS, timeout=15)
+            cancel_ok = resp.status_code in (200, 204)
+        except Exception as exc:
+            logger.warning("In-flight %s: stale-close cancel request failed: %s", inflight_id, exc)
+
+        reason = (f"Close order {order_id} for {symbol} pending {age_minutes:.0f}m with no fill — "
+                 f"marked stale, cancel {'requested' if cancel_ok else 'attempt failed'}")
+        insert_ticket(conn, "EXECUTION_ENGINE", "SYSTEM", "inflight_stale_warning", {
+            "inflight_id": inflight_id, "ticket_id": ticket_id, "position_id": position_id,
+            "symbol": symbol, "order_id": order_id, "age_minutes": round(age_minutes, 1),
+            "cancel_requested": cancel_ok,
+        })
+        log_system_event(conn, "WARNING", "execution_engine", reason,
+                         {"inflight_id": inflight_id, "position_id": position_id, "symbol": symbol})
+        logger.warning(reason)
 
 
 def _record_close_fill(conn, inflight_row: dict, order: dict, fill_price: float) -> None:

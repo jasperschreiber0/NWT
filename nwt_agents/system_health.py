@@ -103,6 +103,34 @@ def build_report(conn) -> str:
         for r in rows:
             lines.append(f"  {r['action']}: {r['n']}")
 
+        # --- Stale / stuck in-flight close orders ---
+        cur.execute(
+            """
+            SELECT id, ticket_id, position_id, payload, alpaca_order_id, created_at, stale_since
+            FROM nwt_inflight_orders
+            WHERE kind = 'close' AND status = 'pending'
+              AND created_at < NOW() - INTERVAL '30 minutes'
+            ORDER BY created_at
+            """
+        )
+        rows = cur.fetchall()
+        lines.append("\nSTALE/STUCK IN-FLIGHT CLOSE ORDERS:")
+        if not rows:
+            lines.append("  (none)")
+        for r in rows:
+            payload = r["payload"] or {}
+            symbol = payload.get("symbol", "?")
+            age = _age(r["created_at"])
+            flag = " [cancel already attempted]" if r["stale_since"] else ""
+            lines.append(
+                f"  ALERT: {symbol} close order stuck\n"
+                f"    Position: {r['position_id']}\n"
+                f"    Order:    {r['alpaca_order_id']}\n"
+                f"    Age:      {age}{flag}\n"
+                f"    Reason:   Broker accepted order but no fill\n"
+                f"    Required action: reconcile / retry close"
+            )
+
         # --- Force-close state summary ---
         cur.execute(
             "SELECT state, COUNT(*) AS n, MAX(attempt_count) AS max_attempts "
