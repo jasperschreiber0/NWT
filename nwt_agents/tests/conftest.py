@@ -85,6 +85,14 @@ CREATE TABLE nwt_trade_outcomes (
     position_id UUID REFERENCES nwt_portfolio_ledger(position_id)
 );
 
+-- Partial unique index matching db/migrate_2026_07_idempotent_close.sql —
+-- makes write_trade_outcome's ON CONFLICT DO NOTHING an actual guard against
+-- a duplicate outcome row for the same position, instead of a no-op (there
+-- was previously nothing for it to conflict against). Legacy rows with a
+-- NULL position_id are exempt so they can still occur more than once.
+CREATE UNIQUE INDEX nwt_trade_outcomes_position_id_uniq
+    ON nwt_trade_outcomes (position_id) WHERE position_id IS NOT NULL;
+
 CREATE TABLE nwt_tickets (
     ticket_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     from_agent TEXT NOT NULL,
