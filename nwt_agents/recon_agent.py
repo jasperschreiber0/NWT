@@ -79,6 +79,44 @@ def fetch_ledger_open(conn) -> list:
 # Recon logic
 # ---------------------------------------------------------------------------
 
+def _handle_ledger_not_alpaca(conn, ledger_map: dict, alpaca_map: dict) -> list:
+    """
+    Positions open in the ledger but absent from Alpaca's live positions ->
+    mark 'suspect' (non-critical).
+
+    Guarded on status='open' (mirrors execution/ledger.py::close_position's
+    own idempotency guard): ledger_map was read from the ledger at the top
+    of this recon run, but the execution engine can close this exact
+    position for real (fill, ledger update, trade_outcome write) in the
+    window between that read and this write. An unconditional UPDATE would
+    overwrite a legitimate 'closed' status with 'suspect', destroying that
+    close. A row this UPDATE doesn't touch (rowcount==0) was closed for
+    real in the meantime — not untracked risk, so it's not reported as a
+    mismatch at all.
+    """
+    mismatches = []
+    for sym, rows in ledger_map.items():
+        if sym in alpaca_map:
+            continue
+        for row in rows:
+            pid = str(row["position_id"])
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE nwt_portfolio_ledger SET status='suspect' "
+                    "WHERE position_id=%s AND status='open'",
+                    (row["position_id"],),
+                )
+                marked_suspect = cur.rowcount > 0
+            conn.commit()
+            if not marked_suspect:
+                logger.info("in_ledger_not_alpaca: %s position_id=%s already closed by "
+                           "another process — not overwriting, not a mismatch", sym, pid)
+                continue
+            logger.warning("in_ledger_not_alpaca: %s position_id=%s — marking suspect", sym, pid)
+            mismatches.append({"class": "in_ledger_not_alpaca", "symbol": sym, "position_id": pid})
+    return mismatches
+
+
 def run_recon(conn, mode: str) -> bool:
     """
     Returns True if clean (exit 0), False if any mismatch (exit 1).
@@ -126,18 +164,7 @@ def run_recon(conn, mode: str) -> bool:
             critical = True
 
     # 2: In ledger but not in Alpaca → mark suspect (non-critical)
-    for sym, rows in ledger_map.items():
-        if sym not in alpaca_map:
-            for row in rows:
-                pid = str(row["position_id"])
-                logger.warning("in_ledger_not_alpaca: %s position_id=%s — marking suspect", sym, pid)
-                mismatches.append({"class": "in_ledger_not_alpaca", "symbol": sym, "position_id": pid})
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE nwt_portfolio_ledger SET status='suspect' WHERE position_id=%s",
-                        (row["position_id"],),
-                    )
-                conn.commit()
+    mismatches.extend(_handle_ledger_not_alpaca(conn, ledger_map, alpaca_map))
 
     # 3: Qty mismatch → CRITICAL
     # Compares Alpaca's live qty against the SUM of real filled qty recorded

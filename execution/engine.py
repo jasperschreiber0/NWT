@@ -74,6 +74,16 @@ POLL_INTERVAL = 3
 POLL_MAX = 10
 ET_TZ = ZoneInfo("America/New_York")
 
+# Broker-side order statuses that mean the order is still being worked —
+# NOT filled, but also not dead. A close ticket must never be retired
+# (marked FAILED/FAILED_REQUIRES_HUMAN) while its order is in one of these
+# states: that would declare a position un-closeable while Alpaca might
+# still fill it seconds later.
+ACTIVE_ORDER_STATUSES = {
+    "new", "accepted", "pending_new", "accepted_for_bidding",
+    "calculated", "partially_filled", "pending_cancel", "pending_replace", "held",
+}
+
 # Aggregate same-direction notional cap (long vs short across all bots/tracks).
 # Distinct from master/strategist.py's PER_BOT_WEIGHT_CEILING, which caps a
 # single bot's share of total capital — the two are complementary controls
@@ -683,6 +693,113 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
 # FORCE_CLOSE / CLOSE_REQUEST processing
 # ---------------------------------------------------------------------------
 
+def _finalize_close_fill(conn, ticket_id: str, position_id, asset_type: str,
+                          exit_reason: str, payload: dict, fill_price: float,
+                          symbol: str) -> None:
+    """
+    Common success path for a CLOSE_REQUEST whose order is confirmed filled.
+    close_position() is idempotent (no-op if some other process already
+    closed this position_id) — write_trade_outcome only runs if THIS call
+    is the one that actually performed the close, so a position can never
+    get two trade_outcome rows from two separate close paths racing.
+    """
+    if position_id:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM nwt_portfolio_ledger WHERE position_id = %s",
+                        (position_id,))
+            pos = cur.fetchone()
+        if pos:
+            pos = dict(pos)
+            actually_closed = close_position(conn, position_id, fill_price, 0.0, exit_reason)
+            if actually_closed and asset_type == "option":
+                write_trade_outcome(conn, pos, fill_price, exit_reason,
+                                    payload.get("strategy_id"))
+
+    insert_decision(conn, ticket_id, "EXECUTED",
+                    f"Closed {symbol} at {fill_price:.4f} reason={exit_reason}")
+    log_system_event(conn, "INFO", "execution_engine",
+                     f"Close executed: {symbol} at {fill_price:.4f}",
+                     {"ticket_id": ticket_id, "exit_reason": exit_reason,
+                      "position_id": position_id})
+
+
+def _last_close_order_id(conn, ticket_id: str):
+    """
+    The most recent close order this engine placed for this ticket, if any —
+    tracked via the "Close order placed" log event written right after
+    place_close_order below. Lets a still-undecided CLOSE_REQUEST ticket
+    resume tracking its own in-flight order on the next run instead of
+    placing a second order on top of one that may still be working.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload->>'alpaca_order_id' FROM nwt_system_log
+            WHERE component = 'execution_engine'
+              AND message = 'Close order placed'
+              AND payload->>'ticket_id' = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (ticket_id,),
+        )
+        row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
+def _resolve_close_order(conn, ticket_id: str, alpaca_order_id: str, position_id,
+                          asset_type: str, exit_reason: str, payload: dict,
+                          symbol: str) -> None:
+    """
+    Never retire a close ticket on a guess. poll_order_until_filled's return
+    value can be up to POLL_MAX*POLL_INTERVAL seconds stale by the time a
+    caller decides what to do with it — re-query Alpaca directly for the
+    order's CURRENT status before deciding anything:
+      - filled now -> finalize as a normal close (order may have filled in
+        the interim between the last poll and this check).
+      - still active broker-side -> cancel it and leave the ticket
+        undecided so the next run re-verifies/re-attempts. The order may
+        simply need more time; marking the ticket done here would abandon a
+        position that could still close correctly moments later.
+      - confirmed terminal (canceled/rejected/expired/done_for_day) and not
+        filled -> only now is it safe to retire the ticket, and it goes to
+        FAILED_REQUIRES_HUMAN rather than plain FAILED — broker state is
+        confirmed dead, so this needs a human, not an automatic retry.
+    """
+    try:
+        order = alpaca_get(f"/orders/{alpaca_order_id}")
+    except Exception as exc:
+        logger.error("Ticket %s: could not verify broker state for order %s: %s — "
+                     "leaving ticket undecided for next run", ticket_id, alpaca_order_id, exc)
+        return
+
+    status = order.get("status", "")
+    fill_price = float(order.get("filled_avg_price") or 0)
+
+    if status == "filled" and fill_price > 0:
+        _finalize_close_fill(conn, ticket_id, position_id, asset_type, exit_reason,
+                             payload, fill_price, symbol)
+        return
+
+    if status in ACTIVE_ORDER_STATUSES:
+        logger.warning("Ticket %s: close order %s still active (status=%s) — "
+                       "cancelling and retrying on next run", ticket_id, alpaca_order_id, status)
+        try:
+            alpaca_delete(f"/orders/{alpaca_order_id}")
+        except Exception as exc:
+            logger.error("Ticket %s: cancel request for order %s failed: %s — "
+                         "will retry next run", ticket_id, alpaca_order_id, exc)
+        # No decision inserted — the ticket stays pending so the next engine
+        # run resumes tracking this same order via _last_close_order_id.
+        return
+
+    reason = f"Close order not filled — confirmed broker status={status!r}"
+    insert_decision(conn, ticket_id, "FAILED_REQUIRES_HUMAN", reason)
+    log_system_event(conn, "ERROR", "execution_engine", reason,
+                     {"ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id,
+                      "position_id": position_id})
+
+
 def process_close_ticket(conn, ticket: dict) -> None:
     """
     Handle CLOSE_REQUEST tickets. The close side must match the position's
@@ -710,35 +827,31 @@ def process_close_ticket(conn, ticket: dict) -> None:
     close_side = "buy" if pos_direction == "short" else "sell"
 
     try:
+        # Resume a prior in-flight order for this ticket rather than placing
+        # a second one on top of it (see _resolve_close_order's docstring).
+        existing_order_id = _last_close_order_id(conn, ticket_id)
+        if existing_order_id:
+            _resolve_close_order(conn, ticket_id, existing_order_id, position_id,
+                                  asset_type, exit_reason, payload, symbol)
+            return
+
         order = place_close_order(symbol, qty, asset_type, side=close_side)
-        filled = poll_order_until_filled(order["id"])
+        alpaca_order_id = order["id"]
+        log_system_event(conn, "INFO", "execution_engine", "Close order placed",
+                         {"ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id,
+                          "symbol": symbol, "position_id": position_id})
+
+        filled = poll_order_until_filled(alpaca_order_id)
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
 
         if fill_status != "filled" or fill_price <= 0:
-            insert_decision(conn, ticket_id, "FAILED",
-                            f"Close order not filled — status={fill_status}")
+            _resolve_close_order(conn, ticket_id, alpaca_order_id, position_id,
+                                  asset_type, exit_reason, payload, symbol)
             return
 
-        slippage = 0.0
-        if position_id:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM nwt_portfolio_ledger WHERE position_id = %s",
-                            (position_id,))
-                pos = cur.fetchone()
-            if pos:
-                pos = dict(pos)
-                close_position(conn, position_id, fill_price, slippage, exit_reason)
-                if asset_type == "option":
-                    write_trade_outcome(conn, pos, fill_price, exit_reason,
-                                        payload.get("strategy_id"))
-
-        insert_decision(conn, ticket_id, "EXECUTED",
-                        f"Closed {symbol} at {fill_price:.4f} reason={exit_reason}")
-        log_system_event(conn, "INFO", "execution_engine",
-                         f"Close executed: {symbol} at {fill_price:.4f}",
-                         {"ticket_id": ticket_id, "exit_reason": exit_reason,
-                          "position_id": position_id})
+        _finalize_close_fill(conn, ticket_id, position_id, asset_type, exit_reason,
+                             payload, fill_price, symbol)
     except Exception as exc:
         reason = f"Close failed: {exc}"
         logger.error("Ticket %s: %s", ticket_id, reason)

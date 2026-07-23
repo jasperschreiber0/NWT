@@ -354,13 +354,35 @@ def _position_qty(pos: dict) -> int:
 
 
 def _has_pending_close(conn, position_id: str) -> bool:
+    """
+    A CLOSE_REQUEST/FORCE_CLOSE ticket blocks a new one for the same
+    position as long as it has no terminal EXECUTION_ENGINE decision yet —
+    not merely "was created recently". execution/engine.py's
+    process_close_ticket now leaves a close ticket undecided for as long as
+    its order is legitimately still active at the broker (verify-before-
+    retire, see _resolve_close_order there), which can outlast a fixed
+    recency window. Checking recency alone would let this function stop
+    treating that ticket as pending once it aged past the window, and
+    monitor_options_positions would then fire a second, redundant
+    CLOSE_REQUEST for the same position while the first order is still
+    working. The 2-hour window is kept only as a backstop for a ticket that
+    was dropped before any decision was ever written (crash, bug) — not as
+    the primary pending signal.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT COUNT(*) FROM nwt_tickets
-            WHERE type IN ('CLOSE_REQUEST', 'FORCE_CLOSE')
-              AND payload->>'position_id' = %s
-              AND created_at > NOW() - INTERVAL '2 hours'
+            SELECT COUNT(*) FROM nwt_tickets t
+            WHERE t.type IN ('CLOSE_REQUEST', 'FORCE_CLOSE')
+              AND t.payload->>'position_id' = %s
+              AND (
+                  t.created_at > NOW() - INTERVAL '2 hours'
+                  OR NOT EXISTS (
+                      SELECT 1 FROM nwt_ticket_decisions d
+                      WHERE d.ticket_id = t.ticket_id
+                        AND d.decided_by = 'EXECUTION_ENGINE'
+                  )
+              )
             """,
             (position_id,),
         )

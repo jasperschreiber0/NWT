@@ -84,11 +84,20 @@ def close_position(
     exit_reason: str = "unknown",
     exit_bid: Optional[float] = None,
     exit_ask: Optional[float] = None,
-) -> None:
+) -> bool:
     """
     UPDATE nwt_portfolio_ledger: set status='closed', exit_price, exit_time,
     realized_slippage, exit_reason, and exit NBBO (feeds the pnl_adjusted haircut).
     exit_reason: target | stop | hard_close | max_hold | kill_switch | manual
+
+    Guarded on status != 'closed' so this is idempotent: a second close
+    attempt for the same position_id (a retry, or a race against another
+    process acting on a stale read — e.g. recon_agent) is a no-op instead of
+    overwriting a real exit_price/exit_time with whatever the second caller
+    happens to be holding. Returns True if this call actually closed the
+    position, False if it was already closed (or the position_id is
+    unknown) — callers use this to avoid writing a second trade outcome for
+    a position someone else already closed.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -101,15 +110,18 @@ def close_position(
                 exit_reason = %s,
                 exit_bid = %s,
                 exit_ask = %s
-            WHERE position_id = %s
+            WHERE position_id = %s AND status != 'closed'
             """,
             (exit_price, datetime.now(timezone.utc), slippage, exit_reason, exit_bid, exit_ask, position_id),
         )
-        if cur.rowcount == 0:
-            logger.warning("close_position: no rows updated for position_id=%s", position_id)
+        closed = cur.rowcount > 0
+        if not closed:
+            logger.warning("close_position: position_id=%s already closed (or not found) — skipping", position_id)
     conn.commit()
-    logger.info("Closed position %s at %.4f slippage=%.4f reason=%s",
-                position_id, exit_price, slippage, exit_reason)
+    if closed:
+        logger.info("Closed position %s at %.4f slippage=%.4f reason=%s",
+                    position_id, exit_price, slippage, exit_reason)
+    return closed
 
 
 def get_open_positions(conn, bot_source: Optional[str] = None) -> list:
