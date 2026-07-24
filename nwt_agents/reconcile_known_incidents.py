@@ -274,12 +274,19 @@ def apply_correction(conn, correction: dict, dry_run: bool) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dry-run", action="store_true",
+                       help="Explicit no-op flag — dry-run is already the default with no "
+                            "flags at all. Accepted so the safe invocation is self-documenting.")
     parser.add_argument("--execute", action="store_true",
                        help="Actually write to the database. Without this, always dry-run.")
     parser.add_argument("--yes-i-am-sure", action="store_true", dest="confirmed",
                        help="Required together with --execute — a second explicit flag "
                             "against running this by accident.")
     args = parser.parse_args()
+
+    if args.dry_run and args.execute:
+        logger.error("--dry-run and --execute both given — refusing to write. Running as --dry-run.")
+        args.execute = False
 
     dry_run = not (args.execute and args.confirmed)
     if args.execute and not args.confirmed:
