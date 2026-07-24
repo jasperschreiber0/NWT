@@ -4,6 +4,8 @@
 
 > Read this before touching anything.
 
+> **Forward-looking design:** `docs/STRATEGY_DISCOVERY_PLATFORM.md` is a companion architecture document describing the next evolution of this system — a Strategy Factory capable of continuously discovering, validating, deploying, and retiring many strategies at once, built on top of (not replacing) everything below. It is a design document only; nothing in it is implemented yet. This file remains the source of truth for what is currently deployed.
+
 ---
 
 ## Current Status
