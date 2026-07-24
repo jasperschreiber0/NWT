@@ -79,4 +79,12 @@ NWT_DIR=/home/northworld/trading/nwt_agents
 
 # DB backup — nightly 22:30 UTC, local dump + 7-day rotation
 # NOTE: offsite upload requires AWS CLI or rclone configured separately
-30 22 * * * mkdir -p /var/backups/nwt && set -a && source /home/northworld/trading/nwt_agents/.env && set +a && pg_dump "$NWT_DB_DSN" | gzip > /var/backups/nwt/nwt_$(date +\%Y\%m\%d_\%H\%M).sql.gz && find /var/backups/nwt/ -name "*.sql.gz" -mtime +7 -delete >> /var/log/nwt/backup.log 2>&1
+# P0-6 fix: without `set -o pipefail`, a failed pg_dump piped into gzip still
+# reports gzip's (successful) exit code, so a broken/empty dump would pass
+# silently and the old-backup pruning below would still run — deleting the
+# last known-good backups on the same day a corrupt one was written. Now:
+# dump to a .tmp file, validate it (gzip -t integrity check + non-empty),
+# and only rename it into place and prune old backups if validation passes.
+# A failed run leaves the .tmp file in place for inspection and does not
+# touch any existing *.sql.gz backups.
+30 22 * * * set -o pipefail; mkdir -p /var/backups/nwt && set -a && source /home/northworld/trading/nwt_agents/.env && set +a && f=/var/backups/nwt/nwt_$(date +\%Y\%m\%d_\%H\%M).sql.gz && tmp="$f.tmp" && ( pg_dump "$NWT_DB_DSN" | gzip > "$tmp" && gzip -t "$tmp" && [ -s "$tmp" ] && mv "$tmp" "$f" && find /var/backups/nwt/ -name "*.sql.gz" -mtime +7 -delete || echo "NWT DB BACKUP FAILED — pg_dump/gzip validation failed, old backups NOT pruned, partial file left at $tmp for inspection" ) >> /var/log/nwt/backup.log 2>&1

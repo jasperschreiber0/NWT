@@ -117,9 +117,61 @@ def get_db() -> psycopg2.extensions.connection:
     return psycopg2.connect(NWT_DB_DSN)
 
 
+def try_acquire_singleton_lock(conn, lock_name: str) -> bool:
+    """
+    P0-2: prevent two instances of this cron-scheduled engine run overlapping
+    (e.g. a slow prior run still going when the next 5-minute cron firing
+    starts). Postgres SESSION-level advisory lock, held for the lifetime of
+    `conn` — no lockfile, no new table; a killed process (OOM, reboot) drops
+    the backend connection and Postgres releases the lock automatically.
+
+    Identical to nwt_agents/shared_context.py's try_acquire_singleton_lock —
+    duplicated here rather than imported because execution/ is a separate
+    package with its own .env and doesn't import from nwt_agents/ anywhere
+    else in this file either (see load_master_directives below, which is
+    likewise a local copy rather than a cross-package import). Keep both
+    implementations in sync if this logic ever changes.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(hashtext(%s)::bigint)", (lock_name,))
+        return bool(cur.fetchone()[0])
+
+
 def load_master_directives() -> dict:
     with open(SHARED_DIR / "master-directives.json") as f:
         return json.load(f)
+
+
+def directives_is_stale(directives: dict, now_utc: datetime = None) -> tuple:
+    """
+    P0-5: master-strategist fires 21:30 UTC and stamps master-directives.json
+    with THAT day's date, so the file in force for the next session is always
+    dated "yesterday" relative to a same-day check made before the next
+    21:30 UTC run — accept today's date or yesterday's, never anything
+    older. global_kill_switch is still re-read fresh separately below; this
+    is an additional, independent veto for the case where the whole file
+    (regime, bot_permissions) is stale because master/strategist.py crashed
+    before writing today's update.
+
+    Identical to nwt_agents/shared_context.py's directives_is_stale —
+    duplicated here for the same reason load_master_directives above is a
+    local copy rather than a cross-package import. Keep both in sync.
+
+    Returns (is_stale: bool, reason: str).
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    today = now_utc.date()
+    d = directives.get("date")
+    if not d:
+        return True, "master-directives.json has no 'date' field — treating as stale"
+    expected_yesterday = (today - timedelta(days=1)).isoformat()
+    expected_today = today.isoformat()
+    if d not in (expected_yesterday, expected_today):
+        return True, (
+            f"master-directives.json is stale (date={d}, expected "
+            f"{expected_yesterday} or {expected_today})"
+        )
+    return False, ""
 
 
 def alpaca_get(path: str) -> dict:
@@ -256,6 +308,10 @@ def synchronous_risk_veto(conn, payload: dict) -> tuple:
         directives = load_master_directives()
     except Exception:
         return True, "Synchronous veto: master-directives.json unreadable — NO-TRADE MODE"
+
+    stale, stale_reason = directives_is_stale(directives)
+    if stale:
+        return True, f"Synchronous veto: {stale_reason}"
 
     if directives.get("global_kill_switch", False):
         return True, "Synchronous veto: global kill switch active"
@@ -1058,6 +1114,12 @@ def main() -> None:
     logger.info("Execution Engine starting")
 
     conn = get_db()
+
+    if not try_acquire_singleton_lock(conn, "execution_engine"):
+        logger.warning("execution_engine: another instance already holds the lock — skipping this cycle")
+        conn.close()
+        return
+
     try:
         upsert_heartbeat(conn)
 

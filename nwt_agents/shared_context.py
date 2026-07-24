@@ -74,6 +74,27 @@ def get_db() -> psycopg2.extensions.connection:
     return psycopg2.connect(os.environ["NWT_DB_DSN"])
 
 
+def try_acquire_singleton_lock(conn, lock_name: str) -> bool:
+    """
+    P0-2: prevent two instances of the same cron-scheduled script (e.g. a
+    slow run overlapping the next 5-minute firing) from processing the same
+    tickets/positions concurrently.
+
+    Uses a Postgres SESSION-level advisory lock, held for the lifetime of
+    `conn`. No new table, no lockfile: if this process is killed outright
+    (OOM, host reboot, SIGKILL), Postgres detects the dropped backend
+    connection and releases the lock automatically — there is no stale-lock
+    state to clean up by hand, unlike a filesystem lockfile.
+
+    Returns True if the lock was acquired (caller should proceed) or False
+    if another instance already holds it (caller should log and exit
+    cleanly without doing any work this cycle).
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(hashtext(%s)::bigint)", (lock_name,))
+        return bool(cur.fetchone()[0])
+
+
 # ---------------------------------------------------------------------------
 # File loaders
 # ---------------------------------------------------------------------------
@@ -104,6 +125,41 @@ def load_master_directives() -> dict:
             path.write_text(example.read_text())
     with open(path) as f:
         return json.load(f)
+
+
+def directives_is_stale(directives: dict, now_utc: datetime = None) -> tuple:
+    """
+    P0-5: master-strategist fires 21:30 UTC (after US close) and stamps
+    master-directives.json with THAT day's date — so the file in force for
+    the next session is always dated "yesterday" relative to a same-day
+    check made before the next 21:30 UTC run. This mirrors
+    session_scorecard.py's check_directives_fresh() acceptance window
+    exactly (today's date, or yesterday's) so the two checks never disagree
+    about what "fresh" means.
+
+    Only the presence of a plausible "date" field is checked here — if
+    master/strategist.py crashes before write_directives() runs, the file on
+    disk is simply yesterday's (or older), and until this check existed
+    nothing caught that at trade time: every consumer re-checked
+    global_kill_switch fresh but silently traded all day against a stale
+    regime/bot_permissions snapshot. global_kill_switch behaviour itself is
+    unchanged — this is an additional, independent veto.
+
+    Returns (is_stale: bool, reason: str). reason is empty when not stale.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    today = now_utc.date()
+    d = directives.get("date")
+    if not d:
+        return True, "master-directives.json has no 'date' field — treating as stale"
+    expected_yesterday = (today - timedelta(days=1)).isoformat()
+    expected_today = today.isoformat()
+    if d not in (expected_yesterday, expected_today):
+        return True, (
+            f"master-directives.json is stale (date={d}, expected "
+            f"{expected_yesterday} or {expected_today})"
+        )
+    return False, ""
 
 
 def load_conviction_tickets() -> list:
@@ -404,14 +460,19 @@ def pre_trade_veto(conn, track: str) -> tuple:
     """
     Final synchronous gate before submitting an order for a NEW position.
     Re-reads master-directives.json fresh (kill switch may have been activated
-    since this process started) and re-checks track cooling-off and the
-    new-entry cutoff. Returns (vetoed: bool, reason: str).
+    since this process started), verifies it's actually from the current
+    trading day (P0-5 — see directives_is_stale), and re-checks track
+    cooling-off and the new-entry cutoff. Returns (vetoed: bool, reason: str).
     Closes/liquidations must NOT go through this gate.
     """
     try:
         directives = load_master_directives()
     except FileNotFoundError:
         return True, "pre_trade_veto: master-directives.json missing — NO-TRADE MODE"
+
+    stale, stale_reason = directives_is_stale(directives)
+    if stale:
+        return True, f"pre_trade_veto: {stale_reason}"
 
     if directives.get("global_kill_switch", False):
         return True, "pre_trade_veto: global kill switch active"
@@ -444,6 +505,7 @@ _INACTIVITY_CLASS_MAP = {
     "NO_TRADE_MODE": "regime_skip",
     "REGIME_MISMATCH": "regime_skip",
     "ARCHETYPE_CONSOLIDATED": "no_edge",
+    "STALE_DIRECTIVES": "regime_skip",
 }
 
 

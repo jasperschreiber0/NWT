@@ -22,6 +22,7 @@ import integrity_gate
 from shared_context import (
     check_no_trade_mode,
     compute_final_sizing,
+    directives_is_stale,
     evaluate_shadow_mutation,
     get_active_strategy_ids,
     get_db,
@@ -99,6 +100,15 @@ def main() -> None:
             for strategy_id in active_strategy_ids:
                 log_inactivity(conn, strategy_id, "D", "NO_TRADE_MODE", regime)
             log_system_event(conn, "WARNING", "track_d", f"no_trade_mode — all D strategies inactive: {halt_reason}")
+            return
+
+        stale, stale_reason = directives_is_stale(directives)
+        if stale:
+            logger.warning("%s — Track D exiting without proposals", stale_reason)
+            regime = directives.get("regime", {})
+            for strategy_id in active_strategy_ids:
+                log_inactivity(conn, strategy_id, "D", "STALE_DIRECTIVES", regime)
+            log_system_event(conn, "WARNING", "track_d", f"{stale_reason} — all D strategies inactive")
             return
 
         if directives.get("global_kill_switch", False):
