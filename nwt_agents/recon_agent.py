@@ -507,12 +507,59 @@ def run_recon(conn, mode: str) -> bool:
             for row in ledger_map[sym]
         )
         if abs(broker_net - ledger_net) > 0.5:
-            entry = {"class": "qty_mismatch", "symbol": sym,
-                     "broker_net_qty": broker_net, "ledger_net_qty": ledger_net}
-            logger.error("CRITICAL qty mismatch: %s broker_net=%.0f ledger_net=%.0f",
-                        sym, broker_net, ledger_net)
+            # Distinguish an "impossible state" — ledger and broker disagree
+            # on DIRECTION, not just quantity (e.g. ledger believes long,
+            # broker is actually short) — from an ordinary quantity drift.
+            # A sign conflict means the ledger's belief about which way a
+            # position even faces is simply wrong; it must never be treated
+            # as "the same kind of off-by-N-shares problem" — see the
+            # 2026-07-22 BHP incident, where the ledger showed +29 long
+            # while the broker was actually -10 short.
+            sign_conflict = (
+                broker_net != 0 and ledger_net != 0
+                and (broker_net > 0) != (ledger_net > 0)
+            )
+            entry = {
+                "class": "directional_conflict" if sign_conflict else "qty_mismatch",
+                "symbol": sym, "broker_net_qty": broker_net, "ledger_net_qty": ledger_net,
+            }
+            if sign_conflict:
+                logger.error(
+                    "CRITICAL impossible state: %s ledger believes %s (%.0f) but broker "
+                    "actually holds %s (%.0f)",
+                    sym, "long" if ledger_net > 0 else "short", abs(ledger_net),
+                    "long" if broker_net > 0 else "short", abs(broker_net),
+                )
+            else:
+                logger.error("CRITICAL qty mismatch: %s broker_net=%.0f ledger_net=%.0f",
+                            sym, broker_net, ledger_net)
             mismatches.append(entry)
             critical = True
+
+    # 4: Standing warning for ANY open UNATTRIBUTED exposure — even when a
+    # symbol's aggregate net qty happens to match the broker exactly (the
+    # 2026-07-22 AAPL shape: a 300-share UNATTRIBUTED long netted against a
+    # -14 mislabeled "short" summed to exactly the real +286, so the
+    # qty_mismatch check above never fired at all). Non-critical — never
+    # sets no_trade_mode — but must never be silently invisible just
+    # because the aggregate math happens to net out; broker exposure with
+    # no attribution is real capital no bot's sizing can see.
+    for sym, rows in ledger_map.items():
+        unattributed_rows = [r for r in rows if (r.get("bot_source") or "").upper() == "UNATTRIBUTED"]
+        if not unattributed_rows:
+            continue
+        unattributed_qty = sum(float(r.get("qty") or 0) for r in unattributed_rows)
+        logger.warning(
+            "Unattributed exposure: %s has %d UNATTRIBUTED position(s), qty=%.0f — "
+            "needs manual attribution/closure (CLAUDE.md recovery runbook step 3)",
+            sym, len(unattributed_rows), unattributed_qty,
+        )
+        mismatches.append({
+            "class": "unattributed_exposure", "symbol": sym,
+            "position_ids": [str(r["position_id"]) for r in unattributed_rows],
+            "qty": unattributed_qty,
+        })
+        # Deliberately does not set critical=True — see docstring above.
 
     if not mismatches:
         insert_ticket(conn, "RECON_AGENT", "SYSTEM", "recon_ok", {
@@ -535,7 +582,7 @@ def run_recon(conn, mode: str) -> bool:
 
     if critical:
         unresolved = [m for m in mismatches if m.get("resolution") == "unresolved_needs_human"
-                      or m["class"] == "qty_mismatch"]
+                      or m["class"] in ("qty_mismatch", "directional_conflict")]
         reason = "Recon critical mismatch: " + "; ".join(
             f"{m['class']} {m.get('symbol','')}" for m in unresolved
         )

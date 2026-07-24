@@ -216,6 +216,125 @@ def get_open_orders(symbol: str) -> list:
     return resp.json()
 
 
+def get_alpaca_position(symbol: str) -> dict | None:
+    """
+    Current Alpaca position for one symbol, or None if flat.
+
+    The broker's own net position is the source of truth for whether a
+    trade opens new directional exposure or merely reduces/closes existing
+    exposure that some OTHER ledger row (a different bot, or an
+    UNATTRIBUTED import) already represents — Alpaca nets all activity in
+    a symbol into a single position regardless of which strategy placed
+    which order. A 404 means genuinely flat, not an error.
+    """
+    try:
+        pos = alpaca_get(f"/positions/{symbol}")
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            return None
+        raise
+    qty = float(pos.get("qty", 0))
+    if qty == 0:
+        return None
+    return {"qty": abs(qty), "side": "long" if qty > 0 else "short"}
+
+
+def classify_equity_exposure(broker_pos_before: dict | None, side: str, filled_qty: float) -> dict:
+    """
+    Split a just-filled equity order's quantity into the portion that
+    reduces pre-existing broker exposure vs. the portion that represents a
+    genuinely NEW directional position — using the broker's own pre-trade
+    position as the source of truth, never the ticket's claimed
+    `direction`.
+
+    This is the fix for the 2026-07-22 AAPL incident: a "short" entry
+    ticket for 14 shares was recorded as a brand-new short position, when
+    in reality the account already held a 300-share long (from an
+    unrelated, UNATTRIBUTED import) and the sell order just trimmed it —
+    Alpaca has no per-strategy sub-positions, so a sell against an existing
+    long is a reduction, never a new short, unless the sell quantity
+    exceeds the existing long (symmetric for buy vs. an existing short).
+
+    Returns {"opening_qty", "reducing_qty", "reduces_existing"}:
+      - reducing_qty:  portion that closed out pre-existing OPPOSITE
+                       broker exposure — must NOT be recorded as a new
+                       position.
+      - opening_qty:   portion (if any) beyond that existing exposure —
+                       the only part that may become a new ledger row.
+      - reduces_existing: True if any reduction happened at all.
+    """
+    existing_qty = broker_pos_before["qty"] if broker_pos_before else 0.0
+    existing_side = broker_pos_before["side"] if broker_pos_before else None
+
+    opposing = (side == "sell" and existing_side == "long") or (side == "buy" and existing_side == "short")
+    if not opposing or existing_qty <= 0:
+        return {"opening_qty": filled_qty, "reducing_qty": 0.0, "reduces_existing": False}
+
+    reducing_qty = min(filled_qty, existing_qty)
+    opening_qty = max(filled_qty - existing_qty, 0.0)
+    return {"opening_qty": opening_qty, "reducing_qty": reducing_qty, "reduces_existing": reducing_qty > 0}
+
+
+def reduce_opposing_equity_rows(conn, symbol: str, opposing_direction: str, reduce_qty: float,
+                                exit_price: float, exit_reason: str, note: str) -> list:
+    """
+    Reduce (or fully close) existing open equity ledger rows of
+    `opposing_direction` for `symbol`, oldest first, until `reduce_qty` is
+    exhausted. Used when a fill has been classified (classify_equity_exposure)
+    as reducing pre-existing broker exposure rather than opening a new
+    position — this may span rows from a DIFFERENT bot_source (including
+    UNATTRIBUTED), since broker exposure doesn't respect bot attribution.
+
+    Returns the list of position_ids touched, for audit logging by the caller.
+    """
+    remaining = reduce_qty
+    touched = []
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT * FROM nwt_portfolio_ledger
+            WHERE asset = %s AND asset_type = 'equity' AND status = 'open' AND direction = %s
+            ORDER BY entry_time ASC
+            """,
+            (symbol, opposing_direction),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    for row in rows:
+        if remaining <= 1e-9:
+            break
+        position_id = str(row["position_id"])
+        row_qty = float(row.get("qty") or 0)
+        if row_qty <= 0:
+            continue
+        take = min(remaining, row_qty)
+        fully_closed = apply_close_fill(conn, row, take, exit_price, 0.0, exit_reason)
+        touched.append(position_id)
+        log_system_event(
+            conn, "WARNING", "execution_engine",
+            f"Cross-attribution reduction: {symbol} position {position_id} "
+            f"({row.get('bot_source')}) reduced by {take:g} — {note}",
+            {"position_id": position_id, "reduced_by": take, "fully_closed": fully_closed,
+             "bot_source": row.get("bot_source")},
+        )
+        remaining -= take
+
+    if remaining > 1e-9:
+        logger.warning(
+            "reduce_opposing_equity_rows: %s wanted to reduce %g %s exposure but only found "
+            "%g across ledger rows — %g unaccounted for (broker exposure with no matching "
+            "ledger row at all; needs reconciliation)",
+            symbol, reduce_qty, opposing_direction, reduce_qty - remaining, remaining,
+        )
+        log_system_event(
+            conn, "CRITICAL", "execution_engine",
+            f"{symbol}: reduced broker exposure by {reduce_qty - remaining:g} but "
+            f"{remaining:g} had no matching open ledger row — untracked broker exposure, needs reconciliation",
+            {"symbol": symbol, "unaccounted_qty": remaining, "direction": opposing_direction},
+        )
+    return touched
+
+
 def get_current_price(symbol: str) -> float:
     url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/trades/latest"
     resp = requests.get(url, headers=ALPACA_HEADERS, timeout=15)
@@ -277,7 +396,27 @@ def get_disabled_tracks(conn) -> set:
     return disabled
 
 
-def _check_bot_permissions(directives: dict, bot_source: str, sized_notional: float) -> tuple:
+def get_unattributed_notional(conn) -> float:
+    """
+    Total notional_risk currently open under bot_source='UNATTRIBUTED'.
+
+    UNATTRIBUTED positions are real capital sitting at the broker (cold-start
+    imports, --adopt-untracked, or a mislabeled entry never reconciled) — the
+    2026-07-22 AAPL incident had ~$95k of a ~$97k account sitting unattributed,
+    invisible to every capital/sizing calculation that only reads bot-specific
+    exposure. It must count against available capital the same as any
+    attributed position would.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(SUM(notional_risk), 0) FROM nwt_portfolio_ledger "
+            "WHERE status = 'open' AND bot_source = 'UNATTRIBUTED'"
+        )
+        (total,) = cur.fetchone()
+    return float(total or 0)
+
+
+def _check_bot_permissions(conn, directives: dict, bot_source: str, sized_notional: float) -> tuple:
     """
     Re-verify master-directives.json's per-bot status/capital_weight/size_cap
     for Track A equity bots, independent of whatever the executor already
@@ -304,12 +443,27 @@ def _check_bot_permissions(directives: dict, bot_source: str, sized_notional: fl
         equity = get_alpaca_account_equity()
     except Exception:
         equity = 97_000.0
-    max_notional = equity * capital_weight * size_cap
+
+    # Available capital excludes notional already sitting in unattributed
+    # exposure — that capital is not actually free to deploy even though raw
+    # account equity doesn't distinguish it from real slack.
+    unattributed_notional = get_unattributed_notional(conn)
+    available_equity = max(equity - unattributed_notional, 0.0)
+    if unattributed_notional > 0:
+        logger.warning(
+            "Synchronous veto check for %s: %.0f of %.0f equity is UNATTRIBUTED — "
+            "available capital reduced to %.0f for sizing purposes",
+            perm_key, unattributed_notional, equity, available_equity,
+        )
+
+    max_notional = available_equity * capital_weight * size_cap
     if sized_notional > max_notional * 1.05:  # small tolerance for rounding
         return True, (
             f"Synchronous veto: sized_notional {sized_notional:.0f} exceeds "
             f"bot_permissions.{perm_key} cap {max_notional:.0f} "
-            f"(capital_weight={capital_weight}, size_cap={size_cap})"
+            f"(capital_weight={capital_weight}, size_cap={size_cap}, "
+            f"available_equity={available_equity:.0f} after {unattributed_notional:.0f} "
+            f"unattributed)"
         )
     return False, ""
 
@@ -331,7 +485,7 @@ def synchronous_risk_veto(conn, payload: dict) -> tuple:
 
     bot_source = payload.get("bot_source", "")
 
-    vetoed, reason = _check_bot_permissions(directives, bot_source, float(payload.get("sized_notional", 0)))
+    vetoed, reason = _check_bot_permissions(conn, directives, bot_source, float(payload.get("sized_notional", 0)))
     if vetoed:
         return True, reason
 
@@ -1257,6 +1411,20 @@ def process_close_ticket(conn, ticket: dict) -> None:
 
     pos_direction = payload.get("direction", "long")
     ledger_pos = get_ledger_position(conn, position_id) if position_id else None
+
+    # Never process a CLOSE_REQUEST for a position already closed — mirrors
+    # process_force_close's identical guard. Without this, a second close
+    # ticket racing/lagging behind a first one that already succeeded would
+    # submit a real order against a position that no longer exists at the
+    # broker (the exact mechanism behind the 2026-07-22 BHP phantom short:
+    # a duplicate close ticket sold into a zero position, and Alpaca opened
+    # a new short instead of rejecting it).
+    if ledger_pos and ledger_pos.get("status") == "closed":
+        reason = f"CLOSE_REQUEST: position {position_id} already closed"
+        logger.info("Ticket %s: %s", ticket_id, reason)
+        insert_decision(conn, ticket_id, "SKIPPED", reason)
+        return
+
     if ledger_pos:
         if ledger_pos.get("direction"):
             pos_direction = ledger_pos["direction"]
@@ -1266,6 +1434,41 @@ def process_close_ticket(conn, ticket: dict) -> None:
         if ledger_pos.get("qty"):
             qty = max(int(float(ledger_pos["qty"])), 1)
     close_side = "buy" if pos_direction == "short" else "sell"
+
+    # Broker-position validation before submitting an equity close: the
+    # ledger's belief about direction/qty is not proof anything real backs
+    # it (see record_entry_fill's cross-attribution handling — a "short"
+    # row can be a mislabeled trim of someone else's long). Confirm the
+    # broker actually holds a matching position in the expected direction
+    # before ever placing the order — never submit into what would be a
+    # rejected/phantom-creating close, and never let it retry forever
+    # against a position that structurally cannot be closed this way.
+    if asset_type == "equity":
+        try:
+            broker_pos = get_alpaca_position(symbol)
+        except Exception as exc:
+            logger.warning("Ticket %s: broker position check failed for %s (%s) — "
+                           "proceeding without this guard", ticket_id, symbol, exc)
+            broker_pos = "unknown"
+        if broker_pos != "unknown":
+            broker_matches = (
+                broker_pos is not None
+                and broker_pos["side"] == pos_direction
+                and broker_pos["qty"] >= qty - 0.5
+            )
+            if not broker_matches:
+                reason = (
+                    f"CLOSE_REQUEST: broker position for {symbol} does not match ledger's "
+                    f"{pos_direction} qty={qty} (broker shows {broker_pos!r}) — refusing to "
+                    f"submit a close that would either be rejected or create phantom exposure; "
+                    f"needs reconciliation"
+                )
+                logger.error("Ticket %s: %s", ticket_id, reason)
+                insert_decision(conn, ticket_id, "FAILED_REQUIRES_HUMAN", reason)
+                log_system_event(conn, "CRITICAL", "execution_engine", reason,
+                                 {"ticket_id": ticket_id, "position_id": position_id,
+                                  "symbol": symbol, "broker_position": broker_pos})
+                return
 
     # Never stack a second close order on top of a working one — the retry
     # 422s ("insufficient qty available") because the first order is already
@@ -1848,9 +2051,69 @@ def record_entry_fill(conn, ticket_id: str, payload: dict, filled_order: dict,
         ledger_direction = "long"
         base_delta = 0.5 if payload.get("option_type", "call") == "call" else -0.5
         delta_exposure = payload.get("delta_exposure", base_delta)
+        opening_qty = filled_qty
+        reduced_position_ids = []
     else:
         ledger_direction = direction
         delta_exposure = 1.0 if direction == "long" else -1.0
+
+        # Broker-aware position intent validation (Finding: 2026-07-22 AAPL
+        # incident). Never trust `direction` alone to mean "this is a new
+        # position" — check what the broker actually held BEFORE this order
+        # went in. A sell against an existing broker long (from ANY
+        # bot_source, including UNATTRIBUTED) reduces that exposure; it is
+        # only a genuine new short for whatever quantity exceeds the
+        # existing long. Symmetric for buy vs. an existing short.
+        side = "buy" if direction == "long" else "sell"
+        broker_pos_before = payload.get("broker_position_before_entry")
+        classification = classify_equity_exposure(broker_pos_before, side, filled_qty)
+        opening_qty = classification["opening_qty"]
+        reduced_position_ids = []
+
+        if classification["reduces_existing"]:
+            opposing_direction = "long" if side == "sell" else "short"
+            reduced_position_ids = reduce_opposing_equity_rows(
+                conn, instrument, opposing_direction, classification["reducing_qty"],
+                fill_price, "reconciled_broker_exposure_merge",
+                note=f"ticket {ticket_id} ({payload.get('bot_source')}) fill of "
+                     f"{filled_qty:g} {side} merged into pre-existing broker exposure",
+            )
+            log_system_event(
+                conn, "WARNING", "execution_engine",
+                f"{instrument}: {classification['reducing_qty']:g} of this "
+                f"{side} fill reduced pre-existing broker exposure instead of opening a "
+                f"new {direction} position — not attributed to a single bot at entry, "
+                f"needs reconciliation review",
+                {"ticket_id": ticket_id, "symbol": instrument, "side": side,
+                 "reduced_qty": classification["reducing_qty"], "opening_qty": opening_qty,
+                 "reduced_position_ids": reduced_position_ids},
+            )
+
+        if opening_qty <= 1e-9:
+            # The entire fill reduced existing exposure — no new directional
+            # position exists at all. Recording one here would recreate
+            # exactly the AAPL bug (a phantom short/long with nothing real
+            # behind it).
+            reasoning = (
+                f"Filled at {fill_price:.4f} — entire {filled_qty:g} share fill absorbed "
+                f"into pre-existing broker exposure (position_ids: {reduced_position_ids}), "
+                f"no new position opened, alpaca_order_id={alpaca_order_id}"
+            )
+            if note:
+                reasoning += f" ({note})"
+            insert_decision(conn, ticket_id, "EXECUTED", reasoning)
+            log_system_event(conn, "INFO", "execution_engine",
+                             f"Executed {symbol} (equity) — reduced existing exposure, no new position",
+                             {"ticket_id": ticket_id, "fill_price": fill_price,
+                              "reduced_position_ids": reduced_position_ids})
+            logger.info("Ticket %s EXECUTED: reduced existing exposure only, no new position "
+                        "(fill=%.4f)", ticket_id, fill_price)
+            return
+
+    # notional_risk scales with whatever fraction of the fill actually opens
+    # new exposure — the reduced portion's risk belongs to the position(s)
+    # it reduced, not to a freshly-created row.
+    opening_notional = sized_notional * (opening_qty / filled_qty) if filled_qty > 0 else sized_notional
 
     ledger_data = {
         "bot_source": payload["bot_source"],
@@ -1859,8 +2122,8 @@ def record_entry_fill(conn, ticket_id: str, payload: dict, filled_order: dict,
         "asset_type": asset_type,
         "direction": ledger_direction,
         "delta_exposure": delta_exposure,
-        "notional_risk": sized_notional,
-        "qty": filled_qty,
+        "notional_risk": opening_notional,
+        "qty": opening_qty,
         "entry_price": fill_price,
         "entry_time": datetime.now(timezone.utc),
         "entry_bid": entry_bid,
@@ -1874,6 +2137,10 @@ def record_entry_fill(conn, ticket_id: str, payload: dict, filled_order: dict,
 
     reasoning = (f"Filled at {fill_price:.4f}, slippage={slippage:.4f}, "
                  f"position_id={position_id}, alpaca_order_id={alpaca_order_id}")
+    if reduced_position_ids:
+        reasoning += (f" ({classification['reducing_qty']:g} of {filled_qty:g} filled qty "
+                      f"reduced existing positions {reduced_position_ids}; "
+                      f"{opening_qty:g} opened as new)")
     if note:
         reasoning += f" ({note})"
     insert_decision(conn, ticket_id, "EXECUTED", reasoning)
@@ -1930,6 +2197,21 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     legs = payload.get("legs") or []
     expected_price = None
     entry_bid = entry_ask = None
+
+    # Snapshot the broker's position BEFORE this order — the source of
+    # truth for whether the fill (once it happens) opens genuinely new
+    # exposure or merely reduces/closes exposure some other ledger row
+    # already represents (see classify_equity_exposure). Must be taken now,
+    # not at fill-resolution time, since the in-flight resolver may run
+    # cycles later after other trades have changed the broker's position.
+    if asset_type == "equity":
+        try:
+            payload["broker_position_before_entry"] = get_alpaca_position(symbol)
+        except Exception as exc:
+            logger.warning("Ticket %s: could not snapshot broker position for %s before "
+                           "entry (%s) — proceeding without cross-attribution protection",
+                           ticket_id, symbol, exc)
+            payload["broker_position_before_entry"] = None
 
     client_order_id = client_order_id_for(ticket_id)
     record_client_order_id(conn, ticket_id, client_order_id)  # submission begins now

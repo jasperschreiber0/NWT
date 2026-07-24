@@ -225,6 +225,8 @@ def compute_exposure(positions: list[dict]) -> dict:
             "options_notional": 0.0,
             "equity_count": 0,
             "options_count": 0,
+            "unattributed_notional": 0.0,
+            "unattributed_count": 0,
         }
 
     weighted_delta_sum = 0.0
@@ -233,6 +235,8 @@ def compute_exposure(positions: list[dict]) -> dict:
     options_notional = 0.0
     equity_count = 0
     options_count = 0
+    unattributed_notional = 0.0
+    unattributed_count = 0
 
     for pos in positions:
         notional = float(pos.get("notional_risk") or 0)
@@ -257,6 +261,15 @@ def compute_exposure(positions: list[dict]) -> dict:
         else:
             equity_count += 1
 
+        # UNATTRIBUTED positions are real broker exposure with no strategy
+        # owner (cold-start imports, --adopt-untracked, or a mislabeled
+        # entry never reconciled — the 2026-07-22 AAPL incident had ~$95k
+        # sitting unattributed). They must count against available capital
+        # like any other position, not be invisible to capital planning.
+        if (pos.get("bot_source") or "").upper() == "UNATTRIBUTED":
+            unattributed_notional += notional
+            unattributed_count += 1
+
     # Normalise delta to [-1, 1]
     if total_notional > 0:
         net_delta = max(-1.0, min(1.0, weighted_delta_sum / total_notional))
@@ -271,14 +284,22 @@ def compute_exposure(positions: list[dict]) -> dict:
 
     logger.info(
         "Exposure: net_delta=%.4f net_vega=%.4f total_notional=%.0f "
-        "options=%.0f equity_positions=%d options_positions=%d",
+        "options=%.0f equity_positions=%d options_positions=%d unattributed_notional=%.0f (%d positions)",
         net_delta,
         net_vega,
         total_notional,
         options_notional,
         equity_count,
         options_count,
+        unattributed_notional,
+        unattributed_count,
     )
+    if unattributed_notional > 0:
+        logger.warning(
+            "Exposure: %.0f notional (%d position(s)) is UNATTRIBUTED — real broker "
+            "exposure with no strategy owner, consuming capital no bot can see",
+            unattributed_notional, unattributed_count,
+        )
 
     return {
         "net_delta_estimate": round(net_delta, 4),
@@ -287,6 +308,8 @@ def compute_exposure(positions: list[dict]) -> dict:
         "options_notional": round(options_notional, 2),
         "equity_count": equity_count,
         "options_count": options_count,
+        "unattributed_notional": round(unattributed_notional, 2),
+        "unattributed_count": unattributed_count,
     }
 
 # ---------------------------------------------------------------------------
@@ -798,6 +821,18 @@ def main() -> int:
         )
         conflict_notes = allocator_notes + conflict_notes
 
+        # Surface UNATTRIBUTED exposure as a standing warning — it's real
+        # capital no bot's own sizing math can see (see get_unattributed_notional
+        # in execution/engine.py, which is what actually enforces the capital
+        # reduction at order time; this is visibility for humans/dashboard).
+        if exposure.get("unattributed_notional", 0) > 0:
+            conflict_notes.append(
+                f"WARNING: ${exposure['unattributed_notional']:.0f} across "
+                f"{exposure['unattributed_count']} position(s) is UNATTRIBUTED broker "
+                f"exposure with no strategy owner — needs manual reconciliation "
+                f"(see CLAUDE.md recovery runbook)"
+            )
+
         # --- Reasoning ---
         reasoning = build_reasoning(
             regime=regime,
@@ -818,6 +853,8 @@ def main() -> int:
             "global_kill_switch": kill_switch,
             "net_delta_estimate": exposure["net_delta_estimate"],
             "net_vega_estimate": exposure["net_vega_estimate"],
+            "unattributed_notional": exposure.get("unattributed_notional", 0.0),
+            "unattributed_count": exposure.get("unattributed_count", 0),
             "bot_permissions": permissions,
             "conflict_notes": "; ".join(conflict_notes) if conflict_notes else "",
             "reasoning": reasoning,
