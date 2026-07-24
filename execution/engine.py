@@ -74,6 +74,14 @@ POLL_INTERVAL = 3
 POLL_MAX = 10
 ET_TZ = ZoneInfo("America/New_York")
 
+# P0-1: how old an orphaned CLAIMED ticket decision must be before this run
+# will resume it. try_acquire_singleton_lock() already guarantees at most
+# one engine instance runs at a time, so any CLAIMED row found at the start
+# of a run is, by construction, orphaned by a crashed prior run rather than
+# a live concurrent one — this threshold is defense-in-depth against that
+# guarantee ever being weakened, not the primary safety mechanism.
+CLAIM_STALE_SECONDS = 60
+
 # Aggregate same-direction notional cap (long vs short across all bots/tracks).
 # Distinct from master/strategist.py's PER_BOT_WEIGHT_CEILING, which caps a
 # single bot's share of total capital — the two are complementary controls
@@ -351,19 +359,128 @@ def poll_order_until_filled(order_id: str) -> dict:
 
 
 def insert_decision(conn, ticket_id: str, decision: str, reasoning: str) -> None:
+    """
+    P0-1: record this ticket's final EXECUTION_ENGINE decision. Upserts on
+    the (ticket_id, decided_by) unique index (migrate_2026_07_execution_
+    idempotency.sql) — claim_or_resume_ticket() already inserted a CLAIMED
+    row before any Alpaca call, so in the normal path this UPDATEs that same
+    row (finalizing the claim) rather than creating a second one. Still
+    safe to call without a prior claim (inserts fresh) for any code path
+    that doesn't go through the claim/execute flow.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO nwt_ticket_decisions (ticket_id, decision, reasoning, decided_by)
             VALUES (%s, %s, %s, 'EXECUTION_ENGINE')
+            ON CONFLICT (ticket_id, decided_by) DO UPDATE
+              SET decision = EXCLUDED.decision, reasoning = EXCLUDED.reasoning
             """,
             (ticket_id, decision, reasoning),
         )
     conn.commit()
 
 
+def claim_or_resume_ticket(conn, ticket_id: str) -> bool:
+    """
+    P0-1: atomically claim a ticket before doing anything with a side effect
+    (an Alpaca call). Turns the old unsafe pattern —
+
+        ticket found -> Alpaca order placed -> decision recorded
+
+    (a crash between the first two steps left the ticket looking untouched,
+    so the next cron cycle retried it and placed a second live order) —
+    into:
+
+        ticket claimed -> Alpaca order placed -> result recorded -> claim finalized
+
+    Returns True if this run owns the ticket now and must carry it through
+    to an insert_decision() call. Returns False if it must not be touched
+    this run: already finalized by a previous run, or (should not be
+    reachable given the singleton lock, see CLAIM_STALE_SECONDS) claimed too
+    recently to safely assume the claimant crashed.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_ticket_decisions (ticket_id, decision, reasoning, decided_by)
+            VALUES (%s, 'CLAIMED', 'execution_engine processing started', 'EXECUTION_ENGINE')
+            ON CONFLICT (ticket_id, decided_by) DO NOTHING
+            RETURNING id
+            """,
+            (ticket_id,),
+        )
+        fresh_claim = cur.fetchone() is not None
+    conn.commit()
+    if fresh_claim:
+        return True
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT decision, created_at FROM nwt_ticket_decisions
+            WHERE ticket_id = %s AND decided_by = 'EXECUTION_ENGINE'
+            """,
+            (ticket_id,),
+        )
+        existing = cur.fetchone()
+
+    if not existing or existing["decision"] != "CLAIMED":
+        return False  # already finalized (EXECUTED/FAILED/REJECTED/SKIPPED) — nothing to do
+
+    age = (datetime.now(timezone.utc) - existing["created_at"].replace(tzinfo=timezone.utc)).total_seconds()
+    if age < CLAIM_STALE_SECONDS:
+        logger.warning("Ticket %s: CLAIMED %.0fs ago, below staleness threshold — not resuming", ticket_id, age)
+        return False
+
+    logger.warning("Ticket %s: resuming stale CLAIMED decision (%.0fs old) — likely a crashed prior run",
+                    ticket_id, age)
+    return True
+
+
+def client_order_id_for(key: str, kind: str) -> str:
+    """Deterministic Alpaca client_order_id for a ticket/position + phase —
+    the same logical retry always produces the same id, so a resubmission
+    after a crash either gets rejected by Alpaca as a duplicate or, via
+    find_or_place_order(), is detected and reused before ever being sent."""
+    return f"nwt-{kind}-{key}"[:128]
+
+
+def alpaca_get_by_client_order_id(client_order_id: str) -> dict | None:
+    """Look up an order by client_order_id. None if Alpaca has never seen it."""
+    url = f"{ALPACA_BASE_URL}/v2/orders:by_client_order_id"
+    resp = requests.get(url, headers=ALPACA_HEADERS, params={"client_order_id": client_order_id}, timeout=15)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+def find_or_place_order(client_order_id: str, place_fn) -> dict:
+    """
+    P0-1 crash recovery (Scenario B): if an order with this client_order_id
+    already exists at Alpaca — a prior run submitted it and crashed before
+    finishing (ledger write, decision write) — reuse it instead of
+    resubmitting. Otherwise place_fn() submits a new order carrying this
+    same client_order_id.
+    """
+    existing = alpaca_get_by_client_order_id(client_order_id)
+    if existing is not None:
+        logger.warning(
+            "client_order_id=%s already exists at Alpaca (order_id=%s, status=%s) — "
+            "reusing instead of resubmitting (crash-recovery path)",
+            client_order_id, existing.get("id"), existing.get("status"),
+        )
+        return existing
+    return place_fn()
+
+
 def fetch_pending_tickets(conn) -> list:
-    """Return approved TRADE_REQUEST tickets with no EXECUTION_ENGINE decision yet."""
+    """
+    Return approved TRADE_REQUEST tickets this run must (re)process: either
+    never touched by EXECUTION_ENGINE, or claimed by a run that crashed
+    before finalizing (P0-1 recovery — see claim_or_resume_ticket).
+    """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
@@ -374,20 +491,32 @@ def fetch_pending_tickets(conn) -> list:
               AND t.from_agent IN (
                   'EU_EXECUTOR', 'AUS_EXECUTOR', 'CHINA_EXECUTOR', 'NWT_EXECUTION_AGENT'
               )
-              AND NOT EXISTS (
-                  SELECT 1 FROM nwt_ticket_decisions d
-                  WHERE d.ticket_id = t.ticket_id
-                    AND d.decided_by = 'EXECUTION_ENGINE'
+              AND (
+                  NOT EXISTS (
+                      SELECT 1 FROM nwt_ticket_decisions d
+                      WHERE d.ticket_id = t.ticket_id AND d.decided_by = 'EXECUTION_ENGINE'
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM nwt_ticket_decisions d
+                      WHERE d.ticket_id = t.ticket_id AND d.decided_by = 'EXECUTION_ENGINE'
+                        AND d.decision = 'CLAIMED'
+                        AND d.created_at < NOW() - (%(stale)s || ' seconds')::interval
+                  )
               )
             ORDER BY t.created_at ASC
             """,
+            {"stale": CLAIM_STALE_SECONDS},
         )
         rows = cur.fetchall()
     return [dict(r) for r in rows]
 
 
 def fetch_force_close_tickets(conn) -> list:
-    """Return FORCE_CLOSE and CLOSE_REQUEST tickets with no EXECUTION_ENGINE decision yet."""
+    """
+    Return FORCE_CLOSE / CLOSE_REQUEST tickets this run must (re)process:
+    either never touched by EXECUTION_ENGINE, or claimed by a run that
+    crashed before finalizing (P0-1 recovery — see claim_or_resume_ticket).
+    """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
@@ -395,13 +524,21 @@ def fetch_force_close_tickets(conn) -> list:
             FROM nwt_tickets t
             WHERE t.to_agent = 'EXECUTION_ENGINE'
               AND t.type IN ('FORCE_CLOSE', 'CLOSE_REQUEST')
-              AND NOT EXISTS (
-                  SELECT 1 FROM nwt_ticket_decisions d
-                  WHERE d.ticket_id = t.ticket_id
-                    AND d.decided_by = 'EXECUTION_ENGINE'
+              AND (
+                  NOT EXISTS (
+                      SELECT 1 FROM nwt_ticket_decisions d
+                      WHERE d.ticket_id = t.ticket_id AND d.decided_by = 'EXECUTION_ENGINE'
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM nwt_ticket_decisions d
+                      WHERE d.ticket_id = t.ticket_id AND d.decided_by = 'EXECUTION_ENGINE'
+                        AND d.decision = 'CLAIMED'
+                        AND d.created_at < NOW() - (%(stale)s || ' seconds')::interval
+                  )
               )
             ORDER BY t.created_at ASC
-            """
+            """,
+            {"stale": CLAIM_STALE_SECONDS},
         )
         rows = cur.fetchall()
     return [dict(r) for r in rows]
@@ -482,7 +619,7 @@ def compute_qty_from_notional(sized_notional: float, price: float) -> int:
     return max(int(sized_notional / price), 1)
 
 
-def place_equity_order(payload: dict) -> dict:
+def place_equity_order(payload: dict, client_order_id: str) -> dict:
     symbol = payload["symbol"]
     sized_notional = float(payload["sized_notional"])
     time_in_force = payload["time_in_force"]
@@ -498,12 +635,14 @@ def place_equity_order(payload: dict) -> dict:
         "side": side,
         "type": "market",
         "time_in_force": time_in_force,
+        "client_order_id": client_order_id,
     }
-    logger.info("Placing equity order: %s %s x%d (notional=%.2f)", side, symbol, qty, sized_notional)
+    logger.info("Placing equity order: %s %s x%d (notional=%.2f) client_order_id=%s",
+                side, symbol, qty, sized_notional, client_order_id)
     return alpaca_post("/orders", order_body)
 
 
-def place_options_order(payload: dict) -> dict:
+def place_options_order(payload: dict, client_order_id: str) -> dict:
     """
     Single-leg option entries are ALWAYS buy-to-open — a bearish thesis buys
     a put, it never sells a call. Sell-to-open is only reachable inside a
@@ -521,6 +660,7 @@ def place_options_order(payload: dict) -> dict:
             "qty": str(qty),
             "type": "market",
             "time_in_force": time_in_force,
+            "client_order_id": client_order_id,
             "legs": [
                 {
                     "symbol": leg["option_symbol"],
@@ -531,8 +671,9 @@ def place_options_order(payload: dict) -> dict:
                 for leg in legs
             ],
         }
-        logger.info("Placing mleg options order: %d legs x%d (%s)",
-                    len(legs), qty, ", ".join(f"{l['side']} {l['option_symbol']}" for l in legs))
+        logger.info("Placing mleg options order: %d legs x%d (%s) client_order_id=%s",
+                    len(legs), qty, ", ".join(f"{l['side']} {l['option_symbol']}" for l in legs),
+                    client_order_id)
         return alpaca_post("/orders", order_body)
 
     option_symbol = payload["option_symbol"]
@@ -543,12 +684,13 @@ def place_options_order(payload: dict) -> dict:
         "type": "market",
         "time_in_force": time_in_force,
         "order_class": "simple",
+        "client_order_id": client_order_id,
     }
-    logger.info("Placing options order: buy %s x%d", option_symbol, qty)
+    logger.info("Placing options order: buy %s x%d client_order_id=%s", option_symbol, qty, client_order_id)
     return alpaca_post("/orders", order_body)
 
 
-def place_close_order(symbol: str, qty: int, asset_type: str, side: str = "sell") -> dict:
+def place_close_order(symbol: str, qty: int, asset_type: str, client_order_id: str, side: str = "sell") -> dict:
     """
     side defaults to "sell" (closing a long position — true for equity and
     every single-leg option position). A short option leg (only reachable
@@ -562,10 +704,11 @@ def place_close_order(symbol: str, qty: int, asset_type: str, side: str = "sell"
         "side": side,
         "type": "market",
         "time_in_force": "day",
+        "client_order_id": client_order_id,
     }
     if asset_type == "option":
         order_body["order_class"] = "simple"
-    logger.info("Placing close order: %s %s x%d", side, symbol, qty)
+    logger.info("Placing close order: %s %s x%d client_order_id=%s", side, symbol, qty, client_order_id)
     return alpaca_post("/orders", order_body)
 
 
@@ -718,7 +861,17 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
                             notional, entry_price, exit_reason) -> None:
     try:
         qty = compute_qty_from_notional(notional, entry_price)
-        order = place_close_order(symbol, qty, "equity")
+        # P0-1: this monitor scans open ledger positions every cycle rather
+        # than consuming a ticket, so there's no claim to make — but the
+        # same crash-recovery gap exists for the Alpaca call itself (fill
+        # succeeds, close_position() write crashes, next cycle still sees
+        # the position 'open' and would otherwise resubmit). Keyed on
+        # position_id (stable per ledger row) rather than a ticket_id.
+        client_order_id = client_order_id_for(position_id, "eqmon")
+        order = find_or_place_order(
+            client_order_id,
+            lambda: place_close_order(symbol, qty, "equity", client_order_id),
+        )
         filled = poll_order_until_filled(order["id"])
         fill_price = float(filled.get("filled_avg_price") or current_price)
         slippage = abs(fill_price - current_price) / current_price if current_price > 0 else 0.0
@@ -748,6 +901,10 @@ def process_close_ticket(conn, ticket: dict) -> None:
     position first so this can never default to "sell" against a short.
     """
     ticket_id = str(ticket["ticket_id"])
+    if not claim_or_resume_ticket(conn, ticket_id):
+        logger.info("Ticket %s: not claimed this run — skipping", ticket_id)
+        return
+
     payload = ticket.get("payload") or {}
     symbol = payload.get("option_symbol") or payload.get("symbol", "")
     position_id = payload.get("position_id")
@@ -765,8 +922,12 @@ def process_close_ticket(conn, ticket: dict) -> None:
             pos_direction = row["direction"]
     close_side = "buy" if pos_direction == "short" else "sell"
 
+    client_order_id = client_order_id_for(ticket_id, "close")
     try:
-        order = place_close_order(symbol, qty, asset_type, side=close_side)
+        order = find_or_place_order(
+            client_order_id,
+            lambda: place_close_order(symbol, qty, asset_type, client_order_id, side=close_side),
+        )
         filled = poll_order_until_filled(order["id"])
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
@@ -809,6 +970,10 @@ def process_force_close(conn, ticket: dict) -> None:
     and closes the ledger row with exit price + exit NBBO.
     """
     ticket_id = str(ticket["ticket_id"])
+    if not claim_or_resume_ticket(conn, ticket_id):
+        logger.info("Ticket %s: not claimed this run — skipping", ticket_id)
+        return
+
     payload = ticket.get("payload") or {}
     position_id = payload.get("position_id", "")
     asset = payload.get("symbol") or payload.get("option_symbol", "")
@@ -822,6 +987,9 @@ def process_force_close(conn, ticket: dict) -> None:
         return
 
     if position.get("status") == "closed":
+        # P0-1 crash recovery (Scenario D): a resumed FORCE_CLOSE whose
+        # prior attempt already liquidated at Alpaca and wrote the ledger
+        # close lands here and stops — no second liquidation attempt.
         reason = f"FORCE_CLOSE: position {position_id} already closed"
         logger.info("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "SKIPPED", reason)
@@ -834,6 +1002,14 @@ def process_force_close(conn, ticket: dict) -> None:
     expected_price = (exit_bid + exit_ask) / 2.0 if (exit_bid and exit_ask) else None
 
     try:
+        # Alpaca's position-liquidation endpoint (DELETE /v2/positions/{..})
+        # does not accept a client_order_id — unlike every other order path
+        # in this file, that idempotency mechanism isn't available here.
+        # Crash safety instead comes from the status=='closed' check above
+        # (resumed after a fully-completed prior attempt: skips) plus
+        # Alpaca's own behaviour when there is genuinely nothing left to
+        # liquidate (resumed after Alpaca-succeeded-but-ledger-write-crashed:
+        # this call 404s — caught below as FAILED, not a second live order).
         order = alpaca_delete(f"/positions/{asset}")
     except Exception as exc:
         reason = f"FORCE_CLOSE: liquidation order failed for {asset}: {exc}"
@@ -890,9 +1066,22 @@ def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
     Recon matches Alpaca positions per contract, so legs must be individual
     rows; the monitor values/closes the structure as a unit via the group id.
     Returns the spread_group_id.
+
+    P0-1: if a prior run already inserted some legs for this alpaca_order_id
+    before crashing, reuse ITS spread_group_id instead of minting a new one
+    — otherwise a resumed insert would split one spread's legs across two
+    different group ids. insert_position() below is idempotent per
+    (alpaca_order_id, asset), so already-inserted legs are safely skipped
+    and only the missing ones get written.
     """
     qty = int(payload.get("qty", 1))
-    spread_group_id = str(uuid.uuid4())
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT spread_group_id FROM nwt_portfolio_ledger WHERE alpaca_order_id = %s LIMIT 1",
+            (alpaca_order_id,),
+        )
+        existing_group = cur.fetchone()
+    spread_group_id = str(existing_group["spread_group_id"]) if existing_group else str(uuid.uuid4())
     filled_legs = {l.get("symbol"): l for l in (filled_order.get("legs") or [])}
     position_ids = []
 
@@ -950,6 +1139,10 @@ def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
 
 def process_ticket(conn, ticket: dict, directives: dict) -> None:
     ticket_id = str(ticket["ticket_id"])
+    if not claim_or_resume_ticket(conn, ticket_id):
+        logger.info("Ticket %s: not claimed this run — skipping", ticket_id)
+        return
+
     payload = ticket.get("payload") or {}
 
     missing = REQUIRED_FIELDS - set(payload.keys())
@@ -992,11 +1185,12 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     legs = payload.get("legs") or []
     expected_price = None
     entry_bid = entry_ask = None
+    client_order_id = client_order_id_for(ticket_id, "trade")
 
     try:
         if asset_type == "equity":
             entry_bid, entry_ask = get_latest_quote(symbol, "equity")
-            order = place_equity_order(payload)
+            order = find_or_place_order(client_order_id, lambda: place_equity_order(payload, client_order_id))
             expected_price = get_current_price(symbol)
         elif asset_type == "option":
             if not legs:
@@ -1004,7 +1198,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
                 entry_bid, entry_ask = get_latest_quote(option_symbol, "option")
                 if entry_bid and entry_ask:
                     expected_price = (entry_bid + entry_ask) / 2.0
-            order = place_options_order(payload)
+            order = find_or_place_order(client_order_id, lambda: place_options_order(payload, client_order_id))
         else:
             reason = f"Unknown asset_type: {asset_type}"
             insert_decision(conn, ticket_id, "FAILED", reason)

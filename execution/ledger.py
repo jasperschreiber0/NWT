@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 def insert_position(conn, data: dict) -> str:
     """
     INSERT a new position into nwt_portfolio_ledger.
-    Returns the new position_id (UUID as string).
+    Returns the position_id (UUID as string) — either newly created, or the
+    pre-existing one if this exact (alpaca_order_id, asset) was already
+    inserted.
 
     Required keys in data:
         bot_source, asset, asset_type
@@ -40,6 +42,16 @@ def insert_position(conn, data: dict) -> str:
     actually carried (Brain->Execution contract fields) so the equity
     position monitor can use them instead of falling back to a genome/
     hardcoded default.
+
+    P0-1: idempotent on (alpaca_order_id, asset) — one_ledger_row_per_order_
+    asset in migrate_2026_07_execution_idempotency.sql. A resumed ticket
+    that reused an already-filled order (via execution/engine.py's
+    find_or_place_order) must not create a second ledger row for the same
+    fill; this makes calling insert_position twice for the same order+asset
+    safe and return the same position_id both times. Rows with no
+    alpaca_order_id (e.g. recon_agent.py's cold-start UNATTRIBUTED imports)
+    are unaffected — the constraint only applies where alpaca_order_id is
+    set, so every such row is always a fresh INSERT.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -49,6 +61,8 @@ def insert_position(conn, data: dict) -> str:
                  notional_risk, qty, entry_price, entry_time, entry_bid, entry_ask,
                  alpaca_order_id, stop_pct, target_pct, spread_group_id, status)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
+            ON CONFLICT (alpaca_order_id, asset) WHERE alpaca_order_id IS NOT NULL
+              DO NOTHING
             RETURNING position_id
             """,
             (
@@ -70,7 +84,26 @@ def insert_position(conn, data: dict) -> str:
                 data.get("spread_group_id"),
             ),
         )
-        position_id = cur.fetchone()[0]
+        row = cur.fetchone()
+
+        if row is None:
+            # Conflict — this (alpaca_order_id, asset) was already inserted
+            # by a prior attempt. Look up and reuse that row's position_id
+            # rather than silently doing nothing (the caller needs an id).
+            cur.execute(
+                "SELECT position_id FROM nwt_portfolio_ledger WHERE alpaca_order_id = %s AND asset = %s",
+                (data.get("alpaca_order_id"), data["asset"]),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            position_id = row[0]
+            logger.warning(
+                "insert_position: (alpaca_order_id=%s, asset=%s) already exists — reusing position_id=%s",
+                data.get("alpaca_order_id"), data["asset"], position_id,
+            )
+            return str(position_id)
+
+        position_id = row[0]
     conn.commit()
     logger.info("Inserted position %s for %s (%s)", position_id, data["asset"], data["bot_source"])
     return str(position_id)
