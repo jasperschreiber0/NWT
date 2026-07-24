@@ -17,6 +17,20 @@ Nothing here proposes removing the Risk Agent's authority, the append-only ticke
 
 ---
 
+## 0.5 Governing Constraint: Reliability Before Capability
+
+> **This section overrides ambition anywhere below it conflicts.** NWT currently experiences frequent production failures. That fact changes the priority order of everything in this document, not just the roadmap's ordering — it changes which pieces get built at all, and how.
+
+**Three rules apply to every proposal in this file:**
+
+1. **Every addition must reduce operational complexity or provide a clear, specific reliability benefit.** "Would be useful for research" is not sufficient justification on its own. Where a section below doesn't obviously satisfy this, it now carries an explicit note explaining which of the two applies — or is marked deferred until it does.
+2. **No new always-running service unless there is no simpler alternative.** NWT's current always-on footprint is exactly one process: `nwt-dashboard` (FastAPI). Everything else in the system — PM2 `cron_restart` bots, nwt_agents' crontab jobs — is scheduled, runs, exits, and is absent the rest of the time. A crashed cron job affects one cycle; a crashed daemon affects every cycle until someone notices and restarts it, and adds a permanent PM2 entry that must itself be monitored. Given the system's current failure rate, adding daemons is adding failure surface, not removing it. §12 below reflects this: every component originally scoped as a new service is re-scoped as a cron-scheduled script or a flag/mode on an existing agent, unless genuinely impossible.
+3. **Prefer extending an existing file over creating a new one.** Every new file is a new thing that can import the wrong thing, drift from its sibling, or be forgotten in a deploy. Where a proposed component's logic fits naturally as a new function or `--flag` on an agent that already runs on the required cadence, it is folded in rather than shipped as its own module. This directly serves Risk 2 from `CLAUDE.md` (silent divergence between near-duplicate components) as much as it serves simplicity.
+
+**Consequence for sequencing:** nothing in this document should be built before the current production failures are understood and addressed. §16's roadmap now opens with a Phase 0 that is not about the Strategy Factory at all — it's about establishing that the *existing* system runs reliably enough to be worth extending. Building a Portfolio Optimizer on top of an allocator that silently fails half its cron runs does not produce a better allocator; it produces a more elaborate failure.
+
+---
+
 ## 1. Strategy Factory
 
 ### 1.1 The core abstraction: `Strategy`
@@ -55,8 +69,8 @@ This is a strict generalization of the existing rule ("no agent may use hardcode
 `CLAUDE.md` already flags this as Risk 2 ("must be enforced in code, not convention"). At Strategy Factory scale it needs a concrete mechanism:
 
 - Each strategy spec is invoked in a **pure function call** with an immutable snapshot of market state passed in — no shared DB connection, no shared in-memory cache across strategies within a single evaluation pass. If two strategies need the same expensive computation (e.g. an IV surface), it's computed once upstream and passed to both as the same immutable input — never recomputed with side-effectful caching that could drift between them.
-- A nightly **isolation auditor** (`strategy_isolation_auditor.py`) statically scans strategy spec files for cross-strategy imports or writes to any table other than its own decision/outcome rows, and fails CI / raises a ticket if violated.
-- Bot-level isolation rules (US/EU/AUS/China market-data boundaries from `CLAUDE.md` §"Bot Isolation Rules") become a special case of strategy-level isolation, enforced the same way.
+- **Isolation check runs as a static lint pass in CI/pre-deploy, not as a runtime service.** A script (`factory/check_isolation.py`, invoked by the existing deploy step or a pre-commit hook — no new process, no new cron entry, no new PM2 app) statically scans strategy spec files for cross-strategy imports or writes to any table other than its own decision/outcome rows, and fails the deploy if violated. This is strictly cheaper than a "nightly isolation auditor service": a lint failure blocks a bad deploy before it ships, whereas a nightly runtime check only discovers the violation after it's already been running in production for up to 24 hours. It also adds zero new always-running processes and zero new cron-schedule collision risk.
+- Bot-level isolation rules (US/EU/AUS/China market-data boundaries from `CLAUDE.md` §"Bot Isolation Rules") become a special case of strategy-level isolation, enforced the same way — and, notably, this check would have caught the class of bug `CLAUDE.md` Risk 2 already warns about ("bots silently converging to US macro proxy") *before* deploy in the current system too. Recommend running it against the existing Track A/C/D/E code today, independent of anything else in this document — it's a pure reliability improvement with no new capability attached.
 
 ---
 
@@ -121,11 +135,15 @@ The existing bounded-z-score tilt (±25% of baseline, no bot dominates) is a rea
 - Portfolio-level volatility target (vol targeting, not just capital targeting — a strategy sized the same in a calm regime and a stressed regime is a bug)
 - Lifecycle-stage capital ceiling (§2.4, hard constraint, not optimized away)
 
-This is a solvable convex(-ish) problem at the scale in question (hundreds, not tens of thousands, of strategies) — a standard quadratic-program formulation (mean-variance with position and cluster caps) is sufficient; no need for anything exotic. Recommend implementing as `master/portfolio_optimizer.py`, called from `strategist.py` after `allocator.py`'s per-bucket performance stats are computed, with `allocator.py`'s existing bounded-tilt logic retained as the fallback/cold-start path when the optimizer's inputs are too sparse (mirrors the existing cold-start-returns-baseline-weights behavior).
+This is a solvable convex(-ish) problem at the scale in question (hundreds, not tens of thousands, of strategies) — a standard quadratic-program formulation (mean-variance with position and cluster caps) is sufficient; no need for anything exotic.
+
+**No new service.** This is implemented as new functions *inside the existing* `master/allocator.py`, called from the existing `compute_dynamic_weights()` on the existing `strategist.py` cadence (21:30 UTC) — not a new file, not a new process, not a new cron entry. `compute_dynamic_weights()`'s current bounded-z-score tilt becomes one branch of the same function (used when a strategy hasn't cleared enough trades for the fuller correlation/tail-risk treatment, or when the QP solve itself fails/times out — see below), rather than a separate fallback module that has to be kept in sync with a separate optimizer module. One file, one entry point, one cold-start path — the opposite of the "Portfolio Optimizer as a new service" framing this section originally proposed. Correlation computation (originally scoped as a standalone "Correlation Engine" — see §9) is likewise a function in the same file, since it's an input the allocator needs every time it runs, not an independent schedule.
+
+**Reliability requirement, not just an optimization nicety:** a QP solver call is a new failure mode that pure weighted-average tilting doesn't have (infeasible constraint sets, solver timeout, numerical issues at edge cases like a single active strategy). `compute_dynamic_weights()` must catch solver failure explicitly and fall back to the existing bounded-tilt logic, logging the fallback as a ticket — never let a solver exception propagate into a missed `master-directives.json` write, which is exactly the kind of failure the system can least afford given its current reliability record. This fallback-on-failure behavior is a hard requirement for shipping this, not a future nice-to-have.
 
 ### 3.4 Authority boundary
 
-The Portfolio Optimizer has exactly the same authority as the existing Portfolio Brain: **allocation, throttling, risk gating — never signal generation, never strategy logic override.** It sits above the existing Portfolio Brain / `master-directives.json` layer conceptually (it decides strategy-level and bot-level weights together, since bots and options strategies are now the same kind of object — competing units), but does not gain any new authority kind. The Risk Agent's veto authority remains strictly senior to the allocator's weighting decision, exactly as today.
+The extended allocator has exactly the same authority as the existing Portfolio Brain: **allocation, throttling, risk gating — never signal generation, never strategy logic override.** It decides strategy-level and bot-level weights together (since bots and options strategies are now the same kind of object — competing units), but does not gain any new authority kind and does not introduce a new component with its own failure/authority surface. The Risk Agent's veto authority remains strictly senior to the allocator's weighting decision, exactly as today.
 
 ---
 
@@ -158,9 +176,11 @@ Two consequences:
 
 ## 5. AI Research Layer
 
-### 5.1 Strict authority boundary
+### 5.1 Strict authority boundary — and no new daemon
 
-The AI Research Agent (`nwt_agents/research_agent.py`, new) has **read-only** access to the research warehouse and **zero** write access to genome, registry, orders, or ledger. Its only output is a row in a new append-only table, `nwt_research_hypotheses` — text + supporting statistics + a proposed experiment design. This is the same authority discipline already applied to the Mutation Engine ("AI never deploys changes directly... humans approve experiments") — the Research Agent is one step further removed than the Mutation Engine: it doesn't even get to write a shadow genome row itself. A human (or the existing Mutation Engine, after human sign-off on the hypothesis) turns a hypothesis into an actual shadow-mode experiment.
+The AI Research Agent has **read-only** access to the research warehouse and **zero** write access to genome, registry, orders, or ledger. Its only output is a row in a new append-only table, `nwt_research_hypotheses` — text + supporting statistics + a proposed experiment design. This is the same authority discipline already applied to the Mutation Engine ("AI never deploys changes directly... humans approve experiments") — the Research Agent is one step further removed than the Mutation Engine: it doesn't even get to write a shadow genome row itself. A human (or the existing Mutation Engine, after human sign-off on the hypothesis) turns a hypothesis into an actual shadow-mode experiment.
+
+**Implementation: a mode on the existing Learning Agent, not a new file or a new cron line.** `nwt_agents/learning_agent.py` already runs daily at 21:00 UTC and already computes win rates and attribution from the same warehouse this feature needs to read. Add a `--research` invocation (triggered weekly — e.g. Mondays — from the *same* existing crontab line via a day-of-week check inside the script, not a second `crontab.txt` entry) that runs the pattern-mining pass and writes to `nwt_research_hypotheses`. This is strictly simpler than standing up `research_agent.py` as a sibling agent: one fewer process to reason about at startup, one fewer file that can drift out of sync with the warehouse schema Learning Agent already understands, and one fewer crontab line that can be misordered relative to the agents it depends on (`SHELL=/bin/bash` first-line bug class from `CLAUDE.md`'s Known Gotchas applies to every new crontab line added — the fewer added, the smaller that risk).
 
 ### 5.2 Responsibilities
 
@@ -189,9 +209,11 @@ The existing engine already gets the hard part right: one parameter at a time, s
 
 ## 7. Massive Backtesting Infrastructure
 
-### 7.1 Why this is new, not an extension
+### 7.1 Why this is new, not an extension — and why it is deliberately last, not first
 
-Nothing in the current repo runs a historical backtest — Track C/D/E are paper-trading forward in real time. A Strategy Factory cannot gate `BACKTEST → PAPER` (§2.2) without one. This is new infrastructure: `research/backtest_engine.py` + a historical data store, `nwt_historical_bars` / `nwt_historical_options_chains` (new, separate from the live warehouse — 10-20 years of daily/intraday equity bars and options chains is a materially different storage and access pattern than live decision logging).
+Nothing in the current repo runs a historical backtest — Track C/D/E are paper-trading forward in real time. A Strategy Factory cannot gate `BACKTEST → PAPER` (§2.2) without one. This is genuinely new infrastructure with no existing component to extend: `research/backtest_engine.py` + a historical data store, `nwt_historical_bars` / `nwt_historical_options_chains`.
+
+**This is the single largest new build in the whole document, and per the governing constraint (§0.5) it is explicitly the lowest-priority item here.** It adds no reliability benefit to the currently-running system — it's pure new capability, aimed at strategies that don't exist yet. It should not be started while current production failures are unresolved (§16 Phase 0), and even once started, it runs as an **offline, on-demand script invoked manually or from the dashboard's "promote to backtest" action** — never a scheduled cron job, never a daemon. There is nothing time-sensitive about when a backtest runs; running it on-demand instead of on a schedule removes an entire category of "did the nightly backtest job silently fail" monitoring burden that a cron job would otherwise require.
 
 ### 7.2 Regime library
 
@@ -232,11 +254,11 @@ The Portfolio Optimizer (§3.3) re-runs on this same cadence and reallocates wit
 
 ## 9. Portfolio Optimisation (Portfolio Intelligence Layer)
 
-This is largely §3's optimizer restated from the portfolio-construction angle rather than the capital-allocation angle — same component, different lens, so it's specified once (§3.3) and referenced here rather than duplicated. Additional inputs specific to the "behave like an institutional multi-strategy fund" framing:
+This is largely §3's optimizer restated from the portfolio-construction angle rather than the capital-allocation angle — same component, same file (`master/allocator.py`, extended — no separate "Correlation Engine" or "Portfolio Optimizer" service, per §3.3/§0.5), different lens. Additional inputs specific to the "behave like an institutional multi-strategy fund" framing:
 
-- **Volatility targeting at the portfolio level**, not just per-strategy — the book's total realized vol should be actively managed toward a target (e.g. scale all positions down uniformly, not per-strategy, when realized portfolio vol exceeds target — distinct from the existing per-strategy Risk Agent sizing-reduction rules, which act on individual strategies/tracks).
-- **Options Greeks aggregation** (§4.1's new Greeks table feeds this directly) — net delta, net vega, net gamma, net theta at the whole-portfolio level, checked against explicit caps, extending Portfolio Brain's current "lightweight net delta + net vega estimation" (flagged as incomplete in `CLAUDE.md` Risk 1) into the full Greek set.
-- **Capital efficiency** — margin/buying-power consumed per unit of expected edge; relevant once defined-risk spreads and directional single-leg positions compete for the same options buying power pool, so the optimizer should not just maximize Sharpe per dollar of notional but per dollar of *buying power consumed*.
+- **Volatility targeting at the portfolio level**, not just per-strategy — the book's total realized vol should be actively managed toward a target (e.g. scale all positions down uniformly, not per-strategy, when realized portfolio vol exceeds target — distinct from the existing per-strategy Risk Agent sizing-reduction rules, which act on individual strategies/tracks). This is a new *check*, not a new *poller* — it reads Greeks already being collected (below) at the Risk Agent's existing 5-minute cadence, it does not need its own polling loop.
+- **Options Greeks aggregation** — net delta, net vega, net gamma, net theta at the whole-portfolio level, checked against explicit caps, extending Portfolio Brain's current "lightweight net delta + net vega estimation" (flagged as incomplete in `CLAUDE.md` Risk 1) into the full Greek set. Greeks are computed and written by the **existing** `execution_agent.py`/`risk_agent.py` polling cycle (already runs every 5 minutes per `CLAUDE.md`'s cron schedule) — this is new columns/rows on an existing poll, not a new poll.
+- **Capital efficiency** — margin/buying-power consumed per unit of expected edge; relevant once defined-risk spreads and directional single-leg positions compete for the same options buying power pool, so the allocator should not just maximize Sharpe per dollar of notional but per dollar of *buying power consumed*.
 
 ---
 
@@ -247,7 +269,7 @@ Extends the existing `dashboard/` FastAPI service (`nwt-dashboard`, always-on pe
 | Dashboard | Primary source |
 |---|---|
 | Strategy Health | `nwt_strategy_registry` + `nwt_strategy_decay` + rolling Sharpe/Sortino/Calmar |
-| Portfolio Health | Portfolio Optimizer output + net Greeks + correlation matrix heatmap |
+| Portfolio Health | Extended `allocator.py` output + net Greeks + correlation matrix heatmap |
 | Learning Progress | Trade-count progression per strategy toward next lifecycle gate (§2.2) |
 | Capital Allocation | Current + historical weights per strategy, vs. lifecycle-stage ceiling |
 | Risk | Existing Risk Agent trigger states + new tail-risk (CVaR) view |
@@ -354,15 +376,14 @@ CREATE TABLE nwt_mutation_proposals (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Portfolio Optimizer run log (audit trail, parallels nwt_allocator_history)
-CREATE TABLE nwt_portfolio_optimizer_history (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  run_time TIMESTAMPTZ DEFAULT NOW(),
-  inputs JSONB NOT NULL,               -- per-strategy Sharpe/Sortino/Calmar/corr/liquidity/tail-risk snapshot
-  correlation_matrix JSONB NOT NULL,
-  outputs JSONB NOT NULL,              -- resulting weights per strategy
-  binding_constraints TEXT[]           -- which caps were active this run, for explainability
-);
+-- Extended allocator audit trail: new nullable columns on the EXISTING nwt_allocator_history
+-- table (already logs every allocator run's inputs/outputs per CLAUDE.md's Layer D) rather
+-- than a new parallel table — same run log, richer per-run detail.
+ALTER TABLE nwt_allocator_history
+  ADD COLUMN correlation_matrix JSONB,
+  ADD COLUMN tail_risk_inputs JSONB,        -- per-strategy CVaR/liquidity snapshot at run time
+  ADD COLUMN binding_constraints TEXT[],    -- which caps were active this run, for explainability
+  ADD COLUMN solver_status TEXT;            -- 'qp_solved' | 'fallback_bounded_tilt' | 'cold_start' — see §3.3
 
 -- Historical data store for backtesting (separate from live warehouse)
 CREATE TABLE nwt_historical_bars (
@@ -399,19 +420,21 @@ Existing tables extended with new nullable FK columns only (never a breaking cha
 
 ---
 
-## 12. New Services Required
+## 12. New Components — Zero New Always-Running Services
 
-| Service | Path | Cadence | Authority |
+Per §0.5, the bar for "new service" is deliberately high. Re-scoped against that bar, almost nothing in this document needs one. The table below replaces the original "New Services Required" list; the "Original framing" column is kept so the re-scoping is auditable rather than silently different.
+
+| Component | Original framing | Actual implementation | New daemon? |
 |---|---|---|---|
-| Strategy Registry API | `factory/registry_service.py` | on-demand (dashboard + agents read/write registry rows) | Registry CRUD only — never trading |
-| Portfolio Optimizer | `master/portfolio_optimizer.py` | Same cadence as `strategist.py` (21:30 UTC) + monthly deep recompute | Allocation output only, feeds `master-directives.json`'s successor schema |
-| Backtest Engine | `research/backtest_engine.py` | On-demand, triggered by `BACKTEST` stage entry | Read-only vs. historical store; writes only to `nwt_backtest_runs` |
-| Historical Data Loader | `research/historical_data_loader.py` | One-time bulk load + daily incremental append | Write-only to `nwt_historical_*` tables |
-| Isolation Auditor | `factory/strategy_isolation_auditor.py` | Nightly (alongside recon, 23:00 UTC window) | Read-only static analysis; raises tickets, never blocks trading directly (Risk Agent already owns that authority) |
-| AI Research Agent | `nwt_agents/research_agent.py` | Weekly (or on-demand from dashboard) | Read-only warehouse access; writes only to `nwt_research_hypotheses` |
-| Correlation Engine | `master/correlation_engine.py` | Same cadence as Portfolio Optimizer (it's an input to it) | Read-only; writes `correlation_matrix` into `nwt_portfolio_optimizer_history` |
+| Strategy Registry | New `factory/registry_service.py` API | A table (`nwt_strategy_registry`) plus a handful of functions in the existing `nwt_agents/shared_context.py` (already the shared import every agent uses). No API layer — agents that need registry data query Postgres directly, exactly like every other table in the system. | No |
+| Capital allocation (was "Portfolio Optimizer") | New `master/portfolio_optimizer.py` | New functions inside the existing `master/allocator.py`, called from the existing `compute_dynamic_weights()` on the existing 21:30 UTC cadence (§3.3). | No |
+| Correlation computation | New `master/correlation_engine.py` | A function inside `master/allocator.py` (§9) — it's an input the allocator needs each run, not an independent schedule. | No |
+| Isolation check | New nightly `factory/strategy_isolation_auditor.py` service | A CI/pre-deploy lint script, `factory/check_isolation.py`, run at deploy time, not on a schedule (§1.3). | No |
+| Research hypothesis mining (was "AI Research Agent") | New `nwt_agents/research_agent.py` | A `--research` mode added to the existing `nwt_agents/learning_agent.py`, firing weekly from the *same* existing 21:00 UTC crontab line via an in-script day-of-week check (§5.1). | No |
+| Backtest Engine | New `research/backtest_engine.py` | Still a new file — there's genuinely nothing to extend, since nothing in the repo runs historical backtests today. Invoked **on-demand only** (manual or dashboard-triggered), never scheduled — no cron entry, no PM2 app (§7.1). Lowest-priority item in this document; deferred past Phase 0. | No — on-demand script, exits after each run |
+| Historical Data Loader | New `research/historical_data_loader.py` | Same reasoning as Backtest Engine: a new file because there's no existing historical-data component, but a script invoked as a one-time bulk load plus a daily incremental append **tacked onto the existing daily cron window** (e.g. run right after the existing 22:30 UTC DB backup slot) rather than its own new cadence. | No |
 
-None of these introduce a new order-authority holder. The Execution Engine remains the only component that calls Alpaca order endpoints, exactly as `CLAUDE.md` currently mandates.
+**Net result: the existing always-on process count does not change.** `nwt-dashboard` remains the only long-running daemon in the system before and after this design. Every other addition is either a new column/table read by an existing scheduled job, a new function in an existing file called from an existing cron entry, or a script that runs once and exits. The Execution Engine remains the only component that calls Alpaca order endpoints, exactly as `CLAUDE.md` currently mandates — nothing above changes order authority.
 
 ---
 
@@ -440,7 +463,7 @@ Human or Research Agent hypothesis
 Market data + genome (per strategy) → strategy spec evaluates
   → candidate signal (or none — logged as inactivity, per existing "Do Nothing as a First-Class State")
   → nwt_market_state_snapshot row written (decision-time snapshot)
-  → Portfolio Optimizer's last-computed weight for this strategy determines sizing ceiling
+  → allocator.py's last-computed weight for this strategy (§3.3) determines sizing ceiling
   → Risk Agent veto pass (13+ rules, now strategy-agnostic — operates on any strategy regardless of track)
   → Execution Engine places order (only path to Alpaca)
   → nwt_execution_quality + nwt_position_greeks rows written at fill
@@ -452,7 +475,7 @@ Market data + genome (per strategy) → strategy spec evaluates
 
 ```
 nwt_strategy_decay recompute (existing, extended per §8.1)
-  → Portfolio Optimizer full recompute (correlation matrix + all inputs)
+  → allocator.py's full recompute (correlation matrix + all inputs, same 21:30 UTC cadence)
   → within-bounds reallocation applied automatically
   → any strategy crossing an auto-retire trigger → nwt_strategy_lifecycle_log: * → retired
   → any strategy eligible for next capital step → lifecycle gate check → promote or hold
@@ -477,16 +500,17 @@ Decay flag OR approved research hypothesis
 
 | Agent | Current role | Added role |
 |---|---|---|
-| Portfolio Brain (`master/strategist.py`) | Regime classification, per-bot allocation | Delegates capital-weighting math to Portfolio Optimizer; retains regime classification and kill-switch authority unchanged |
-| Risk Agent | 13 veto rules, per-track | Same 13 rules, now evaluated per-strategy across a much larger strategy population — no new rule types, just broader scope |
+| Portfolio Brain (`master/strategist.py`) | Regime classification, per-bot allocation | Unchanged responsibility, calls into `allocator.py`'s extended `compute_dynamic_weights()` exactly as it calls the existing one today; retains regime classification and kill-switch authority unchanged |
+| `master/allocator.py` | Per-bot bounded-tilt weighting | Extended in place: QP-based multi-strategy allocation, correlation computation, with the existing bounded-tilt logic retained as the explicit fallback on solver failure or cold start (§3.3) |
+| Risk Agent | 13 veto rules, per-track | Same 13 rules, now evaluated per-strategy across a much larger strategy population — no new rule types, just broader scope. Existing 5-min poll also now writes Greeks snapshots (§9) — same cadence, more columns. |
 | Execution Engine | Places all orders | Unchanged — remains the sole order-authority holder |
 | Mutation Agent | Propose/promote genome mutations | Additionally accepts research-hypothesis-sourced proposals (§6); adds explicit rollback-condition field |
-| Learning Agent | Win-rate/attribution | Additional consumer: feeds the Research Agent's warehouse queries and the Portfolio Optimizer's per-strategy stats |
+| Learning Agent (`nwt_agents/learning_agent.py`) | Win-rate/attribution, daily 21:00 UTC | Extended with a weekly `--research` mode (§5.1) — same file, same crontab line, one new flag |
 | Recon Agent | Ledger vs. Alpaca reconciliation | Unchanged |
-| **New: Research Agent** | — | Read-only hypothesis generation (§5) |
-| **New: Portfolio Optimizer** | — | Capital allocation across the full strategy population (§3, §9) |
-| **New: Backtest Engine** | — | Historical validation gate for `BACKTEST → PAPER` (§7) |
-| **New: Isolation Auditor** | — | Static enforcement of strategy non-interference (§1.3) |
+| **New file: Backtest Engine** (`research/backtest_engine.py`) | — | On-demand only, never scheduled. Historical validation gate for `BACKTEST → PAPER` (§7). Lowest priority; deferred past Phase 0. |
+| **New script: isolation check** (`factory/check_isolation.py`) | — | Deploy-time lint, not a runtime agent (§1.3) |
+
+No new long-running agent is introduced. The only genuinely new *file* in this table (Backtest Engine) is explicitly a script, not a service.
 
 ---
 
@@ -494,68 +518,71 @@ Decay flag OR approved research hypothesis
 
 ```
 /home/northworld/trading/
-├── factory/                          # NEW — Strategy Factory core
-│   ├── registry_service.py
-│   ├── strategy_isolation_auditor.py
+├── factory/                          # NEW — minimal, no runtime service
+│   ├── check_isolation.py            # deploy-time lint, not a cron job
 │   └── strategy_specs/               # one file per strategy, pure logic only
 │       ├── US-ORB-001.py
 │       ├── OPT-C-IRONCONDOR-014.py
 │       └── ...
-├── research/                          # NEW — backtesting + historical data
-│   ├── backtest_engine.py
-│   ├── historical_data_loader.py
+├── research/                          # NEW, deferred past Phase 0 — on-demand only
+│   ├── backtest_engine.py            # invoked manually / from dashboard, never cron
+│   ├── historical_data_loader.py     # runs inside the existing daily cron window
 │   └── regime_library.py             # the labeled historical windows from §7.2
 ├── master/
-│   ├── strategist.py                 # existing, delegates weighting to optimizer
-│   ├── allocator.py                  # existing, retained as cold-start fallback
-│   ├── portfolio_optimizer.py        # NEW
-│   ├── correlation_engine.py         # NEW
+│   ├── strategist.py                 # existing, unchanged call pattern into allocator.py
+│   ├── allocator.py                  # EXTENDED IN PLACE — QP allocation + correlation, no new file
 │   └── market_internals.py           # existing
 ├── nwt_agents/
-│   ├── research_agent.py             # NEW
+│   ├── learning_agent.py             # EXTENDED IN PLACE — adds --research mode, same cron line
 │   ├── mutation_agent.py             # existing, extended per §6
 │   ├── track_c.py / track_d.py / track_e.py   # existing
 │   └── ...                           # existing agents unchanged
 ├── execution/                        # existing, unchanged authority
 ├── dashboard/
-│   └── views/                        # NEW subviews per §10
+│   └── views/                        # NEW subviews per §10 — same existing always-on process
 ├── db/
 │   ├── schema.sql                    # existing Day-1 baseline, unchanged
 │   └── migrate_2026_XX_strategy_factory.sql   # NEW — schema in §11
-└── ecosystem.config.cjs / crontab.txt          # extended with new services' schedules
+└── ecosystem.config.cjs / crontab.txt          # no new PM2 apps; at most one new cron line
+                                                 # (historical data loader's incremental append)
 ```
+
+Compare file/process count to the original framing: two fewer new top-level files under `master/`, one fewer under `nwt_agents/`, and `factory/` shrinks from a service to a lint script plus the (unavoidable) strategy-spec directory that the isolation model in §1 requires regardless of implementation approach.
 
 ---
 
 ## 16. Implementation Roadmap & Priority Order
 
-Sequenced so every phase leaves the system in a fully-working, fully-safe state — nothing here requires a "big bang" cutover, consistent with the existing rebuild's own incremental philosophy.
+Sequenced so every phase leaves the system in a fully-working, fully-safe state — nothing here requires a "big bang" cutover, consistent with the existing rebuild's own incremental philosophy. Per §0.5, this roadmap now opens with a phase that isn't about the Strategy Factory at all.
 
-**Phase 1 — Foundation (warehouse before anything else)**
-1. Research Data Warehouse schema (§11, §4) — partitioned tables, FK columns added to existing tables. This must come first: nothing else (optimizer, research agent, backtester validation) has data to work with otherwise, and retrofitting historical attribution later is far more expensive than capturing it from day one.
-2. Strategy Registry (§1, §2) — wrap the *existing* 36 Track C/D/E strategies + 4 Track A bots into the registry as a pure metadata migration. No behavior change yet. This proves the schema against real strategies before any new one is added.
+**Phase 0 — Reliability first (blocking; nothing below starts until this is done)**
+0. Before any line of this document is implemented: identify and fix the current sources of production failure. Concretely, this means running the existing Session Startup Checklist and Startup Integrity Gate checks and treating any recurring failure as the top-priority bug, not a known-quirk to design around. In particular: (a) confirm every cron job in `crontab.txt` is actually completing and not silently erroring — a failed job that doesn't alert is indistinguishable from a working system until a human happens to check; (b) confirm PM2 apps are not flapping (`pm2 list` uptime, not just status); (c) confirm recon is clean and `no_trade_mode` isn't being tripped and silently left on; (d) confirm heartbeat rows are fresh. **Do not add new cron entries, new tables, or new agent modes while the existing schedule has unexplained failures** — every addition below makes the system harder to reason about, and a system that's already failing unpredictably is the worst possible base to add complexity to. If this phase surfaces concrete recurring failures, fixing them is higher priority than anything in Phase 1 onward, even though those fixes aren't detailed in this document (they depend on what Phase 0 actually finds).
 
-**Phase 2 — Governance layer**
-3. Isolation Auditor — run against the existing codebase first; fix any existing violations before adding more strategies (this is a genuinely useful audit of the *current* system, not just future-proofing).
+**Phase 1 — Foundation (warehouse before anything else, additive-only changes)**
+1. Research Data Warehouse schema (§11, §4) — new partitioned tables, FK columns added to existing tables. Pure additive migration: no existing agent's behavior changes, nothing reads the new tables yet, so this phase cannot itself introduce a new production failure mode — it's schema-only. This must come first: nothing else (allocator extension, research mode, backtester validation) has data to work with otherwise, and retrofitting historical attribution later is far more expensive than capturing it from day one.
+2. Strategy Registry (§1, §2) — wrap the *existing* 36 Track C/D/E strategies + 4 Track A bots into the registry as a pure metadata migration. No behavior change yet, no new process (§12) — this proves the schema against real strategies before any new one is added.
+
+**Phase 2 — Governance layer (deploy-time and gate logic only, still no new runtime processes)**
+3. Isolation check (§1.3) — a deploy-time lint script (`factory/check_isolation.py`), not a service. Run against the existing codebase first; fix any existing violations before adding more strategies (this is a genuinely useful audit of the *current* system, not just future-proofing, and a pure reliability win in its own right).
 4. Lifecycle gates (§2.2) wired to the existing Learning Gate logic — no new gate math needed, just formalize the existing mutation Learning Gate as the general strategy-promotion gate.
 
-**Phase 3 — Backtesting infrastructure**
-5. Historical data loader + regime library (§7.2) — this is the single largest new build (10-20 years of bars + options chains) and the longest lead time; start it early so it's ready when new strategies need it.
-6. Backtest engine + overfitting checks (§7.3, §7.4).
+**Phase 3 — Portfolio intelligence (extends `allocator.py` in place — see §3.3, §9)**
+5. Correlation computation — the highest-value missing risk control per `CLAUDE.md`'s own Risk 1, and buildable with only warehouse data that Phase 1 already provides. Implemented as a function inside `master/allocator.py`, not a new component.
+6. QP-based multi-strategy capital allocation (§3.3), with the existing bounded-tilt logic as the explicit, tested fallback on solver failure — ship the fallback path *before* the QP path goes live, and verify it triggers correctly, since a broken fallback here means a missed `master-directives.json` write.
 
-**Phase 4 — Portfolio intelligence**
-7. Correlation Engine — the highest-value missing risk control per `CLAUDE.md`'s own Risk 1, and buildable with only warehouse data that Phase 1 already provides.
-8. Portfolio Optimizer (§3.3, §9) — subsumes and extends the existing `allocator.py`, keeping it as cold-start fallback.
+**Phase 4 — Learning acceleration (extends `learning_agent.py` in place)**
+7. Research hypothesis mode on the existing Learning Agent (§5) — sequenced after the warehouse and correlation logic exist, since it needs rich data to mine and existing attribution infrastructure (Layer B) to anchor its output format against.
+8. Mutation Engine extensions (§6) — rollback-condition field, research-hypothesis-sourced proposals.
 
-**Phase 5 — Learning acceleration**
-9. AI Research Agent (§5) — deliberately sequenced *after* the warehouse and correlation engine exist, since it needs rich data to mine and existing attribution infrastructure (Layer B) to anchor its output format against.
-10. Mutation Engine extensions (§6) — rollback-condition field, research-hypothesis-sourced proposals.
+**Phase 5 — Backtesting infrastructure (deferred, on-demand only, lowest priority in this document)**
+9. Historical data loader + regime library (§7.2) — the single largest new build (10-20 years of bars + options chains) and the only major piece of net-new *infrastructure* (as opposed to extension) in this roadmap. Explicitly sequenced last among the build phases, per §0.5/§7.1: it adds no reliability benefit to the running system and should not compete for engineering attention with anything above.
+10. Backtest engine + overfitting checks (§7.3, §7.4) — on-demand script, never scheduled.
 
 **Phase 6 — Scale-out**
 11. Onboard genuinely new strategies (beyond the existing 36+4) through the full Phase 1-5 pipeline, one at a time, watching the gates actually reject weak candidates before trusting the pipeline with volume.
 12. Dashboard views (§10) — can be built incrementally alongside any phase above; sequenced last only because it has no gating dependency on anything else and delivers no risk-reduction on its own, only visibility.
 
-Priority principle: **risk controls and data capture before new strategy volume.** Every phase before Phase 6 makes the *existing* system safer or more observable without adding a single new strategy. Phase 6 — the part that actually grows strategy count — comes last, deliberately, because it's the phase that most needs everything before it to already be trustworthy.
+Priority principle: **risk controls and data capture before new strategy volume, and reliability before all of it (§0.5, Phase 0).** Every phase before Phase 6 makes the *existing* system safer or more observable without adding a single new strategy, and — per the re-scoping in §12 — without adding a single new always-running process either. Phase 6, the part that actually grows strategy count, comes last, deliberately, because it's the phase that most needs everything before it to already be trustworthy.
 
 ---
 
@@ -570,9 +597,11 @@ Priority principle: **risk controls and data capture before new strategy volume.
 
 ### 17.2 Failure modes to design against explicitly
 
-- **Optimizer instability**: a QP-based allocator can produce large weight swings from small input changes near a constraint boundary. Add a turnover penalty / smoothing constraint (max weight change per cycle) so the optimizer doesn't whipsaw capital between strategies — this is a standard institutional practice and is currently absent from the spec above; it should be added to §3.3 as an explicit constraint before implementation.
-- **Research Agent hallucinated hypotheses at scale**: as strategy count and data volume grow, an LLM given "find patterns" without a bounded, structured query interface will generate large volumes of low-quality hypotheses that overwhelm human review capacity. Mitigation: rate-limit hypothesis generation, and require every hypothesis to pass the sample-size + out-of-sample check (§5.3) *before* it reaches the human review queue, not after.
-- **Silent lifecycle-stage drift**: a strategy stuck in `SHADOW` for months with no proposal to advance or retire it is a failure mode of its own — a "zombie strategy" consuming research-agent attention and dashboard space with no path forward. Add a max-time-in-stage alert (not an auto-retire, since some strategies genuinely need more shadow time — but a stall this long should always surface for human attention).
+- **Optimizer instability**: a QP-based allocator can produce large weight swings from small input changes near a constraint boundary. Add a turnover penalty / smoothing constraint (max weight change per cycle) so the allocator doesn't whipsaw capital between strategies — this is a standard institutional practice and is currently absent from the spec above; it should be added to §3.3 as an explicit constraint before implementation.
+- **Research-mode hallucinated hypotheses at scale**: as strategy count and data volume grow, an LLM given "find patterns" without a bounded, structured query interface will generate large volumes of low-quality hypotheses that overwhelm human review capacity. Mitigation: rate-limit hypothesis generation, and require every hypothesis to pass the sample-size + out-of-sample check (§5.3) *before* it reaches the human review queue, not after.
+- **Silent lifecycle-stage drift**: a strategy stuck in `SHADOW` for months with no proposal to advance or retire it is a failure mode of its own — a "zombie strategy" consuming attention and dashboard space with no path forward. Add a max-time-in-stage alert (not an auto-retire, since some strategies genuinely need more shadow time — but a stall this long should always surface for human attention).
+- **Folding new logic into existing files (`allocator.py`, `learning_agent.py`) is a reliability win over new services, but it is not free** — a bug in the new `--research` code path inside `learning_agent.py` can now, in principle, take down the existing win-rate/attribution logic that shares the same process, where a broken standalone `research_agent.py` would have failed in isolation. Mitigation: the new code path must be wrapped so an exception in the research mode is caught and logged as its own ticket, never allowed to abort the agent's existing daily run — extending a file must not mean *coupling its failure modes*. This is the direct cost of §0.5's "prefer extending" rule and should be treated as a hard requirement on every extension in this document, not just a note.
+- **Cron-line reduction has a limit**: even the minimized footprint in §12 adds one new cron line (historical data loader's daily incremental append) and could add a second if the research-mode day-of-week branch inside `learning_agent.py` ever needs independent scheduling. Every crontab line is subject to the exact `SHELL=/bin/bash`-must-be-first-line failure class already documented in `CLAUDE.md`'s Known Gotchas ("caused 373 dead tickets in the prior deployment") — re-verify that invariant explicitly whenever `crontab.txt` is touched for this work, not just at initial rebuild.
 
 ### 17.3 Missing institutional-grade components not otherwise covered above
 
@@ -586,3 +615,5 @@ Priority principle: **risk controls and data capture before new strategy volume.
 ## 18. What Does Not Change
 
 To be explicit, since the request is to evolve rather than replace: the append-only ticket model, the genome-must-exist-at-startup rule, `no_trade_mode` semantics, the Risk Agent's 13-rule veto authority and its seniority over every other component, the Execution Engine as sole order-authority holder, the Ledger as sole position-truth source (never Alpaca directly), shadow-mode-before-promotion for any strategy change, and the Startup Integrity Gate — all carry forward unchanged. The Strategy Factory is additive scaffolding around a decision-making core that was already built correctly; it does not touch that core's authority model.
+
+**Also unchanged, per the governing constraint in §0.5: the always-on process count.** `nwt-dashboard` was the only long-running daemon before this document and remains the only one after it. Every capability above is delivered as new tables, new functions inside existing files called from existing cron entries, or on-demand scripts — never a new PM2 app, never a second thing that has to independently start, stay up, and be restarted after a crash. Given that NWT is currently experiencing frequent production failures, that is treated here as more important than any single capability this document describes: a platform that discovers strategies but can't reliably run its existing four bots and one options stack has not made progress.
