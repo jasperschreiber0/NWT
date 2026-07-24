@@ -1349,6 +1349,16 @@ def main() -> None:
                 except Exception as exc:
                     logger.error("Unhandled error in close ticket %s: %s",
                                  ticket.get("ticket_id"), exc)
+                    # A failed statement leaves the connection's transaction
+                    # aborted until rolled back — without this, one bad
+                    # ticket silently fails every ticket after it in the
+                    # same run (every subsequent statement on this
+                    # connection errors with "current transaction is
+                    # aborted"), not just the one that actually failed.
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
         pending = fetch_pending_tickets(conn)
         logger.info("Found %d pending TRADE_REQUEST tickets", len(pending))
@@ -1363,6 +1373,14 @@ def main() -> None:
             except Exception as exc:
                 ticket_id = str(ticket.get("ticket_id", "unknown"))
                 logger.error("Unhandled error on ticket %s: %s", ticket_id, exc)
+                # See matching comment in the close-ticket loop above — a
+                # failed statement leaves the connection transaction aborted
+                # until rolled back, which otherwise cascades into every
+                # remaining ticket in this run failing too.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 try:
                     log_system_event(conn, "ERROR", "execution_engine",
                                      f"Unhandled error on ticket {ticket_id}: {exc}",
