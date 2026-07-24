@@ -810,6 +810,26 @@ def run_equity_position_monitor(conn) -> None:
     equity_positions = [p for p in positions if p.get("asset_type") == "equity"
                         and p.get("bot_source") != "UNATTRIBUTED"]
 
+    # UNATTRIBUTED positions (cold-start imports awaiting human attribution)
+    # are deliberately excluded above -- we don't know which bot's exit
+    # rules apply, so guessing would be worse than doing nothing. But
+    # "do nothing" must not mean "say nothing": previously this exclusion
+    # was silent, so an imported position could sit unmanaged indefinitely
+    # with no operational visibility. Flag it every run instead -- cheap,
+    # and it's the only signal a human has that these need attention.
+    unattributed_equity = [p for p in positions if p.get("asset_type") == "equity"
+                           and p.get("bot_source") == "UNATTRIBUTED"]
+    if unattributed_equity:
+        symbols = [p.get("asset", "") for p in unattributed_equity]
+        logger.warning("Position monitor: %d UNATTRIBUTED equity position(s) excluded from "
+                        "automated management (no owning bot's exit rules apply): %s",
+                        len(unattributed_equity), symbols)
+        log_system_event(conn, "WARNING", "execution_engine",
+                         f"{len(unattributed_equity)} UNATTRIBUTED equity position(s) unmanaged "
+                         "pending human attribution",
+                         {"symbols": symbols,
+                          "position_ids": [str(p.get("position_id")) for p in unattributed_equity]})
+
     if not equity_positions:
         return
 
