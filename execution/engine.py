@@ -82,6 +82,18 @@ ET_TZ = ZoneInfo("America/New_York")
 # guarantee ever being weakened, not the primary safety mechanism.
 CLAIM_STALE_SECONDS = 60
 
+# P0-1: production already had 16 tickets carrying two legitimate
+# EXECUTION_ENGINE decision rows each (an older in-flight-order-tracking
+# mechanism this file no longer has — see migrate_2026_07_execution_
+# idempotency.sql for the full story), so the DB's uniqueness guarantee on
+# nwt_ticket_decisions(ticket_id, decided_by) is a PARTIAL index scoped to
+# this cutoff, not a full one. Every ON CONFLICT clause targeting that index
+# must carry this identical predicate or Postgres can't use it for conflict
+# inference ("no unique or exclusion constraint matching the ON CONFLICT
+# specification" — exactly the error hit before this was added). Must match
+# the migration file's index predicate exactly, character for character.
+IDEMPOTENCY_CUTOFF = "2026-07-24T00:00:00+00:00"
+
 # Aggregate same-direction notional cap (long vs short across all bots/tracks).
 # Distinct from master/strategist.py's PER_BOT_WEIGHT_CEILING, which caps a
 # single bot's share of total capital — the two are complementary controls
@@ -361,20 +373,21 @@ def poll_order_until_filled(order_id: str) -> dict:
 def insert_decision(conn, ticket_id: str, decision: str, reasoning: str) -> None:
     """
     P0-1: record this ticket's final EXECUTION_ENGINE decision. Upserts on
-    the (ticket_id, decided_by) unique index (migrate_2026_07_execution_
-    idempotency.sql) — claim_or_resume_ticket() already inserted a CLAIMED
-    row before any Alpaca call, so in the normal path this UPDATEs that same
-    row (finalizing the claim) rather than creating a second one. Still
-    safe to call without a prior claim (inserts fresh) for any code path
-    that doesn't go through the claim/execute flow.
+    the (ticket_id, decided_by) partial unique index (migrate_2026_07_
+    execution_idempotency.sql, scoped to IDEMPOTENCY_CUTOFF onward — see
+    that constant's own comment) — claim_or_resume_ticket() already
+    inserted a CLAIMED row before any Alpaca call, so in the normal path
+    this UPDATEs that same row (finalizing the claim) rather than creating
+    a second one. Still safe to call without a prior claim (inserts fresh)
+    for any code path that doesn't go through the claim/execute flow.
     """
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             INSERT INTO nwt_ticket_decisions (ticket_id, decision, reasoning, decided_by)
             VALUES (%s, %s, %s, 'EXECUTION_ENGINE')
-            ON CONFLICT (ticket_id, decided_by) DO UPDATE
-              SET decision = EXCLUDED.decision, reasoning = EXCLUDED.reasoning
+            ON CONFLICT (ticket_id, decided_by) WHERE created_at >= '{IDEMPOTENCY_CUTOFF}'
+              DO UPDATE SET decision = EXCLUDED.decision, reasoning = EXCLUDED.reasoning
             """,
             (ticket_id, decision, reasoning),
         )
@@ -402,10 +415,11 @@ def claim_or_resume_ticket(conn, ticket_id: str) -> bool:
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            """
+            f"""
             INSERT INTO nwt_ticket_decisions (ticket_id, decision, reasoning, decided_by)
             VALUES (%s, 'CLAIMED', 'execution_engine processing started', 'EXECUTION_ENGINE')
-            ON CONFLICT (ticket_id, decided_by) DO NOTHING
+            ON CONFLICT (ticket_id, decided_by) WHERE created_at >= '{IDEMPOTENCY_CUTOFF}'
+              DO NOTHING
             RETURNING id
             """,
             (ticket_id,),
@@ -416,10 +430,19 @@ def claim_or_resume_ticket(conn, ticket_id: str) -> bool:
         return True
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # ORDER BY + LIMIT 1: deterministic even for a legacy ticket that
+        # (from before IDEMPOTENCY_CUTOFF) carries more than one
+        # EXECUTION_ENGINE row — take the most recent one. In practice such
+        # tickets are already terminal and never reach this function at all
+        # (fetch_pending_tickets/fetch_force_close_tickets only return
+        # never-touched or stale-CLAIMED tickets), but an unordered
+        # fetchone() over possibly-multiple rows is a latent bug regardless.
         cur.execute(
             """
             SELECT decision, created_at FROM nwt_ticket_decisions
             WHERE ticket_id = %s AND decided_by = 'EXECUTION_ENGINE'
+            ORDER BY created_at DESC
+            LIMIT 1
             """,
             (ticket_id,),
         )
