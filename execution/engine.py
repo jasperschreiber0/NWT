@@ -635,6 +635,94 @@ def check_directional_cap(conn, direction: str, incoming_notional: float) -> tup
 
 
 # ---------------------------------------------------------------------------
+# Immediate post-fill reconciliation
+# ---------------------------------------------------------------------------
+
+def set_no_trade_mode_local(conn, reason: str, set_by: str) -> None:
+    """
+    Local copy of shared_context.set_no_trade_mode — execution/ deliberately
+    does not import from nwt_agents/ (see upsert_agent_state's docstring
+    elsewhere in this codebase: "master/ and nwt_agents/ stay independent
+    stacks"). Same UPSERT the rest of the system already uses.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nwt_system_flags (flag, value, reason, set_by, updated_at)
+            VALUES ('no_trade_mode', TRUE, %s, %s, NOW())
+            ON CONFLICT (flag) DO UPDATE
+              SET value=TRUE, reason=%s, set_by=%s, updated_at=NOW()
+            """,
+            (reason, set_by, reason, set_by),
+        )
+    conn.commit()
+
+
+def get_alpaca_position_qty(symbol: str) -> float:
+    """Signed live qty for one symbol (+long/-short), 0.0 if flat (404).
+    A separate seam from alpaca_get() because a 404 here is meaningful data
+    (position is flat) rather than an error to propagate."""
+    resp = requests.get(f"{ALPACA_BASE_URL}/v2/positions/{symbol}", headers=ALPACA_HEADERS, timeout=15)
+    if resp.status_code == 404:
+        return 0.0
+    resp.raise_for_status()
+    return float(resp.json().get("qty", 0))
+
+
+def verify_post_fill_position(conn, symbol: str, asset_type: str) -> bool:
+    """
+    Immediate, single-symbol reconciliation, run right after every fill
+    (open or close) instead of waiting for recon_agent's scheduled gate/
+    nightly sweep. Compares Alpaca's live position for this one symbol
+    against the ledger's own SUM of open signed qty for it: expected broker
+    state = what the ledger now believes, checked the moment it could be
+    wrong, not up to a full cron interval later.
+
+    This is what would have caught the 2026-07-28 BHP incident within
+    seconds — the ledger closed a 10-share short via a "sell" that actually
+    grew it to -20 at the broker; this check compares the two right after
+    that same fill instead of waiting for the next scheduled recon.
+
+    On a real divergence, halts trading immediately (same authority
+    recon_agent.py already exercises for the same class of finding — this
+    is a narrower, faster version of the same check, not a new one).
+    Never reverses or retries the trade that already happened, and never
+    escalates its own failure to fetch/verify into a halt — a transient
+    Alpaca lookup error is not evidence of a real mismatch.
+    """
+    try:
+        broker_qty = get_alpaca_position_qty(symbol)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(CASE WHEN direction = 'short' THEN -qty ELSE qty END), 0)
+                FROM nwt_portfolio_ledger
+                WHERE asset = %s AND asset_type = %s AND status = 'open'
+                """,
+                (symbol, asset_type),
+            )
+            ledger_qty = float(cur.fetchone()[0] or 0)
+
+        if abs(broker_qty - ledger_qty) > 0.5:
+            reason = (f"Post-fill verification FAILED for {symbol}: broker qty={broker_qty:.0f}, "
+                      f"ledger implies={ledger_qty:.0f} — divergence detected immediately after a fill")
+            logger.error(reason)
+            log_system_event(conn, "CRITICAL", "execution_engine", reason,
+                             {"symbol": symbol, "asset_type": asset_type,
+                              "broker_qty": broker_qty, "ledger_qty": ledger_qty})
+            set_no_trade_mode_local(conn, reason, "execution_engine_post_fill_check")
+            return False
+        return True
+    except Exception as exc:
+        # Verification-infrastructure failure (e.g. Alpaca timeout) is not
+        # itself evidence of a mismatch — log and let the next scheduled
+        # recon run be the backstop, same as before this check existed.
+        logger.warning("Post-fill verification could not run for %s: %s", symbol, exc)
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Order placement
 # ---------------------------------------------------------------------------
 
@@ -903,7 +991,28 @@ def run_equity_position_monitor(conn) -> None:
 def _close_equity_position(conn, pos, current_price, position_id, symbol,
                             notional, entry_price, exit_reason) -> None:
     try:
-        qty = compute_qty_from_notional(notional, entry_price)
+        # BUG FIX (2026-07-28 incident): this previously always called
+        # place_close_order() with no `side`, which defaults to "sell".
+        # Correct for closing a long position, but for a short position
+        # "sell" ADDS to the short instead of covering it — this is exactly
+        # what turned a real -10 BHP short into -20 at the broker while the
+        # ledger row was marked 'closed'. process_close_ticket() (below)
+        # already derives close-side from the position's own ledger
+        # direction correctly; this function must do the same instead of
+        # ever assuming "sell". See CLAUDE.md gotchas: "closing a leg must
+        # also look up its own ledger direction, never assume sell."
+        direction = pos.get("direction", "long")
+        close_side = "buy" if direction == "short" else "sell"
+
+        # Use the ledger's own recorded fill qty (the authoritative filled
+        # count from the opening order) rather than re-deriving it from
+        # notional/entry_price — same principle as insert_position()'s own
+        # qty column ("must reflect the real fill, not a pre-fill
+        # estimate"). Falls back to the notional-derived estimate only for
+        # legacy rows that predate the qty column being populated.
+        qty = pos.get("qty")
+        qty = int(qty) if qty else compute_qty_from_notional(notional, entry_price)
+
         # P0-1: this monitor scans open ledger positions every cycle rather
         # than consuming a ticket, so there's no claim to make — but the
         # same crash-recovery gap exists for the Alpaca call itself (fill
@@ -913,17 +1022,18 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
         client_order_id = client_order_id_for(position_id, "eqmon")
         order = find_or_place_order(
             client_order_id,
-            lambda: place_close_order(symbol, qty, "equity", client_order_id),
+            lambda: place_close_order(symbol, qty, "equity", client_order_id, side=close_side),
         )
         filled = poll_order_until_filled(order["id"])
         fill_price = float(filled.get("filled_avg_price") or current_price)
         slippage = abs(fill_price - current_price) / current_price if current_price > 0 else 0.0
         close_position(conn, position_id, fill_price, slippage, exit_reason)
         log_system_event(conn, "INFO", "execution_engine",
-                         f"Closed equity {symbol} reason={exit_reason} fill={fill_price:.4f}",
+                         f"Closed equity {symbol} reason={exit_reason} fill={fill_price:.4f} side={close_side}",
                          {"position_id": position_id, "exit_reason": exit_reason,
-                          "fill_price": fill_price})
-        logger.info("Closed equity %s at %.4f reason=%s", symbol, fill_price, exit_reason)
+                          "fill_price": fill_price, "side": close_side})
+        logger.info("Closed equity %s at %.4f reason=%s side=%s", symbol, fill_price, exit_reason, close_side)
+        verify_post_fill_position(conn, symbol, "equity")
     except Exception as exc:
         logger.error("Failed to close equity position %s: %s", position_id, exc)
         log_system_event(conn, "ERROR", "execution_engine",
@@ -989,6 +1099,7 @@ def process_close_ticket(conn, ticket: dict) -> None:
             if pos:
                 pos = dict(pos)
                 close_position(conn, position_id, fill_price, slippage, exit_reason)
+                verify_post_fill_position(conn, symbol, asset_type)
                 if asset_type == "option":
                     write_trade_outcome(conn, pos, fill_price, exit_reason,
                                         payload.get("strategy_id"))
@@ -1085,6 +1196,7 @@ def process_force_close(conn, ticket: dict) -> None:
     slippage = abs(fill_price - expected_price) / expected_price if expected_price and expected_price > 0 else 0.0
     close_position(conn, position_id, fill_price, slippage, "hard_close",
                    exit_bid=exit_bid, exit_ask=exit_ask)
+    verify_post_fill_position(conn, asset, asset_type)
     reasoning = (
         f"FORCE_CLOSE filled at {fill_price:.4f}, slippage={slippage:.4f}, "
         f"position_id={position_id}, alpaca_order_id={alpaca_order_id}"
@@ -1166,6 +1278,7 @@ def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
             "spread_group_id": spread_group_id,
         }
         position_ids.append(insert_position(conn, ledger_data))
+        verify_post_fill_position(conn, leg_symbol, "option")
 
     reasoning = (f"mleg filled — {len(position_ids)} legs, "
                  f"spread_group_id={spread_group_id}, alpaca_order_id={alpaca_order_id}")
@@ -1330,6 +1443,8 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         insert_decision(conn, ticket_id, "FAILED", reason)
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
         return
+
+    verify_post_fill_position(conn, ledger_data["asset"], asset_type)
 
     reasoning = (f"Filled at {fill_price:.4f}, slippage={slippage:.4f}, "
                  f"position_id={position_id}, alpaca_order_id={alpaca_order_id}")
