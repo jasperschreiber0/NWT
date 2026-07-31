@@ -279,11 +279,28 @@ def check_ledger(conn) -> None:
 
 def check_close_workflow(conn) -> None:
     """
-    Joins to nwt_tickets.type to identify close tickets structurally
-    (CLOSE_REQUEST / FORCE_CLOSE) instead of guessing from reasoning text.
+    Two close paths exist and only one of them touches nwt_tickets:
+      - Options closes (CLOSE_REQUEST/FORCE_CLOSE tickets, driven by
+        execution_agent.py / risk_agent.py) DO get a nwt_ticket_decisions row.
+      - The equity position monitor's own close
+        (execution/engine.py::_close_equity_position) closes positions
+        directly inside its 5-min sweep and never creates a ticket at all —
+        only a nwt_system_log entry. A ticket-only query misses these
+        entirely. nwt_portfolio_ledger.exit_time is the one signal both
+        paths always populate, so it's the primary evidence here; the
+        ticket join is kept as supplementary detail for the ticket-driven path.
     """
     evidence = []
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT asset_type, exit_reason, COUNT(*) AS n
+            FROM nwt_portfolio_ledger
+            WHERE exit_time > NOW() - INTERVAL '7 days'
+            GROUP BY asset_type, exit_reason
+            """
+        )
+        ledger_closes = cur.fetchall()
         cur.execute(
             """
             SELECT d.decision, COUNT(*) AS n
@@ -303,10 +320,18 @@ def check_close_workflow(conn) -> None:
             """
         )
         recon_events = cur.fetchone()["n"]
-    if not rows:
+
+    if not ledger_closes and not rows:
         record(8, "Close Workflow", "FAIL",
-               ["No CLOSE_REQUEST/FORCE_CLOSE decisions from EXECUTION_ENGINE in the last 7 days"])
+               ["No positions closed (ledger.exit_time) and no CLOSE_REQUEST/FORCE_CLOSE "
+                "decisions in the last 7 days"])
         return
+
+    for r in ledger_closes:
+        evidence.append(f"ledger closes: {r['asset_type']}/{r['exit_reason']}: {r['n']} (7d)")
+    if not rows:
+        evidence.append("(no ticket-driven CLOSE_REQUEST/FORCE_CLOSE decisions in 7d — "
+                        "consistent with equity-monitor-only closes, which don't use tickets)")
     for r in rows:
         evidence.append(f"{r['decision']}: {r['n']} (7d)")
     evidence.append(f"reconciliation events logged (7d): {recon_events}")
