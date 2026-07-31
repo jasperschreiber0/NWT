@@ -73,10 +73,13 @@ def _file_evidence(path: Path) -> tuple:
 
 def check_market_data() -> None:
     evidence = []
-    layer0_path = SHARED_DIR / "layer0_data.json"
+    # layer0_data.json is written by layer0_builder.py into nwt_agents/ itself
+    # (shared_context.py's _agents_dir(), NOT _shared_dir()) — shared/ only
+    # holds the Track A equity bots' candidate JSONs (checked in Stage 2).
+    layer0_path = Path(os.environ.get("NWT_AGENTS_DIR", Path(__file__).parent)) / "layer0_data.json"
     exists, mtime, data, _ = _file_evidence(layer0_path)
     if not exists:
-        record(1, "Market Data", "FAIL", ["shared/layer0_data.json does not exist"])
+        record(1, "Market Data", "FAIL", [f"{layer0_path} does not exist"])
         return
     stale = mtime < datetime.now(timezone.utc) - timedelta(hours=FRESH_HOURS)
     evidence.append(f"layer0_data.json mtime: {mtime.isoformat()} ({_age_str(mtime)})")
@@ -162,26 +165,39 @@ def check_risk_engine(conn) -> None:
 # ---------------------------------------------------------------------------
 
 def check_order_execution(conn) -> None:
+    """
+    Every decision decided_by='EXECUTION_ENGINE' in the window — not filtered
+    by reasoning text, which varies by code path (entry vs close vs
+    force-close vs spread) and is not a reliable signal to grep. EXECUTED/
+    PARTIAL means an order actually reached Alpaca and got a fill;
+    REJECTED/FAILED means a ticket was seen but never placed.
+    """
     evidence = []
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
             SELECT decision, COUNT(*) AS n
             FROM nwt_ticket_decisions
-            WHERE decided_by = 'EXECUTION_ENGINE'
-              AND created_at > NOW() - INTERVAL '24 hours'
-              AND reasoning ILIKE '%alpaca_order_id%'
+            WHERE decided_by = 'EXECUTION_ENGINE' AND created_at > NOW() - INTERVAL '24 hours'
             GROUP BY decision
             """
         )
         rows = cur.fetchall()
     if not rows:
         record(5, "Order Execution", "FAIL",
-               ["No EXECUTION_ENGINE decisions referencing an alpaca_order_id in the last 24h"])
+               ["No EXECUTION_ENGINE decisions of any kind in the last 24h — "
+                "either nothing was queued, or the engine isn't running"])
         return
-    for r in rows:
-        evidence.append(f"{r['decision']}: {r['n']}")
-    record(5, "Order Execution", "PASS", evidence)
+    counts = {r["decision"]: r["n"] for r in rows}
+    reached_alpaca = counts.get("EXECUTED", 0) + counts.get("PARTIAL", 0)
+    for decision, n in counts.items():
+        evidence.append(f"{decision}: {n}")
+    if reached_alpaca == 0:
+        evidence.append("0 EXECUTED/PARTIAL — nothing actually reached Alpaca; "
+                        "everything was REJECTED/FAILED before or during submission")
+        record(5, "Order Execution", "WARN", evidence)
+    else:
+        record(5, "Order Execution", "PASS", evidence)
 
 
 # ---------------------------------------------------------------------------
@@ -189,27 +205,35 @@ def check_order_execution(conn) -> None:
 # ---------------------------------------------------------------------------
 
 def check_fill_handling(conn) -> None:
+    """
+    Reads the ledger directly rather than log message text — proves fills
+    actually landed as data (a priced entry row, a closed row), independent
+    of exactly how any given code path phrases its log line.
+    """
     evidence = []
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT message, payload, created_at
-            FROM nwt_system_log
-            WHERE component = 'execution_engine'
-              AND (message ILIKE '%Partial%' OR message ILIKE '%Executed%')
-              AND created_at > NOW() - INTERVAL '24 hours'
-            ORDER BY created_at DESC LIMIT 10
+            SELECT COUNT(*) AS n FROM nwt_portfolio_ledger
+            WHERE entry_time > NOW() - INTERVAL '24 hours' AND entry_price IS NOT NULL
             """
         )
-        rows = cur.fetchall()
-    if not rows:
-        record(6, "Fill Handling", "FAIL", ["No fill-related execution_engine log lines in the last 24h"])
+        new_fills = cur.fetchone()["n"]
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM nwt_portfolio_ledger WHERE exit_time > NOW() - INTERVAL '24 hours'"
+        )
+        closed_fills = cur.fetchone()["n"]
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM nwt_portfolio_ledger WHERE status = 'pending_reconciliation'"
+        )
+        pending = cur.fetchone()["n"]
+    evidence.append(f"New positions ledgered with a real entry_price (24h): {new_fills}")
+    evidence.append(f"Positions closed (24h): {closed_fills}")
+    evidence.append(f"Currently pending_reconciliation (unresolved fill data — needs manual review): {pending}")
+    if new_fills == 0 and closed_fills == 0:
+        record(6, "Fill Handling", "FAIL", evidence + ["No fill activity ledgered in the last 24h"])
         return
-    partials = sum(1 for r in rows if "partial" in r["message"].lower())
-    evidence.append(f"{len(rows)} fill events in last 24h, {partials} partial")
-    for r in rows[:5]:
-        evidence.append(f"  {r['created_at']}: {r['message']}")
-    record(6, "Fill Handling", "PASS", evidence)
+    record(6, "Fill Handling", "WARN" if pending > 0 else "PASS", evidence)
 
 
 # ---------------------------------------------------------------------------
@@ -254,17 +278,21 @@ def check_ledger(conn) -> None:
 # ---------------------------------------------------------------------------
 
 def check_close_workflow(conn) -> None:
+    """
+    Joins to nwt_tickets.type to identify close tickets structurally
+    (CLOSE_REQUEST / FORCE_CLOSE) instead of guessing from reasoning text.
+    """
     evidence = []
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT decision, COUNT(*) AS n
-            FROM nwt_ticket_decisions
-            WHERE decided_by = 'EXECUTION_ENGINE'
-              AND created_at > NOW() - INTERVAL '7 days'
-              AND (reasoning ILIKE '%broker-confirmed%' OR reasoning ILIKE '%Closed%'
-                   OR reasoning ILIKE '%FORCE_CLOSE%')
-            GROUP BY decision
+            SELECT d.decision, COUNT(*) AS n
+            FROM nwt_ticket_decisions d
+            JOIN nwt_tickets t ON t.ticket_id = d.ticket_id
+            WHERE d.decided_by = 'EXECUTION_ENGINE'
+              AND t.type IN ('CLOSE_REQUEST', 'FORCE_CLOSE')
+              AND d.created_at > NOW() - INTERVAL '7 days'
+            GROUP BY d.decision
             """
         )
         rows = cur.fetchall()
@@ -276,7 +304,8 @@ def check_close_workflow(conn) -> None:
         )
         recon_events = cur.fetchone()["n"]
     if not rows:
-        record(8, "Close Workflow", "FAIL", ["No close-related EXECUTION_ENGINE decisions in the last 7 days"])
+        record(8, "Close Workflow", "FAIL",
+               ["No CLOSE_REQUEST/FORCE_CLOSE decisions from EXECUTION_ENGINE in the last 7 days"])
         return
     for r in rows:
         evidence.append(f"{r['decision']}: {r['n']} (7d)")
