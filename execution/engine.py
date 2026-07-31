@@ -77,9 +77,23 @@ REQUIRED_FIELDS = {
     "strategy_id", "sized_notional", "asset_type", "time_in_force",
 }
 
+VALID_TIME_IN_FORCE = {"day", "gtc", "opg", "cls", "ioc", "fok"}
+
 POLL_INTERVAL = 3
 POLL_MAX = 10
 ET_TZ = ZoneInfo("America/New_York")
+
+
+class OrderIneligible(Exception):
+    """
+    Raised by a pre-flight check BEFORE any Alpaca API call — an order this
+    system would otherwise submit is known, in advance, to be invalid (not
+    shortable, malformed time_in_force, etc). Distinct from an Alpaca
+    rejection: this never reaches the broker at all, so the resulting
+    ticket decision is REJECTED (a business-rule veto), not FAILED (an
+    actual broker communication failure).
+    """
+    pass
 
 # Aggregate same-direction notional cap (long vs short across all bots/tracks).
 # Distinct from master/strategist.py's PER_BOT_WEIGHT_CEILING, which caps a
@@ -132,6 +146,8 @@ def load_master_directives() -> dict:
 def alpaca_get(path: str) -> dict:
     url = f"{ALPACA_BASE_URL}/v2{path}"
     resp = requests.get(url, headers=ALPACA_HEADERS, timeout=15)
+    if not resp.ok:
+        logger.error("Alpaca GET %s → %d: %s", path, resp.status_code, resp.text[:500])
     resp.raise_for_status()
     return resp.json()
 
@@ -164,6 +180,117 @@ def get_current_price(symbol: str) -> float:
 def get_alpaca_account_equity() -> float:
     account = alpaca_get("/account")
     return float(account.get("equity", 97_000))
+
+
+# ---------------------------------------------------------------------------
+# Order eligibility — checks that must pass BEFORE any order reaches Alpaca
+# ---------------------------------------------------------------------------
+
+def is_market_open() -> bool:
+    """
+    GET /v2/clock. Every order this system places is `type: market` with no
+    extended_hours flag — Alpaca will reject any of them outright while the
+    market is closed, for either asset type (options market hours mirror
+    equity hours). On a clock-fetch failure, fail CLOSED (treat as not open)
+    — submitting orders on an unconfirmed market state risks the exact
+    "orders sent when Alpaca will immediately reject them" failure mode this
+    check exists to prevent; skipping a cycle costs nothing, since pending
+    tickets are preserved for the next one.
+    """
+    try:
+        clock = alpaca_get("/clock")
+        return bool(clock.get("is_open", False))
+    except Exception as exc:
+        logger.error("Could not fetch Alpaca clock — treating market as closed: %s", exc)
+        return False
+
+
+def check_shortable(symbol: str) -> tuple:
+    """
+    GET /v2/assets/{symbol}. Returns (eligible: bool, reason: str). Alpaca
+    only allows shorting assets that are both `shortable` and
+    `easy_to_borrow` — a short against anything else is rejected with a 403.
+    Checked BEFORE submission so that guaranteed rejection never reaches
+    Alpaca at all, rather than being discovered from the error response.
+    """
+    try:
+        asset = alpaca_get(f"/assets/{symbol}")
+    except Exception as exc:
+        return False, f"Could not verify shortable status for {symbol}: {exc}"
+
+    if not asset.get("tradable", False):
+        return False, f"{symbol} is not tradable"
+    if not asset.get("shortable", False):
+        return False, f"{symbol} is not shortable"
+    if not asset.get("easy_to_borrow", False):
+        return False, f"{symbol} is shortable but hard-to-borrow (easy_to_borrow=false)"
+    return True, ""
+
+
+def classify_broker_error(exc: Exception) -> tuple:
+    """
+    Classify an Alpaca order-placement failure so it isn't handled uniformly.
+    Returns (category, detail) where category is one of:
+      RETRYABLE       — transient (network error, 429, 5xx). The SAME order
+                         may well succeed on the next attempt; callers should
+                         NOT write a terminal decision for these, so the
+                         ticket stays pending and is retried next cycle.
+      INVALID_ORDER   — the order itself is malformed or not currently
+                         permitted (wash trade, market-hours rejection,
+                         unsupported asset rule). Retrying the identical
+                         order will fail again.
+      POSITION_MISMATCH — broker-side qty/holdings disagree with what was
+                         requested (e.g. insufficient qty available to close).
+      RISK_REJECTION  — broker-side capital/permission constraint (buying
+                         power, PDT, account restriction).
+      UNKNOWN         — could not be classified with confidence; surfaced
+                         loudly rather than silently forced into a bucket.
+
+    Grounded in Alpaca's documented behavior: 422 is their validation-error
+    status (bad/ineligible order), 403 covers wash-trade and shortable/
+    buying-power/permission rejections, 429/5xx are transient. Message-level
+    substring matching narrows 403/422 further where Alpaca's wording is
+    fairly consistent, but defaults to UNKNOWN rather than guessing when it
+    isn't recognized — this table should be refined from real production
+    rejections over time, not treated as exhaustive on day one.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        # No HTTP response at all — DNS/connection/timeout. Always retryable.
+        return "RETRYABLE", f"Network-level failure (no response): {exc}"
+
+    status = resp.status_code
+    try:
+        body = resp.text or ""
+    except Exception:
+        body = ""
+    msg = body.lower()
+
+    if status == 429 or status >= 500:
+        return "RETRYABLE", f"HTTP {status}: {body[:300]}"
+
+    if status == 403:
+        if "wash trade" in msg:
+            return "INVALID_ORDER", f"Wash trade rejection: {body[:300]}"
+        if "shortable" in msg or "hard to borrow" in msg or "borrow" in msg:
+            return "INVALID_ORDER", f"Shortable/hard-to-borrow rejection: {body[:300]}"
+        if "buying power" in msg or "insufficient" in msg:
+            return "RISK_REJECTION", f"Buying power rejection: {body[:300]}"
+        if "pattern day trad" in msg or "pdt" in msg:
+            return "RISK_REJECTION", f"PDT rejection: {body[:300]}"
+        return "UNKNOWN", f"HTTP 403 (unrecognized reason): {body[:300]}"
+
+    if status == 422:
+        if "qty" in msg or "quantity" in msg:
+            return "POSITION_MISMATCH", f"Quantity rejection: {body[:300]}"
+        if "market" in msg and ("closed" in msg or "hour" in msg):
+            return "INVALID_ORDER", f"Market-hours rejection: {body[:300]}"
+        # 422 is Alpaca's general request-validation status — a malformed or
+        # currently-ineligible order is the most likely cause even when the
+        # message doesn't match a more specific pattern above.
+        return "INVALID_ORDER", f"HTTP 422 (validation): {body[:300]}"
+
+    return "UNKNOWN", f"HTTP {status}: {body[:300]}"
 
 
 def get_latest_quote(symbol: str, asset_type: str) -> tuple:
@@ -503,9 +630,23 @@ def place_equity_order(payload: dict) -> dict:
     time_in_force = payload["time_in_force"]
     direction = payload["direction"]
 
+    if time_in_force not in VALID_TIME_IN_FORCE:
+        raise OrderIneligible(f"Unsupported time_in_force {time_in_force!r} for {symbol} — "
+                              f"must be one of {sorted(VALID_TIME_IN_FORCE)}")
+
     price = get_current_price(symbol)
     qty = compute_qty_from_notional(sized_notional, price)
     side = "buy" if direction == "long" else "sell"
+
+    # This is a NEW entry (place_equity_order is never used for closes — see
+    # place_close_order), so side=="sell" here unambiguously means opening a
+    # new short, not selling an existing long. Alpaca rejects a short on a
+    # non-shortable/hard-to-borrow asset with a 403 — check before submitting
+    # rather than let that guaranteed rejection reach the broker.
+    if side == "sell":
+        eligible, reason = check_shortable(symbol)
+        if not eligible:
+            raise OrderIneligible(f"Short-sale blocked for {symbol}: {reason}")
 
     order_body = {
         "symbol": symbol,
@@ -798,10 +939,14 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
         logger.info("Closed equity %s at %.4f reason=%s filled_qty=%.4f remaining=%.4f",
                     symbol, fill_price, exit_reason, filled_qty, remaining)
     except Exception as exc:
-        logger.error("Failed to close equity position %s: %s", position_id, exc)
-        log_system_event(conn, "ERROR", "execution_engine",
-                         f"Equity close failed for {symbol}: {exc}",
-                         {"position_id": position_id})
+        # No ticket involved in this path — nothing to leave "pending" for a
+        # RETRYABLE error, the position just stays open and gets re-evaluated
+        # by the next 5-min monitor sweep regardless of category.
+        category, detail = classify_broker_error(exc)
+        reason = f"Equity close failed for {symbol} [{category}]: {detail}"
+        logger.error("Position %s: %s", position_id, reason)
+        log_system_event(conn, "ERROR", "execution_engine", reason,
+                         {"position_id": position_id, "category": category})
 
 
 # ---------------------------------------------------------------------------
@@ -909,10 +1054,21 @@ def process_close_ticket(conn, ticket: dict) -> None:
                              {"ticket_id": ticket_id, "exit_reason": exit_reason,
                               "position_id": position_id, "filled_qty": filled_qty})
     except Exception as exc:
-        reason = f"Close failed: {exc}"
+        category, detail = classify_broker_error(exc)
+        reason = f"Close failed [{category}]: {detail}"
         logger.error("Ticket %s: %s", ticket_id, reason)
+        if category == "RETRYABLE":
+            # Leave the ticket undecided — a permanently-FAILED close ticket
+            # is a real open position that stops getting attention (the
+            # options monitor's dedup window skips re-emitting a close
+            # request for 2h once ANY decision exists for this ticket).
+            log_system_event(conn, "WARNING", "execution_engine",
+                             f"Retryable close failure, ticket left pending: {reason}",
+                             {"ticket_id": ticket_id, "position_id": position_id, "category": category})
+            return
         insert_decision(conn, ticket_id, "FAILED", reason)
-        log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+        log_system_event(conn, "ERROR", "execution_engine", reason,
+                         {"ticket_id": ticket_id, "category": category})
 
 
 def process_force_close(conn, ticket: dict) -> None:
@@ -949,20 +1105,40 @@ def process_force_close(conn, ticket: dict) -> None:
     try:
         order = alpaca_delete(f"/positions/{asset}")
     except Exception as exc:
-        reason = f"FORCE_CLOSE: liquidation order failed for {asset}: {exc}"
+        category, detail = classify_broker_error(exc)
+        reason = f"FORCE_CLOSE: liquidation order failed for {asset} [{category}]: {detail}"
         logger.error("Ticket %s: %s", ticket_id, reason)
+        if category == "RETRYABLE":
+            # This is a risk-driven emergency exit — leaving it pending for
+            # immediate retry next cycle matters more here than anywhere
+            # else in the engine. A transient network blip must not
+            # permanently abandon a kill-switch/drawdown liquidation.
+            log_system_event(conn, "WARNING", "execution_engine",
+                             f"Retryable FORCE_CLOSE failure, ticket left pending: {reason}",
+                             {"ticket_id": ticket_id, "position_id": position_id, "category": category})
+            return
         insert_decision(conn, ticket_id, "FAILED", reason)
-        log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+        log_system_event(conn, "ERROR", "execution_engine", reason,
+                         {"ticket_id": ticket_id, "category": category})
         return
 
     alpaca_order_id = order.get("id", "")
     try:
         filled_order = finalize_order(alpaca_order_id) if alpaca_order_id else order
     except Exception as exc:
-        reason = f"FORCE_CLOSE: order poll failed: {exc}"
+        # The DELETE above already succeeded — Alpaca accepted the
+        # liquidation order, this is only a poll/read-back failure. The
+        # order may still be live/filling at the broker even though we
+        # lost track of it; that's a real ledger/broker divergence risk
+        # regardless of category, so this always stays FAILED for a human
+        # to check against recon_agent.py rather than silently retried
+        # (retrying could submit a SECOND liquidation for the same position).
+        category, detail = classify_broker_error(exc)
+        reason = f"FORCE_CLOSE: order poll failed [{category}]: {detail}"
         logger.error("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "FAILED", reason)
-        log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+        log_system_event(conn, "ERROR", "execution_engine", reason,
+                         {"ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id, "category": category})
         return
 
     fill_price_str = filled_order.get("filled_avg_price")
@@ -1178,11 +1354,29 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
             reason = f"Unknown asset_type: {asset_type}"
             insert_decision(conn, ticket_id, "FAILED", reason)
             return
+    except OrderIneligible as exc:
+        # A pre-flight check blocked this before it ever reached Alpaca —
+        # a business-rule veto (like the ones above), not a broker failure.
+        reason = f"Order ineligible: {exc}"
+        logger.warning("Ticket %s rejected: %s", ticket_id, reason)
+        insert_decision(conn, ticket_id, "REJECTED", reason)
+        log_system_event(conn, "WARNING", "execution_engine", reason, {"ticket_id": ticket_id})
+        return
     except Exception as exc:
-        reason = f"Order placement failed: {exc}"
+        category, detail = classify_broker_error(exc)
+        reason = f"Order placement failed [{category}]: {detail}"
         logger.error("Ticket %s: %s", ticket_id, reason)
+        if category == "RETRYABLE":
+            # No terminal decision — leave the ticket unclaimed so the next
+            # cron cycle retries it, instead of permanently failing an order
+            # that may well succeed moments later.
+            log_system_event(conn, "WARNING", "execution_engine",
+                             f"Retryable order failure, ticket left pending: {reason}",
+                             {"ticket_id": ticket_id, "category": category})
+            return
         insert_decision(conn, ticket_id, "FAILED", reason)
-        log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+        log_system_event(conn, "ERROR", "execution_engine", reason,
+                         {"ticket_id": ticket_id, "category": category})
         return
 
     alpaca_order_id = order["id"]
@@ -1315,6 +1509,19 @@ def main() -> None:
         except Exception as exc:
             logger.error("Cannot load master-directives.json: %s", exc)
             sys.exit(1)
+
+        # Every order this engine places is type:market with no extended_hours
+        # flag — Alpaca rejects all of them outright while the market is
+        # closed, for either asset type. Block ALL order-related work for
+        # this cycle up front rather than let each ticket discover that
+        # individually via a guaranteed-failing API call. Nothing gets a
+        # terminal decision here — pending tickets and open positions are
+        # simply left for the next cycle once the market is open.
+        if not is_market_open():
+            logger.info("Market is closed — skipping position monitor and ticket processing this cycle")
+            log_system_event(conn, "INFO", "execution_engine",
+                             "Market closed — order-related processing skipped this cycle")
+            return
 
         try:
             run_equity_position_monitor(conn)
