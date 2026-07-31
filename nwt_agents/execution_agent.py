@@ -373,6 +373,12 @@ def _emit_close_request(conn, pos: dict, exit_reason: str) -> None:
     engine's process_close_ticket looks this up again from the ledger before
     choosing buy-vs-sell to close, but carrying it here too keeps the ticket
     payload self-describing.
+
+    qty is informational only — process_close_ticket does NOT use this value
+    to size the close order. It re-queries the ledger for its own qty and,
+    more importantly, queries Alpaca's live position for the broker-confirmed
+    qty, which is what actually sizes the order. Any divergence between this
+    field and what engine.py finds is logged as a reconciliation event.
     """
     position_id = str(pos["position_id"])
     symbol = pos.get("asset", "")
@@ -470,6 +476,20 @@ def monitor_options_positions(conn) -> None:
             "SELECT * FROM nwt_portfolio_ledger WHERE status='open' AND asset_type='option'"
         )
         positions = [dict(r) for r in cur.fetchall()]
+        # Full per-spread_group_id row count regardless of status, so a group
+        # with one leg still flagged pending_reconciliation can be told apart
+        # from a genuinely complete, healthy group — valuing/closing only the
+        # OPEN legs of an incomplete group would misread a partial structure
+        # (e.g. one healthy leg) as if it were the whole hedged spread.
+        cur.execute(
+            """
+            SELECT spread_group_id, COUNT(*) AS total
+            FROM nwt_portfolio_ledger
+            WHERE spread_group_id IS NOT NULL
+            GROUP BY spread_group_id
+            """
+        )
+        group_total_rows = {str(r["spread_group_id"]): r["total"] for r in cur.fetchall()}
 
     if not positions:
         return
@@ -482,6 +502,18 @@ def monitor_options_positions(conn) -> None:
             groups.setdefault(str(gid), []).append(pos)
         else:
             singles.append(pos)
+
+    incomplete_groups = {
+        gid: legs for gid, legs in groups.items()
+        if len(legs) != group_total_rows.get(gid, len(legs))
+    }
+    for gid in incomplete_groups:
+        logger.warning(
+            "Spread group %s has %d open leg(s) of %d total — a sibling leg is "
+            "pending_reconciliation. Skipping monitoring until resolved.",
+            gid, len(groups[gid]), group_total_rows.get(gid),
+        )
+        del groups[gid]
 
     for pos in singles:
         position_id = str(pos["position_id"])

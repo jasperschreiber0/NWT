@@ -26,7 +26,14 @@ import requests
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 
-from ledger import close_position, get_open_positions, insert_position, log_system_event
+from ledger import (
+    get_open_positions,
+    insert_position,
+    log_reconciliation_event,
+    log_system_event,
+    mark_pending_reconciliation,
+    reduce_position_qty,
+)
 
 _here = Path(__file__).parent
 # override=True: the PM2-inherited ambient environment must never shadow this
@@ -294,6 +301,70 @@ def poll_order_until_filled(order_id: str) -> dict:
     return alpaca_get(f"/orders/{order_id}")
 
 
+def cancel_order(order_id: str) -> bool:
+    """
+    Cancel a resting order. Alpaca returns 204 (empty body) on success — do
+    NOT run this through alpaca_delete, which calls resp.json() and would
+    raise on an empty body. A 422 means the order already reached a terminal
+    state (filled/already-canceled) — that's a no-op here, not a failure.
+    """
+    url = f"{ALPACA_BASE_URL}/v2/orders/{order_id}"
+    resp = requests.delete(url, headers=ALPACA_HEADERS, timeout=15)
+    if resp.status_code in (200, 204):
+        logger.info("Cancelled order %s", order_id)
+        return True
+    if resp.status_code == 422:
+        logger.info("Cancel order %s: already terminal — no-op", order_id)
+        return False
+    logger.error("Alpaca DELETE /orders/%s → %d: %s", order_id, resp.status_code, resp.text[:500])
+    return False
+
+
+def finalize_order(order_id: str) -> dict:
+    """
+    Resolve an order to its true, final, broker-confirmed state — never trust
+    the requested qty as a stand-in for what actually happened. If the order
+    is still open in any sense (new/accepted/pending_new/partially_filled)
+    after the poll window, actively cancel it so it can't keep filling
+    unsupervised, then read back Alpaca's authoritative post-cancel state
+    (filled_qty reflects exactly what executed before the cancel took
+    effect). A partial fill is a real, valid outcome here — it is returned
+    as-is for the caller to ledger correctly, not discarded.
+    """
+    order = poll_order_until_filled(order_id)
+    status = order.get("status", "")
+    if status in ("filled", "canceled", "expired", "rejected", "done_for_day"):
+        return order
+
+    logger.warning("Order %s still '%s' after poll window — cancelling and reading back actual fill",
+                    order_id, status)
+    cancel_order(order_id)
+    time.sleep(POLL_INTERVAL)
+    try:
+        return alpaca_get(f"/orders/{order_id}")
+    except Exception as exc:
+        logger.error("Order %s: failed to read back state after cancel: %s", order_id, exc)
+        return order
+
+
+def get_broker_position(symbol: str) -> dict | None:
+    """
+    Broker-confirmed position for `symbol`, or None if Alpaca reports no open
+    position (404). This is the source of truth for CLOSE quantity — the
+    ledger's own qty/notional_risk must never be used to size a close order;
+    it can drift from reality (rounding, slippage between sizing and fill,
+    a prior partial close). Alpaca is what actually holds the position.
+    """
+    url = f"{ALPACA_BASE_URL}/v2/positions/{symbol}"
+    resp = requests.get(url, headers=ALPACA_HEADERS, timeout=15)
+    if resp.status_code == 404:
+        return None
+    if not resp.ok:
+        logger.error("Alpaca GET /positions/%s → %d: %s", symbol, resp.status_code, resp.text[:500])
+    resp.raise_for_status()
+    return resp.json()
+
+
 def insert_decision(conn, ticket_id: str, decision: str, reasoning: str) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -495,23 +566,30 @@ def place_options_order(payload: dict) -> dict:
     return alpaca_post("/orders", order_body)
 
 
-def place_close_order(symbol: str, qty: int, asset_type: str, side: str = "sell") -> dict:
+def place_close_order(symbol: str, qty: float, asset_type: str, side: str = "sell") -> dict:
     """
     side defaults to "sell" (closing a long position — true for equity and
     every single-leg option position). A short option leg (only reachable
     inside a multi-leg spread) must be closed with side="buy" instead —
     callers closing a specific ledger position must pass the side that
     matches that position's own direction, not assume "sell".
+
+    qty comes from get_broker_position()'s live Alpaca qty (a float — Alpaca
+    supports fractional equity shares). Options are always whole contracts,
+    so that qty is rounded to an int before formatting; a fractional string
+    like "3.0" is not guaranteed to be accepted by Alpaca's options order
+    validation the way "3" is.
     """
+    qty_str = str(int(round(qty))) if asset_type == "option" else str(qty)
     # No order_class for options here either — same 422 as place_options_order.
     order_body = {
         "symbol": symbol,
-        "qty": str(qty),
+        "qty": qty_str,
         "side": side,
         "type": "market",
         "time_in_force": "day",
     }
-    logger.info("Placing close order: %s %s x%d", side, symbol, qty)
+    logger.info("Placing close order: %s %s x%s", side, symbol, qty_str)
     return alpaca_post("/orders", order_body)
 
 
@@ -663,17 +741,62 @@ def run_equity_position_monitor(conn) -> None:
 def _close_equity_position(conn, pos, current_price, position_id, symbol,
                             notional, entry_price, exit_reason) -> None:
     try:
-        qty = compute_qty_from_notional(notional, entry_price)
-        order = place_close_order(symbol, qty, "equity")
-        filled = poll_order_until_filled(order["id"])
+        # Broker is the source of truth for close quantity — never recompute
+        # it from notional/entry_price. That recompute is exactly what let
+        # the ledger silently diverge from Alpaca in the first place.
+        broker_pos = get_broker_position(symbol)
+        broker_qty = abs(float(broker_pos["qty"])) if broker_pos else 0.0
+        ledger_qty = pos.get("qty")
+        ledger_qty = float(ledger_qty) if ledger_qty is not None else None
+
+        if broker_qty <= 0:
+            reason = f"Broker reports zero/no position for {symbol} — cannot close"
+            logger.warning("Position %s: %s (ledger believed qty=%s)", position_id, reason, ledger_qty)
+            log_reconciliation_event(
+                conn, "close_broker_zero_position", symbol, ledger_qty, 0.0, "CRITICAL",
+                "Mark ledger row suspect and run recon_agent.py --nightly",
+                {"position_id": position_id},
+            )
+            with conn.cursor() as cur:
+                cur.execute("UPDATE nwt_portfolio_ledger SET status='suspect' WHERE position_id=%s",
+                            (position_id,))
+            conn.commit()
+            return
+
+        if ledger_qty is not None and abs(broker_qty - ledger_qty) > 0.001:
+            log_reconciliation_event(
+                conn, "close_qty_mismatch", symbol, ledger_qty, broker_qty, "WARNING",
+                "Using broker-confirmed qty as source of truth for this close",
+                {"position_id": position_id, "exit_reason": exit_reason},
+            )
+
+        order = place_close_order(symbol, broker_qty, "equity")
+        filled = finalize_order(order["id"])
         fill_price = float(filled.get("filled_avg_price") or current_price)
+        filled_qty = float(filled.get("filled_qty") or 0)
+
+        if filled_qty <= 0:
+            reason = f"Equity close order for {symbol} did not fill — status={filled.get('status')}"
+            logger.error("Position %s: %s", position_id, reason)
+            log_system_event(conn, "ERROR", "execution_engine", reason, {"position_id": position_id})
+            return
+
         slippage = abs(fill_price - current_price) / current_price if current_price > 0 else 0.0
-        close_position(conn, position_id, fill_price, slippage, exit_reason)
-        log_system_event(conn, "INFO", "execution_engine",
-                         f"Closed equity {symbol} reason={exit_reason} fill={fill_price:.4f}",
-                         {"position_id": position_id, "exit_reason": exit_reason,
-                          "fill_price": fill_price})
-        logger.info("Closed equity %s at %.4f reason=%s", symbol, fill_price, exit_reason)
+        remaining = reduce_position_qty(conn, position_id, filled_qty, fill_price, slippage, exit_reason)
+
+        if remaining > 0:
+            log_system_event(conn, "WARNING", "execution_engine",
+                             f"Partial equity close: {symbol} filled {filled_qty} of {broker_qty}, "
+                             f"{remaining} remains open",
+                             {"position_id": position_id, "exit_reason": exit_reason,
+                              "filled_qty": filled_qty, "requested_qty": broker_qty})
+        else:
+            log_system_event(conn, "INFO", "execution_engine",
+                             f"Closed equity {symbol} reason={exit_reason} fill={fill_price:.4f} qty={filled_qty}",
+                             {"position_id": position_id, "exit_reason": exit_reason,
+                              "fill_price": fill_price, "filled_qty": filled_qty})
+        logger.info("Closed equity %s at %.4f reason=%s filled_qty=%.4f remaining=%.4f",
+                    symbol, fill_price, exit_reason, filled_qty, remaining)
     except Exception as exc:
         logger.error("Failed to close equity position %s: %s", position_id, exc)
         log_system_event(conn, "ERROR", "execution_engine",
@@ -699,30 +822,63 @@ def process_close_ticket(conn, ticket: dict) -> None:
     position_id = payload.get("position_id")
     exit_reason = payload.get("exit_reason", "hard_close")
     asset_type = payload.get("asset_type", "option")
-    qty = int(payload.get("qty", 1))
 
     pos_direction = payload.get("direction", "long")
+    ledger_qty = None
     if position_id:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT direction FROM nwt_portfolio_ledger WHERE position_id = %s",
+            cur.execute("SELECT direction, qty FROM nwt_portfolio_ledger WHERE position_id = %s",
                         (position_id,))
             row = cur.fetchone()
-        if row and row.get("direction"):
-            pos_direction = row["direction"]
+        if row:
+            if row.get("direction"):
+                pos_direction = row["direction"]
+            ledger_qty = float(row["qty"]) if row.get("qty") is not None else None
     close_side = "buy" if pos_direction == "short" else "sell"
 
+    # Broker is the source of truth for close quantity. The ledger's own qty
+    # (or a notional/price recompute) is never used to size this order — it
+    # can drift from what Alpaca actually holds.
+    broker_pos = get_broker_position(symbol)
+    broker_qty = abs(float(broker_pos["qty"])) if broker_pos else 0.0
+
+    if broker_qty <= 0:
+        reason = f"Broker reports zero/no position for {symbol} — nothing to close"
+        logger.warning("Ticket %s: %s (ledger believed qty=%s)", ticket_id, reason, ledger_qty)
+        log_reconciliation_event(
+            conn, "close_broker_zero_position", symbol, ledger_qty, 0.0, "CRITICAL",
+            "Mark ledger row suspect and run recon_agent.py --nightly",
+            {"ticket_id": ticket_id, "position_id": position_id},
+        )
+        if position_id:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE nwt_portfolio_ledger SET status='suspect' WHERE position_id=%s",
+                            (position_id,))
+            conn.commit()
+        insert_decision(conn, ticket_id, "FAILED", reason)
+        return
+
+    if ledger_qty is not None and abs(broker_qty - ledger_qty) > 0.001:
+        log_reconciliation_event(
+            conn, "close_qty_mismatch", symbol, ledger_qty, broker_qty, "WARNING",
+            "Using broker-confirmed qty as source of truth for this close",
+            {"ticket_id": ticket_id, "position_id": position_id, "exit_reason": exit_reason},
+        )
+
     try:
-        order = place_close_order(symbol, qty, asset_type, side=close_side)
-        filled = poll_order_until_filled(order["id"])
+        order = place_close_order(symbol, broker_qty, asset_type, side=close_side)
+        filled = finalize_order(order["id"])
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
+        filled_qty = float(filled.get("filled_qty") or 0)
 
-        if fill_status != "filled" or fill_price <= 0:
+        if filled_qty <= 0 or fill_price <= 0:
             insert_decision(conn, ticket_id, "FAILED",
                             f"Close order not filled — status={fill_status}")
             return
 
         slippage = 0.0
+        remaining = None
         if position_id:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT * FROM nwt_portfolio_ledger WHERE position_id = %s",
@@ -730,17 +886,28 @@ def process_close_ticket(conn, ticket: dict) -> None:
                 pos = cur.fetchone()
             if pos:
                 pos = dict(pos)
-                close_position(conn, position_id, fill_price, slippage, exit_reason)
-                if asset_type == "option":
+                remaining = reduce_position_qty(conn, position_id, filled_qty, fill_price,
+                                                slippage, exit_reason)
+                if remaining == 0 and asset_type == "option":
                     write_trade_outcome(conn, pos, fill_price, exit_reason,
                                         payload.get("strategy_id"))
 
-        insert_decision(conn, ticket_id, "EXECUTED",
-                        f"Closed {symbol} at {fill_price:.4f} reason={exit_reason}")
-        log_system_event(conn, "INFO", "execution_engine",
-                         f"Close executed: {symbol} at {fill_price:.4f}",
-                         {"ticket_id": ticket_id, "exit_reason": exit_reason,
-                          "position_id": position_id})
+        if remaining is not None and remaining > 0:
+            insert_decision(conn, ticket_id, "PARTIAL",
+                            f"Partial close of {symbol}: filled {filled_qty} of {broker_qty}, "
+                            f"{remaining} remains open at {fill_price:.4f}")
+            log_system_event(conn, "WARNING", "execution_engine",
+                             f"Partial close: {symbol} filled {filled_qty} of {broker_qty}",
+                             {"ticket_id": ticket_id, "position_id": position_id,
+                              "filled_qty": filled_qty, "requested_qty": broker_qty})
+        else:
+            insert_decision(conn, ticket_id, "EXECUTED",
+                            f"Closed {symbol} qty={filled_qty} (broker-confirmed) at {fill_price:.4f} "
+                            f"reason={exit_reason}")
+            log_system_event(conn, "INFO", "execution_engine",
+                             f"Close executed: {symbol} at {fill_price:.4f}",
+                             {"ticket_id": ticket_id, "exit_reason": exit_reason,
+                              "position_id": position_id, "filled_qty": filled_qty})
     except Exception as exc:
         reason = f"Close failed: {exc}"
         logger.error("Ticket %s: %s", ticket_id, reason)
@@ -790,7 +957,7 @@ def process_force_close(conn, ticket: dict) -> None:
 
     alpaca_order_id = order.get("id", "")
     try:
-        filled_order = poll_order_until_filled(alpaca_order_id) if alpaca_order_id else order
+        filled_order = finalize_order(alpaca_order_id) if alpaca_order_id else order
     except Exception as exc:
         reason = f"FORCE_CLOSE: order poll failed: {exc}"
         logger.error("Ticket %s: %s", ticket_id, reason)
@@ -800,8 +967,9 @@ def process_force_close(conn, ticket: dict) -> None:
 
     fill_price_str = filled_order.get("filled_avg_price")
     fill_price = float(fill_price_str) if fill_price_str else None
-    if fill_price is None:
-        reason = f"FORCE_CLOSE: no fill price — status={filled_order.get('status')}"
+    filled_qty = float(filled_order.get("filled_qty") or 0)
+    if fill_price is None or filled_qty <= 0:
+        reason = f"FORCE_CLOSE: no fill — status={filled_order.get('status')}"
         logger.warning("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "FAILED", reason)
         log_system_event(conn, "WARNING", "execution_engine", reason, {
@@ -810,19 +978,25 @@ def process_force_close(conn, ticket: dict) -> None:
         return
 
     slippage = abs(fill_price - expected_price) / expected_price if expected_price and expected_price > 0 else 0.0
-    close_position(conn, position_id, fill_price, slippage, "hard_close",
-                   exit_bid=exit_bid, exit_ask=exit_ask)
+    # Alpaca's own close-position endpoint targets the whole position, but
+    # the resulting order can still only partially fill — never assume it
+    # fully closed. reduce_position_qty ledgers exactly what filled and
+    # leaves the row 'open' with the reduced qty if anything remains.
+    remaining = reduce_position_qty(conn, position_id, filled_qty, fill_price, slippage,
+                                    "hard_close", exit_bid=exit_bid, exit_ask=exit_ask)
     reasoning = (
-        f"FORCE_CLOSE filled at {fill_price:.4f}, slippage={slippage:.4f}, "
-        f"position_id={position_id}, alpaca_order_id={alpaca_order_id}"
+        f"FORCE_CLOSE filled {filled_qty} at {fill_price:.4f}, slippage={slippage:.4f}, "
+        f"remaining={remaining}, position_id={position_id}, alpaca_order_id={alpaca_order_id}"
     )
-    insert_decision(conn, ticket_id, "EXECUTED", reasoning)
-    log_system_event(conn, "INFO", "execution_engine",
-                     f"Force-closed {asset} ({asset_type})",
+    decision = "PARTIAL" if remaining > 0 else "EXECUTED"
+    insert_decision(conn, ticket_id, decision, reasoning)
+    log_system_event(conn, "INFO" if remaining == 0 else "WARNING", "execution_engine",
+                     f"Force-closed {asset} ({asset_type}) filled={filled_qty} remaining={remaining}",
                      {"ticket_id": ticket_id, "position_id": position_id,
                       "alpaca_order_id": alpaca_order_id, "fill_price": fill_price,
-                      "slippage": slippage})
-    logger.info("Ticket %s FORCE_CLOSE EXECUTED: position=%s fill=%.4f", ticket_id, position_id, fill_price)
+                      "slippage": slippage, "filled_qty": filled_qty, "remaining": remaining})
+    logger.info("Ticket %s FORCE_CLOSE %s: position=%s fill=%.4f filled_qty=%.4f remaining=%.4f",
+                ticket_id, decision, position_id, fill_price, filled_qty, remaining)
 
 
 # ---------------------------------------------------------------------------
@@ -830,17 +1004,32 @@ def process_force_close(conn, ticket: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
-                               filled_order: dict, alpaca_order_id: str) -> str:
+                               filled_order: dict, alpaca_order_id: str,
+                               is_partial: bool = False) -> str:
     """
     One ledger row PER LEG of a filled mleg order, tied by spread_group_id.
     Recon matches Alpaca positions per contract, so legs must be individual
     rows; the monitor values/closes the structure as a unit via the group id.
+
+    Two failure modes are handled by flagging the row for human review
+    instead of writing fabricated data:
+      - A leg's fill price can't be resolved from the order response OR a
+        live quote → entry_price is left NULL (never $0), and that leg is
+        marked pending_reconciliation so it's excluded from stop/target
+        monitoring rather than silently valued at zero.
+      - The mleg order itself only partially filled (is_partial=True) →
+        every leg in the group is marked pending_reconciliation regardless
+        of its own price, since a partially-filled multi-leg order is a
+        naked-leg-risk situation that must not be treated as a normal,
+        fully-hedged open spread.
+
     Returns the spread_group_id.
     """
     qty = int(payload.get("qty", 1))
     spread_group_id = str(uuid.uuid4())
     filled_legs = {l.get("symbol"): l for l in (filled_order.get("legs") or [])}
     position_ids = []
+    any_unresolved_price = False
 
     for leg in payload["legs"]:
         leg_symbol = leg["option_symbol"]
@@ -849,12 +1038,16 @@ def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
         leg_fill = float(leg_fill) if leg_fill else None
 
         leg_bid, leg_ask = get_latest_quote(leg_symbol, "option")
+        unresolved = False
         if leg_fill is None:
             # Leg fill missing from the order response — fall back to quote mid
             if leg_bid and leg_ask:
                 leg_fill = (leg_bid + leg_ask) / 2.0
             else:
-                leg_fill = 0.0
+                # No order-response price AND no live quote — do not fabricate
+                # a $0 entry_price. Leave it NULL and flag the row instead.
+                unresolved = True
+                any_unresolved_price = True
 
         side = leg["side"]
         leg_direction = "long" if side == "buy" else "short"
@@ -868,7 +1061,7 @@ def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
             "asset_type": "option",
             "direction": leg_direction,
             "delta_exposure": delta_exposure,
-            "notional_risk": abs(leg_fill) * 100 * qty,
+            "notional_risk": (abs(leg_fill) * 100 * qty) if leg_fill is not None else None,
             "qty": qty,
             "entry_price": leg_fill,
             "entry_time": datetime.now(timezone.utc),
@@ -879,18 +1072,48 @@ def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
             "target_pct": payload.get("target_pct"),
             "spread_group_id": spread_group_id,
         }
-        position_ids.append(insert_position(conn, ledger_data))
+        pid = insert_position(conn, ledger_data)
+        position_ids.append(pid)
 
-    reasoning = (f"mleg filled — {len(position_ids)} legs, "
+        if unresolved:
+            mark_pending_reconciliation(
+                conn, pid,
+                f"mleg leg {leg_symbol}: no fill price in order response and no live quote available",
+            )
+            log_reconciliation_event(
+                conn, "unresolved_leg_fill_price", leg_symbol, None, None, "CRITICAL",
+                "Manually verify actual fill price against Alpaca and correct entry_price",
+                {"ticket_id": ticket_id, "position_id": pid, "spread_group_id": spread_group_id},
+            )
+
+    if is_partial:
+        for pid in position_ids:
+            mark_pending_reconciliation(
+                conn, pid,
+                f"mleg order only partially filled — spread_group_id={spread_group_id} "
+                "may hold a naked/unhedged leg",
+            )
+        log_reconciliation_event(
+            conn, "partial_mleg_fill", payload.get("symbol", ""), None, None, "CRITICAL",
+            "Manually verify each leg against Alpaca before treating this spread as hedged",
+            {"ticket_id": ticket_id, "spread_group_id": spread_group_id,
+             "position_ids": position_ids, "alpaca_order_id": alpaca_order_id},
+        )
+
+    status_note = "PARTIAL — pending_reconciliation" if is_partial else (
+        "unresolved leg price — pending_reconciliation" if any_unresolved_price else "EXECUTED"
+    )
+    reasoning = (f"mleg {status_note} — {len(position_ids)} legs, "
                  f"spread_group_id={spread_group_id}, alpaca_order_id={alpaca_order_id}")
-    insert_decision(conn, ticket_id, "EXECUTED", reasoning)
-    log_system_event(conn, "INFO", "execution_engine",
-                     f"Executed spread {payload.get('strategy_type', '')} on {payload.get('symbol', '')}",
+    insert_decision(conn, ticket_id, "PARTIAL" if is_partial else "EXECUTED", reasoning)
+    log_system_event(conn, "WARNING" if (is_partial or any_unresolved_price) else "INFO", "execution_engine",
+                     f"{'Partial ' if is_partial else ''}spread {payload.get('strategy_type', '')} "
+                     f"on {payload.get('symbol', '')}",
                      {"ticket_id": ticket_id, "spread_group_id": spread_group_id,
                       "position_ids": position_ids, "alpaca_order_id": alpaca_order_id,
-                      "strategy_id": payload.get("strategy_id")})
-    logger.info("Ticket %s EXECUTED (spread): group=%s legs=%d",
-                ticket_id, spread_group_id, len(position_ids))
+                      "strategy_id": payload.get("strategy_id"), "is_partial": is_partial})
+    logger.info("Ticket %s %s (spread): group=%s legs=%d",
+                ticket_id, "PARTIAL" if is_partial else "EXECUTED", spread_group_id, len(position_ids))
     return spread_group_id
 
 
@@ -965,7 +1188,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     alpaca_order_id = order["id"]
 
     try:
-        filled_order = poll_order_until_filled(alpaca_order_id)
+        filled_order = finalize_order(alpaca_order_id)
     except Exception as exc:
         reason = f"Order poll failed: {exc}"
         insert_decision(conn, ticket_id, "FAILED", reason)
@@ -975,11 +1198,16 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     fill_status = filled_order.get("status", "")
     fill_price_str = filled_order.get("filled_avg_price")
     fill_price = float(fill_price_str) if fill_price_str else None
+    filled_qty_str = filled_order.get("filled_qty")
+    filled_qty = float(filled_qty_str) if filled_qty_str else 0.0
+    is_partial = fill_status == "partially_filled" or (0 < filled_qty and fill_status != "filled")
 
-    # mleg orders report per-leg fills; the top-level price is the net debit/
-    # credit and may legitimately be absent — status alone decides for spreads
-    if fill_status != "filled" or (fill_price is None and not legs):
-        reason = f"Order did not fill — final status={fill_status}"
+    # Nothing filled at all (rejected/expired/canceled with zero fill, or
+    # mleg with a legitimately absent top-level price and no legs) — a real
+    # failure, not a partial. mleg orders report per-leg fills; the top-level
+    # price is the net debit/credit and may legitimately be absent for spreads.
+    if filled_qty <= 0 or (fill_price is None and not legs):
+        reason = f"Order did not fill — final status={fill_status}, filled_qty={filled_qty}"
         insert_decision(conn, ticket_id, "FAILED", reason)
         log_system_event(conn, "WARNING", "execution_engine", reason,
                          {"ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id})
@@ -987,15 +1215,19 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
 
     if asset_type == "option" and legs:
         try:
-            insert_spread_ledger_rows(conn, ticket_id, payload, filled_order, alpaca_order_id)
+            insert_spread_ledger_rows(conn, ticket_id, payload, filled_order, alpaca_order_id,
+                                      is_partial=is_partial)
         except Exception as exc:
             reason = f"Ledger insert failed: {exc}"
             insert_decision(conn, ticket_id, "FAILED", reason)
             log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
         return
 
-    filled_qty_str = filled_order.get("filled_qty")
-    filled_qty = float(filled_qty_str) if filled_qty_str else float(payload.get("qty", 1))
+    if is_partial:
+        log_system_event(conn, "WARNING", "execution_engine",
+                         f"Partial fill on entry: {symbol} filled_qty={filled_qty} status={fill_status}",
+                         {"ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id,
+                          "filled_qty": filled_qty})
 
     slippage = (abs(fill_price - expected_price) / expected_price
                 if expected_price and expected_price > 0 else 0.0)
@@ -1014,6 +1246,12 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         ledger_direction = direction
         delta_exposure = 1.0 if direction == "long" else -1.0
 
+    # Actual filled notional, not the pre-fill sized/requested notional —
+    # a partial fill or price slippage between sizing and fill means those
+    # two numbers legitimately differ, and exposure math (directional cap,
+    # recon) must be computed off what actually happened.
+    actual_notional = filled_qty * fill_price * (100 if asset_type == "option" else 1)
+
     ledger_data = {
         "bot_source": payload["bot_source"],
         "strategy_id": payload.get("strategy_id"),
@@ -1021,7 +1259,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         "asset_type": asset_type,
         "direction": ledger_direction,
         "delta_exposure": delta_exposure,
-        "notional_risk": sized_notional,
+        "notional_risk": actual_notional,
         "qty": filled_qty,
         "entry_price": fill_price,
         "entry_time": datetime.now(timezone.utc),
@@ -1040,16 +1278,18 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
         return
 
-    reasoning = (f"Filled at {fill_price:.4f}, slippage={slippage:.4f}, "
+    reasoning = (f"{'Partially filled' if is_partial else 'Filled'} qty={filled_qty} "
+                 f"at {fill_price:.4f}, slippage={slippage:.4f}, "
                  f"position_id={position_id}, alpaca_order_id={alpaca_order_id}")
-    insert_decision(conn, ticket_id, "EXECUTED", reasoning)
-    log_system_event(conn, "INFO", "execution_engine",
-                     f"Executed {symbol} ({asset_type}) — {direction}",
+    insert_decision(conn, ticket_id, "PARTIAL" if is_partial else "EXECUTED", reasoning)
+    log_system_event(conn, "WARNING" if is_partial else "INFO", "execution_engine",
+                     f"{'Partially executed' if is_partial else 'Executed'} {symbol} ({asset_type}) — {direction}",
                      {"ticket_id": ticket_id, "position_id": position_id,
-                      "fill_price": fill_price, "slippage": slippage,
-                      "strategy_id": payload.get("strategy_id")})
-    logger.info("Ticket %s EXECUTED: position_id=%s fill=%.4f slippage=%.4f",
-                ticket_id, position_id, fill_price, slippage)
+                      "fill_price": fill_price, "slippage": slippage, "filled_qty": filled_qty,
+                      "is_partial": is_partial, "strategy_id": payload.get("strategy_id")})
+    logger.info("Ticket %s %s: position_id=%s fill=%.4f qty=%.4f slippage=%.4f",
+                ticket_id, "PARTIAL" if is_partial else "EXECUTED", position_id, fill_price,
+                filled_qty, slippage)
 
 
 # ---------------------------------------------------------------------------

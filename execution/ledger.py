@@ -112,6 +112,109 @@ def close_position(
                 position_id, exit_price, slippage, exit_reason)
 
 
+def reduce_position_qty(
+    conn,
+    position_id: str,
+    filled_qty: float,
+    fill_price: float,
+    slippage: float,
+    exit_reason: str,
+    exit_bid: Optional[float] = None,
+    exit_ask: Optional[float] = None,
+) -> float:
+    """
+    Apply a (possibly partial) close fill: decrement the ledger row's qty by
+    filled_qty. If that exhausts the position, delegate to close_position()
+    for the full close semantics (status='closed', exit_price, etc). If any
+    qty remains, the row stays status='open' with the reduced qty — the
+    position is still live and must keep being monitored/reconciled.
+
+    Returns the remaining qty (0.0 if now fully closed). Never assumes a
+    close order fully closed the position — the caller passes the ACTUAL
+    filled_qty Alpaca reported, not the qty that was requested.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT qty FROM nwt_portfolio_ledger WHERE position_id = %s FOR UPDATE",
+            (position_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            logger.warning("reduce_position_qty: position %s not found", position_id)
+            return 0.0
+        current_qty = float(row["qty"]) if row["qty"] is not None else filled_qty
+        remaining = round(max(current_qty - filled_qty, 0.0), 6)
+
+        if remaining <= 0:
+            close_position(conn, position_id, fill_price, slippage, exit_reason,
+                           exit_bid=exit_bid, exit_ask=exit_ask)
+            return 0.0
+
+        cur.execute(
+            "UPDATE nwt_portfolio_ledger SET qty = %s WHERE position_id = %s",
+            (remaining, position_id),
+        )
+    conn.commit()
+    logger.warning("Partial close on position %s: qty %.4f -> %.4f (%.4f filled, still OPEN)",
+                    position_id, current_qty, remaining, filled_qty)
+    return remaining
+
+
+def mark_pending_reconciliation(conn, position_id: str, reason: str) -> None:
+    """
+    Flag a ledger row as needing human/recon review instead of trusting it as
+    a normal open position — used when a fill price or fill quantity can't be
+    resolved with confidence (e.g. an mleg leg with no resolvable price, or a
+    multi-leg order that only partially filled). status stays out of both
+    'open' (position monitors would act on unreliable data) and 'closed'
+    (would hide real, possibly-untracked broker exposure).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE nwt_portfolio_ledger SET status = 'pending_reconciliation' WHERE position_id = %s",
+            (position_id,),
+        )
+    conn.commit()
+    logger.warning("Position %s marked pending_reconciliation: %s", position_id, reason)
+
+
+def log_reconciliation_event(
+    conn,
+    mismatch_type: str,
+    symbol: str,
+    ledger_value,
+    broker_value,
+    severity: str,
+    recommended_action: str,
+    extra: Optional[dict] = None,
+) -> None:
+    """
+    Structured reconciliation-event log, written synchronously at the moment
+    execution/engine.py detects ledger/broker divergence while handling a
+    close (not just on recon_agent.py's nightly/gate schedule). Shares its
+    vocabulary (mismatch_type/severity/recommended_action) with recon_agent.py
+    so both surfaces are queryable the same way.
+    severity: 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL'
+    """
+    level = severity if severity in ("INFO", "WARNING", "ERROR", "CRITICAL") else "WARNING"
+    payload = {
+        "reconciliation_status": "mismatch",
+        "mismatch_type": mismatch_type,
+        "symbol": symbol,
+        "ledger_value": ledger_value,
+        "broker_value": broker_value,
+        "severity": level,
+        "recommended_action": recommended_action,
+    }
+    if extra:
+        payload.update(extra)
+    log_system_event(
+        conn, level, "reconciliation",
+        f"{mismatch_type}: {symbol} ledger={ledger_value} broker={broker_value}",
+        payload,
+    )
+
+
 def get_open_positions(conn, bot_source: Optional[str] = None) -> list:
     """
     SELECT all open positions from nwt_portfolio_ledger.

@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS nwt_portfolio_ledger (
   exit_bid NUMERIC,             -- NBBO at exit
   exit_ask NUMERIC,
   realized_slippage NUMERIC,
-  status TEXT DEFAULT 'open',
+  status TEXT DEFAULT 'open',   -- 'open' | 'closed' | 'suspect' (recon) | 'pending_reconciliation' (unresolved fill price/qty)
   alpaca_order_id TEXT,
   spread_group_id UUID,         -- ties legs of one multi-leg structure together
   created_at TIMESTAMPTZ DEFAULT NOW()

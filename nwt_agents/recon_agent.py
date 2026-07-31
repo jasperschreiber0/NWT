@@ -69,8 +69,16 @@ def fetch_alpaca_positions() -> list:
 
 
 def fetch_ledger_open(conn) -> list:
+    """
+    'open' AND 'pending_reconciliation' rows both represent real, currently-
+    held broker exposure — pending_reconciliation just means execution/engine.py
+    couldn't confidently price or fully account for the fill (e.g. an
+    unresolved mleg leg price, or a partially-filled multi-leg order). Excluding
+    them here would make recon spuriously report them as in_alpaca_not_ledger
+    (missing) when they are in fact known-but-flagged, not missing.
+    """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT * FROM nwt_portfolio_ledger WHERE status = 'open'")
+        cur.execute("SELECT * FROM nwt_portfolio_ledger WHERE status IN ('open', 'pending_reconciliation')")
         rows = cur.fetchall()
     return [dict(r) for r in rows]
 
@@ -117,21 +125,44 @@ def run_recon(conn, mode: str) -> bool:
     mismatches = []
     critical = False
 
-    # 1: In Alpaca but not in ledger → CRITICAL untracked risk
-    for sym, apos in alpaca_map.items():
-        if sym not in ledger_map:
-            entry = {"class": "in_alpaca_not_ledger", "symbol": sym, "alpaca": apos}
-            logger.error("CRITICAL: %s qty=%.0f %s not in ledger", sym, apos["qty"], apos["side"])
-            mismatches.append(entry)
+    def _add(mismatch_type: str, symbol: str, severity: str, recommended_action: str, **fields) -> None:
+        nonlocal critical
+        entry = {
+            "class": mismatch_type,          # kept for backward compat with existing consumers
+            "mismatch_type": mismatch_type,
+            "symbol": symbol,
+            "severity": severity,
+            "recommended_action": recommended_action,
+            **fields,
+        }
+        mismatches.append(entry)
+        if severity == "CRITICAL":
             critical = True
 
-    # 2: In ledger but not in Alpaca → mark suspect (non-critical)
+    # 1: In Alpaca but not in ledger → CRITICAL untracked risk. Broker holds
+    # something the system has zero record of.
+    for sym, apos in alpaca_map.items():
+        if sym not in ledger_map:
+            logger.error("CRITICAL: %s qty=%.0f %s not in ledger", sym, apos["qty"], apos["side"])
+            _add("in_alpaca_not_ledger", sym, "CRITICAL",
+                 "Halt trading (no_trade_mode set), run recon_agent.py --cold-start-import "
+                 "or manually attribute the position, then --clear-if-clean",
+                 alpaca=apos)
+
+    # 2: In ledger but not in Alpaca → the ledger believes a position is open
+    # that the broker has no record of. Most often means it was already
+    # closed at the broker (manually, or by a process outside this system)
+    # while the ledger row was never updated — mark suspect, not critical,
+    # since it doesn't represent untracked NEW risk, just a stale record.
     for sym, rows in ledger_map.items():
         if sym not in alpaca_map:
             for row in rows:
                 pid = str(row["position_id"])
                 logger.warning("in_ledger_not_alpaca: %s position_id=%s — marking suspect", sym, pid)
-                mismatches.append({"class": "in_ledger_not_alpaca", "symbol": sym, "position_id": pid})
+                _add("in_ledger_not_alpaca", sym, "WARNING",
+                     "Verify manually whether this was already closed at the broker; "
+                     "row marked status='suspect' pending confirmation",
+                     position_id=pid, ledger_status_before=row.get("status"))
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE nwt_portfolio_ledger SET status='suspect' WHERE position_id=%s",
@@ -139,26 +170,67 @@ def run_recon(conn, mode: str) -> bool:
                     )
                 conn.commit()
 
-    # 3: Qty mismatch → CRITICAL
-    # Compares Alpaca's live qty against the SUM of real filled qty recorded
-    # per ledger row (nwt_portfolio_ledger.qty, populated from the Alpaca fill
-    # at order time) — not row count. A single order can fill more than one
-    # contract, so "1 row = 1 contract" does not hold.
+    # 3: Qty mismatch → CRITICAL. Compares Alpaca's live qty against the SUM
+    # of real filled qty recorded per ledger row (nwt_portfolio_ledger.qty,
+    # populated from the Alpaca fill at order time) — not row count. A single
+    # order can fill more than one contract/share, so "1 row = 1 unit" does
+    # not hold. Checked for BOTH equity and options — the option-only
+    # restriction this used to have left equity qty drift undetected.
     for sym in set(alpaca_map) & set(ledger_map):
-        asset_type = ledger_map[sym][0].get("asset_type", "equity")
-        if asset_type != "option":
-            continue
         alpaca_qty = alpaca_map[sym]["qty"]
         ledger_qty = sum(float(row.get("qty") or 0) for row in ledger_map[sym])
-        if abs(alpaca_qty - ledger_qty) > 0.5:
-            entry = {"class": "qty_mismatch", "symbol": sym,
-                     "alpaca_qty": alpaca_qty, "ledger_qty": ledger_qty}
-            logger.error("CRITICAL qty mismatch: %s alpaca=%.0f ledger=%.0f", sym, alpaca_qty, ledger_qty)
-            mismatches.append(entry)
-            critical = True
+        tolerance = 0.5 if ledger_map[sym][0].get("asset_type") == "option" else 0.001
+        if abs(alpaca_qty - ledger_qty) > tolerance:
+            logger.error("CRITICAL qty mismatch: %s alpaca=%.4f ledger=%.4f", sym, alpaca_qty, ledger_qty)
+            _add("qty_mismatch", sym, "CRITICAL",
+                 "Trust broker qty. Investigate the fill/close path that produced the drift "
+                 "before allowing further closes on this symbol",
+                 alpaca_qty=alpaca_qty, ledger_qty=ledger_qty)
+
+    # 4: Average entry price mismatch → WARNING. A drifted avg_entry_price
+    # doesn't create untracked risk the way a qty mismatch does, but it does
+    # corrupt PnL/attribution — the Learning Layer trusts entry_price.
+    for sym in set(alpaca_map) & set(ledger_map):
+        alpaca_avg = alpaca_map[sym]["avg_entry"]
+        rows = ledger_map[sym]
+        priced_rows = [r for r in rows if r.get("entry_price") is not None]
+        if alpaca_avg <= 0 or not priced_rows:
+            continue
+        total_qty = sum(float(r.get("qty") or 0) for r in priced_rows)
+        if total_qty <= 0:
+            continue
+        ledger_avg = sum(float(r["entry_price"]) * float(r.get("qty") or 0) for r in priced_rows) / total_qty
+        if ledger_avg <= 0:
+            continue
+        pct_diff = abs(alpaca_avg - ledger_avg) / alpaca_avg
+        if pct_diff > 0.02:  # >2% average-price drift
+            logger.warning("avg_price_mismatch: %s alpaca_avg=%.4f ledger_avg=%.4f (%.1f%% diff)",
+                           sym, alpaca_avg, ledger_avg, pct_diff * 100)
+            _add("avg_price_mismatch", sym, "WARNING",
+                 "Entry price drift affects PnL/attribution accuracy — verify fill records for this symbol",
+                 alpaca_avg_entry=alpaca_avg, ledger_avg_entry=round(ledger_avg, 4),
+                 pct_diff=round(pct_diff, 4))
+
+    # 5: pending_reconciliation rows present in Alpaca and matched by symbol —
+    # not a divergence by itself (both sides agree the position exists), but
+    # surface it so a human knows execution/engine.py flagged something.
+    for sym, rows in ledger_map.items():
+        if sym not in alpaca_map:
+            continue
+        pending = [r for r in rows if r.get("status") == "pending_reconciliation"]
+        for row in pending:
+            _add("pending_reconciliation_open", sym, "WARNING",
+                 "Row was flagged by execution/engine.py at fill time (unresolved price or "
+                 "partial multi-leg fill) — resolve manually, do not auto-clear",
+                 position_id=str(row["position_id"]))
+
+    reconciliation_status = "critical_mismatch" if critical else (
+        "non_critical_mismatch" if mismatches else "clean"
+    )
 
     if not mismatches:
         insert_ticket(conn, "RECON_AGENT", "SYSTEM", "recon_ok", {
+            "reconciliation_status": reconciliation_status,
             "alpaca_positions": len(alpaca_positions),
             "ledger_open": len(ledger_open),
             "mode": mode,
@@ -168,13 +240,14 @@ def run_recon(conn, mode: str) -> bool:
 
     # Write mismatch ticket
     insert_ticket(conn, "RECON_AGENT", "SYSTEM", "recon_mismatch", {
+        "reconciliation_status": reconciliation_status,
         "mismatches": mismatches,
         "mode": mode,
         "critical": critical,
     })
     log_system_event(conn, "CRITICAL" if critical else "WARNING", "recon_agent",
-                     f"Recon {'CRITICAL' if critical else 'non-critical'} mismatch: {len(mismatches)} issues",
-                     {"mismatches": mismatches})
+                     f"Recon {reconciliation_status}: {len(mismatches)} issues",
+                     {"mismatches": mismatches, "reconciliation_status": reconciliation_status})
 
     if critical:
         reason = f"Recon critical mismatch: {len(mismatches)} untracked/qty-mismatch positions"
