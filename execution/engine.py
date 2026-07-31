@@ -479,6 +479,10 @@ def place_options_order(payload: dict) -> dict:
                     len(legs), qty, ", ".join(f"{l['side']} {l['option_symbol']}" for l in legs))
         return alpaca_post("/orders", order_body)
 
+    # No order_class here — Alpaca rejects "simple" on options orders with a
+    # 422 (only "mleg" is a valid order_class for options; a plain order
+    # omits the field entirely). Regressed once already in 3c0aec6 after
+    # being fixed in 09ce0c9 — do not reintroduce it.
     option_symbol = payload["option_symbol"]
     order_body = {
         "symbol": option_symbol,
@@ -486,7 +490,6 @@ def place_options_order(payload: dict) -> dict:
         "side": "buy",
         "type": "market",
         "time_in_force": time_in_force,
-        "order_class": "simple",
     }
     logger.info("Placing options order: buy %s x%d", option_symbol, qty)
     return alpaca_post("/orders", order_body)
@@ -500,6 +503,7 @@ def place_close_order(symbol: str, qty: int, asset_type: str, side: str = "sell"
     callers closing a specific ledger position must pass the side that
     matches that position's own direction, not assume "sell".
     """
+    # No order_class for options here either — same 422 as place_options_order.
     order_body = {
         "symbol": symbol,
         "qty": str(qty),
@@ -507,8 +511,6 @@ def place_close_order(symbol: str, qty: int, asset_type: str, side: str = "sell"
         "type": "market",
         "time_in_force": "day",
     }
-    if asset_type == "option":
-        order_body["order_class"] = "simple"
     logger.info("Placing close order: %s %s x%d", side, symbol, qty)
     return alpaca_post("/orders", order_body)
 
