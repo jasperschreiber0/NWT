@@ -98,14 +98,13 @@ IDEMPOTENCY_CUTOFF = "2026-07-24T00:00:00+00:00"
 # Distinct from master/strategist.py's PER_BOT_WEIGHT_CEILING, which caps a
 # single bot's share of total capital — the two are complementary controls
 # with similar names, not the same control counted twice.
-# Raised from 0.60 to 0.90 (2026-08-05): the prior 0.60 value was inconsistent
-# with the documented Track A capital allocation (US $35k + EU $20k + AUS $20k
-# + China $15k = $90k, ~93% of a ~$97k account) -- once Track A held anywhere
-# near its allocated capital long, 0.60 permanently rejected every further
-# long entry from any bot/track, including nwt_agents' options proposals.
-# 0.90 accommodates the documented allocation while still enforcing a real
-# ceiling against unbounded single-direction concentration.
-DIRECTIONAL_CAP_PCT = 0.90
+# Briefly raised to 0.90 on 2026-08-05 under the hypothesis that legitimate
+# bot exposure needed that much headroom; investigation showed the real
+# cause was a single UNATTRIBUTED legacy position dominating the sum (fixed
+# below, in check_directional_cap() itself), and bot-only exposure was never
+# actually the problem. Reverted to 0.60 same-day once that fix was in place
+# — the smallest correct change is the exclusion, not a wider cap.
+DIRECTIONAL_CAP_PCT = 0.60
 
 # Synchronous risk backstop — mirrors risk_agent rules. The risk agent's
 # 5-minute sweep is authoritative, but its APPROVED decision can be minutes
