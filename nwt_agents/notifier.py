@@ -57,6 +57,18 @@ def alert_zero_tickets(by_utc: str) -> None:
     _send(f"⚠️ <b>NWT — ZERO TICKETS</b>\nNo trade tickets by {by_utc} UTC\n{_ts()}")
 
 
+def alert_exposure(alerts: list, report: dict) -> None:
+    lines = "\n".join(f"  • {a}" for a in alerts[:10])
+    combined = report.get("combined", {})
+    unattributed = report.get("unattributed", {})
+    _send(
+        f"📈 <b>NWT — DIRECTIONAL EXPOSURE ALERT</b>\n{lines}\n"
+        f"Combined: {combined.get('pct_of_equity', 0):.1%} of equity | "
+        f"Unattributed: ${unattributed.get('total_notional', 0):,.0f} "
+        f"({unattributed.get('symbols', [])})\n{_ts()}"
+    )
+
+
 def send_daily_digest(
     *,
     trades_today: int,
