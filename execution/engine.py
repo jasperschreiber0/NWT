@@ -80,7 +80,22 @@ REQUIRED_FIELDS = {
 VALID_TIME_IN_FORCE = {"day", "gtc", "opg", "cls", "ioc", "fok"}
 
 POLL_INTERVAL = 3
-POLL_MAX = 10
+# 20x3s = 60s. Was 10 (30s): proven insufficient on 2026-08-03/08-04 — three
+# consecutive EU_EXECUTOR equity market orders (VGK/EWU/FEZ), submitted right
+# at the 13:30 UTC open both days, sat unfilled through the entire 30s window
+# and were cancelled by finalize_order() with filled_qty=0.0 on both
+# occasions. Consistent with opening-auction/cross settlement latency at
+# major-exchange open rather than a genuinely invalid order — a plain market
+# order on a liquid ETF (VGK/EWU/FEZ) has no other obvious reason to sit
+# completely unfilled for 30 straight seconds. This is a single timeout
+# constant, not a redesign: same poll/cancel/readback logic, more patience
+# before giving up. Tradeoff: a ticket that's going to fail anyway now
+# blocks the processing loop for up to ~63s instead of ~33s before moving to
+# the next one — at current low daily ticket volume this stays well inside
+# the 5-minute cron interval, but if volume grows enough that this budget
+# gets tight, that's a signal for cron-level locking (already a known,
+# separately-tracked gap), not for multiplying this constant further.
+POLL_MAX = 20
 ET_TZ = ZoneInfo("America/New_York")
 
 
@@ -593,6 +608,21 @@ def upsert_heartbeat(conn) -> None:
 # ---------------------------------------------------------------------------
 
 def check_directional_cap(conn, direction: str, incoming_notional: float) -> tuple:
+    """
+    'UNATTRIBUTED' rows (recon_agent.py::cold_start_import()) are excluded
+    from the existing-exposure sum. These are pre-existing broker positions
+    no bot chose to take and none can manage or close via strategy logic —
+    counting them meant a single legacy import (confirmed: $90,805 of AAPL
+    against a ~$94k account) could permanently consume the entire
+    directional budget and block every subsequent, correctly-sized bot
+    trade regardless of direction. Proven live on 2026-08-03/08-04: AUS's
+    EWA/BHP/RIO were rejected on both days with near-identical "long
+    exposure" figures despite zero new AUS positions actually opening —
+    the number wasn't growing from real trades, it was static legacy
+    exposure the bots have no way to reduce. This does not weaken the
+    kill switches (drawdown >8%, VIX >40) — those key off raw account
+    equity, not this ledger sum.
+    """
     try:
         equity = get_alpaca_account_equity()
     except Exception:
@@ -606,7 +636,7 @@ def check_directional_cap(conn, direction: str, incoming_notional: float) -> tup
             """
             SELECT COALESCE(SUM(notional_risk), 0)
             FROM nwt_portfolio_ledger
-            WHERE status = 'open' AND direction = %s
+            WHERE status = 'open' AND direction = %s AND bot_source != 'UNATTRIBUTED'
             """,
             (ledger_direction,),
         )
