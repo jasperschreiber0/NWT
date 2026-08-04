@@ -67,7 +67,7 @@ BASELINE_WEIGHTS = {
 
 # Per-bot capital-weight ceiling (sanity cap on any single bot's share of
 # total capital). Distinct from execution/engine.py's DIRECTIONAL_CAP_PCT
-# (0.60), which caps aggregate same-direction notional across all bots —
+# (0.90), which caps aggregate same-direction notional across all bots —
 # the two are complementary controls, not the same "directional cap" twice.
 PER_BOT_WEIGHT_CEILING = 0.65
 

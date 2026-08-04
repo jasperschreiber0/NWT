@@ -98,7 +98,14 @@ IDEMPOTENCY_CUTOFF = "2026-07-24T00:00:00+00:00"
 # Distinct from master/strategist.py's PER_BOT_WEIGHT_CEILING, which caps a
 # single bot's share of total capital — the two are complementary controls
 # with similar names, not the same control counted twice.
-DIRECTIONAL_CAP_PCT = 0.60
+# Raised from 0.60 to 0.90 (2026-08-05): the prior 0.60 value was inconsistent
+# with the documented Track A capital allocation (US $35k + EU $20k + AUS $20k
+# + China $15k = $90k, ~93% of a ~$97k account) -- once Track A held anywhere
+# near its allocated capital long, 0.60 permanently rejected every further
+# long entry from any bot/track, including nwt_agents' options proposals.
+# 0.90 accommodates the documented allocation while still enforcing a real
+# ceiling against unbounded single-direction concentration.
+DIRECTIONAL_CAP_PCT = 0.90
 
 # Synchronous risk backstop — mirrors risk_agent rules. The risk agent's
 # 5-minute sweep is authoritative, but its APPROVED decision can be minutes
@@ -1328,7 +1335,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     cap_exceeded, total_exposure, cap = check_directional_cap(conn, direction, sized_notional)
     if cap_exceeded:
         reason = (f"Directional cap exceeded: {direction} exposure {total_exposure:.0f} "
-                  f"> {cap:.0f} (60% of equity)")
+                  f"> {cap:.0f} ({DIRECTIONAL_CAP_PCT:.0%} of equity)")
         logger.warning("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "REJECTED", reason)
         log_system_event(conn, "WARNING", "execution_engine", reason,
