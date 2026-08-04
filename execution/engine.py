@@ -618,6 +618,22 @@ def upsert_heartbeat(conn) -> None:
 # ---------------------------------------------------------------------------
 
 def check_directional_cap(conn, direction: str, incoming_notional: float) -> tuple:
+    """
+    'UNATTRIBUTED' rows (recon_agent.py::cold_start_import()) are excluded
+    from the existing-exposure sum. These are pre-existing broker positions
+    no bot chose to take and none can manage/close via strategy logic --
+    counting them here meant a single legacy import (e.g. $90,805 of AAPL
+    against a ~$95k account) could permanently consume the entire directional
+    budget and block every subsequent, correctly-sized bot trade regardless
+    of direction. cold_start_import() only ever runs against a completely
+    empty ledger, so this exclusion cannot be exploited to accumulate more
+    untracked exposure over time -- it is a one-time, closable-only category.
+    This narrows the cap to what it is actually meant to bound: aggregate
+    same-direction notional a bot chose to take on. It does not reduce
+    protection against account-wide catastrophic loss -- the Risk Agent's
+    kill switches (drawdown >8%, VIX >40) key off raw account equity, not
+    this ledger sum, and are unaffected by this exclusion.
+    """
     try:
         equity = get_alpaca_account_equity()
     except Exception:
@@ -631,7 +647,7 @@ def check_directional_cap(conn, direction: str, incoming_notional: float) -> tup
             """
             SELECT COALESCE(SUM(notional_risk), 0)
             FROM nwt_portfolio_ledger
-            WHERE status = 'open' AND direction = %s
+            WHERE status = 'open' AND direction = %s AND bot_source != 'UNATTRIBUTED'
             """,
             (ledger_direction,),
         )

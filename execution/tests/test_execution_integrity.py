@@ -488,3 +488,61 @@ def test_post_fill_verification_passes_when_broker_matches_ledger(conn, monkeypa
     assert clean is True
     value, _ = _no_trade_mode(conn)
     assert value is False
+
+
+# ---------------------------------------------------------------------------
+# UNATTRIBUTED legacy exposure exclusion (2026-08-05: a single cold-start
+# imported AAPL position, $90,805 notional against a ~$95k account, was
+# consuming the entire directional-cap budget and blocking every bot trade
+# regardless of size or direction). check_directional_cap() now excludes
+# bot_source='UNATTRIBUTED' rows from the existing-exposure sum.
+# ---------------------------------------------------------------------------
+
+def test_unattributed_legacy_position_does_not_block_bot_trade(conn, monkeypatch):
+    import engine
+    broker = FakeAlpaca(price=100.0)
+    wire_fake_alpaca(monkeypatch, engine, broker)  # equity fixed at 97,000
+
+    # Reproduces the exact production scenario: one large UNATTRIBUTED
+    # legacy position, then a small, correctly-sized bot trade on top.
+    _insert_open_position(conn, "UNATTRIBUTED", "AAPL", "long", 286, 317.50, None)
+
+    cap_exceeded, total_exposure, cap = engine.check_directional_cap(conn, "long", 698.40)
+
+    assert total_exposure == pytest.approx(698.40), \
+        "the UNATTRIBUTED position must not count toward existing exposure"
+    assert cap_exceeded is False, \
+        "a small, correctly-sized bot trade must not be blocked by legacy exposure alone"
+
+
+def test_legitimate_bot_exposure_still_respects_directional_cap(conn, monkeypatch):
+    import engine
+    broker = FakeAlpaca(price=100.0)
+    wire_fake_alpaca(monkeypatch, engine, broker)  # equity fixed at 97,000, cap = 87,300 at 0.90
+
+    # Real, bot-attributed exposure that alone already exceeds the cap --
+    # the exclusion must not have neutered protection against genuine
+    # bot-driven overexposure.
+    _insert_open_position(conn, "AUS_BOT", "EWA", "long", 3000, 30.0, str(uuid.uuid4()))  # 90,000 notional
+
+    cap_exceeded, total_exposure, cap = engine.check_directional_cap(conn, "long", 1000.0)
+
+    assert total_exposure == pytest.approx(91_000.0)
+    assert cap_exceeded is True, \
+        "bot-attributed exposure must still be capped -- only UNATTRIBUTED rows are excluded"
+
+
+def test_unattributed_and_bot_exposure_both_present_only_bot_side_counts(conn, monkeypatch):
+    import engine
+    broker = FakeAlpaca(price=100.0)
+    wire_fake_alpaca(monkeypatch, engine, broker)
+
+    _insert_open_position(conn, "UNATTRIBUTED", "AAPL", "long", 286, 317.50, None)  # 90,805, excluded
+    _insert_open_position(conn, "AUS_BOT", "EWA", "long", 100, 30.0, str(uuid.uuid4()))  # 3,000, counted
+
+    cap_exceeded, total_exposure, cap = engine.check_directional_cap(conn, "long", 500.0)
+
+    # 3,000 (bot) + 500 (incoming) = 3,500 -- the 90,805 legacy position
+    # must be entirely absent from this figure.
+    assert total_exposure == pytest.approx(3_500.0)
+    assert cap_exceeded is False
