@@ -920,6 +920,18 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
         ledger_qty = pos.get("qty")
         ledger_qty = float(ledger_qty) if ledger_qty is not None else None
 
+        # Close side must match the position's own direction — a long
+        # position is closed by selling; a short position is closed by
+        # buying to cover. This previously always fell through to
+        # place_close_order's "sell" default regardless of direction, which
+        # on a short position ADDS to it instead of covering it (the
+        # 2026-07-28 BHP incident: a real -10 short became -20 at the
+        # broker while the ledger row was marked 'closed'). Same derivation
+        # process_close_ticket already uses correctly for CLOSE_REQUEST
+        # tickets — this path (the equity monitor's own direct close) must
+        # do the same instead of ever assuming "sell".
+        close_side = "buy" if pos.get("direction") == "short" else "sell"
+
         if broker_qty <= 0:
             reason = f"Broker reports zero/no position for {symbol} — cannot close"
             logger.warning("Position %s: %s (ledger believed qty=%s)", position_id, reason, ledger_qty)
@@ -941,7 +953,7 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
                 {"position_id": position_id, "exit_reason": exit_reason},
             )
 
-        order = place_close_order(symbol, broker_qty, "equity")
+        order = place_close_order(symbol, broker_qty, "equity", side=close_side)
         filled = finalize_order(order["id"])
         fill_price = float(filled.get("filled_avg_price") or current_price)
         filled_qty = float(filled.get("filled_qty") or 0)
@@ -957,17 +969,18 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
 
         if remaining > 0:
             log_system_event(conn, "WARNING", "execution_engine",
-                             f"Partial equity close: {symbol} filled {filled_qty} of {broker_qty}, "
+                             f"Partial equity close: {symbol} filled {filled_qty} of {broker_qty} side={close_side}, "
                              f"{remaining} remains open",
                              {"position_id": position_id, "exit_reason": exit_reason,
-                              "filled_qty": filled_qty, "requested_qty": broker_qty})
+                              "filled_qty": filled_qty, "requested_qty": broker_qty, "side": close_side})
         else:
             log_system_event(conn, "INFO", "execution_engine",
-                             f"Closed equity {symbol} reason={exit_reason} fill={fill_price:.4f} qty={filled_qty}",
+                             f"Closed equity {symbol} reason={exit_reason} fill={fill_price:.4f} "
+                             f"qty={filled_qty} side={close_side}",
                              {"position_id": position_id, "exit_reason": exit_reason,
-                              "fill_price": fill_price, "filled_qty": filled_qty})
-        logger.info("Closed equity %s at %.4f reason=%s filled_qty=%.4f remaining=%.4f",
-                    symbol, fill_price, exit_reason, filled_qty, remaining)
+                              "fill_price": fill_price, "filled_qty": filled_qty, "side": close_side})
+        logger.info("Closed equity %s at %.4f reason=%s side=%s filled_qty=%.4f remaining=%.4f",
+                    symbol, fill_price, exit_reason, close_side, filled_qty, remaining)
     except Exception as exc:
         # No ticket involved in this path — nothing to leave "pending" for a
         # RETRYABLE error, the position just stays open and gets re-evaluated
