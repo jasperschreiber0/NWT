@@ -674,7 +674,17 @@ def insert_decision(conn, ticket_id: str, decision: str, reasoning: str) -> None
     than creating a second one. Still safe to call without a prior claim
     (inserts fresh) for paths that never touch Alpaca, e.g. REJECTED before
     any order was ever attempted.
+
+    This is also always the first write attempted after a caught exception
+    (every except block across this file calls it to record FAILED/REJECTED),
+    so the prior statement on conn may have left the transaction aborted —
+    e.g. insert_position() hitting one_ledger_row_per_order_asset on a
+    resumed stale claim whose order was already ledgered before a crash.
+    Postgres refuses any further command on an aborted transaction until an
+    explicit ROLLBACK, and nothing else in this codebase issues one, so this
+    call must always be able to land regardless of what failed before it.
     """
+    conn.rollback()
     with conn.cursor() as cur:
         cur.execute(
             f"""

@@ -35,6 +35,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import psycopg2
+import psycopg2.errors
 import pytest
 from psycopg2.extras import RealDictCursor
 
@@ -57,7 +58,7 @@ def conn():
     c = psycopg2.connect(TEST_DSN)
     yield c
     with c.cursor() as cur:
-        cur.execute("TRUNCATE nwt_ticket_decisions, nwt_tickets CASCADE")
+        cur.execute("TRUNCATE nwt_ticket_decisions, nwt_tickets, nwt_portfolio_ledger, nwt_system_log CASCADE")
     c.commit()
     c.close()
 
@@ -310,3 +311,86 @@ def test_case5_two_distinct_tickets_both_produce_their_own_order(conn):
         rows = cur.fetchall()
     assert len(rows) == 2
     assert {str(r["ticket_id"]) for r in rows} == {ticket_a, ticket_b}
+
+
+# ---------------------------------------------------------------------------
+# Case 6 — a caught IntegrityError must not poison the connection for the
+# rest of the run. Found in the pre-deploy review, not one of the original
+# 5 required cases: a resumed stale claim whose order was already ledgered
+# before a crash calls insert_position() again for the same
+# (alpaca_order_id, asset) pair -> one_ledger_row_per_order_asset correctly
+# rejects it -> the transaction aborts. Before the conn.rollback() fix in
+# insert_decision()/log_system_event(), the very next statement on the same
+# conn (the FAILED decision write) would ALSO raise (InFailedSqlTransaction),
+# and because nothing rolled back, every other ticket processed on that same
+# conn for the rest of that cron cycle would fail the same way.
+# ---------------------------------------------------------------------------
+
+def _sample_ledger_data(alpaca_order_id: str, asset: str) -> dict:
+    return {
+        "bot_source": "EU_BOT",
+        "asset": asset,
+        "asset_type": "equity",
+        "direction": "long",
+        "delta_exposure": 1.0,
+        "notional_risk": 1000.0,
+        "qty": 10,
+        "entry_price": 100.0,
+        "alpaca_order_id": alpaca_order_id,
+    }
+
+
+def test_case6_ledger_insert_conflict_does_not_poison_connection(conn):
+    ticket_a = _insert_ticket(conn)
+    ticket_b = _insert_ticket(conn)
+
+    assert engine.claim_ticket(conn, ticket_a) is True
+
+    # Simulate "already ledgered before the crash": the real ledger row for
+    # the order this resume is about to re-report already exists.
+    ledger_data = _sample_ledger_data("order-dup-1", "TESTSYM")
+    engine.insert_position(conn, ledger_data)
+
+    # The resumed attempt's own insert_position() call for the SAME fill —
+    # exactly what process_ticket does unconditionally after
+    # find_or_place_order() returns the already-existing order.
+    with pytest.raises(psycopg2.errors.UniqueViolation):
+        engine.insert_position(conn, ledger_data)
+
+    # This is the line that used to also raise, before the fix — must not.
+    engine.insert_decision(conn, ticket_a, "FAILED", "Ledger insert failed: duplicate")
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT decision FROM nwt_ticket_decisions WHERE ticket_id=%s AND decided_by='EXECUTION_ENGINE' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (ticket_a,),
+        )
+        row = cur.fetchone()
+    assert row["decision"] == "FAILED", "The FAILED decision must land despite the prior IntegrityError"
+
+    # The connection must still be usable for a completely unrelated ticket —
+    # this is what "poisons the rest of the batch" meant in production.
+    assert engine.claim_ticket(conn, ticket_b) is True
+
+
+def test_case6b_log_system_event_also_recovers_from_aborted_transaction(conn):
+    """
+    Same aborted-transaction scenario, but for the non-ticket-driven
+    _close_equity_position()/process_close_ticket() recovery path, which
+    calls log_system_event() directly rather than insert_decision().
+    """
+    ledger_data = _sample_ledger_data("order-dup-2", "TESTSYM2")
+    engine.insert_position(conn, ledger_data)
+    with pytest.raises(psycopg2.errors.UniqueViolation):
+        engine.insert_position(conn, ledger_data)
+
+    # Must not raise, despite the aborted transaction above.
+    engine.log_system_event(conn, "ERROR", "execution_engine", "Ledger insert failed: duplicate", {})
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM nwt_system_log WHERE message = 'Ledger insert failed: duplicate'"
+        )
+        n = cur.fetchone()["n"]
+    assert n == 1

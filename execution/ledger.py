@@ -245,7 +245,15 @@ def log_system_event(
     """
     INSERT a row into nwt_system_log.
     level: 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL'
+
+    Like insert_decision() in engine.py, this is routinely the first write
+    attempted after a caught exception (every except block across engine.py
+    logs here), so the prior statement may have left conn's transaction
+    aborted. Roll back first so this call always lands regardless of what
+    failed before it — see insert_decision()'s docstring for the full
+    reasoning and the concrete crash-recovery scenario that surfaces it.
     """
+    conn.rollback()
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO nwt_system_log (level, component, message, payload) VALUES (%s, %s, %s, %s)",
