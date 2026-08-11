@@ -39,7 +39,15 @@ def _run_close(direction, mock_place_close_order, mock_finalize_order, mock_get_
         "id": "order-1", "status": "filled", "filled_avg_price": "100.0", "filled_qty": "10",
     }
 
-    with patch("engine.reduce_position_qty", return_value=0.0), \
+    # _close_equity_position now routes the order call through
+    # find_or_place_order(), which checks Alpaca for an existing order under
+    # this client_order_id first (the crash-recovery/race-safety path added
+    # by the execution-order idempotency fix). None here means "no existing
+    # order found", so find_or_place_order proceeds to call place_close_order
+    # exactly as before — this test is about the side= argument that call
+    # receives, not about idempotency, which has its own dedicated test file.
+    with patch("engine.alpaca_get_by_client_order_id", return_value=None), \
+         patch("engine.reduce_position_qty", return_value=0.0), \
          patch("engine.log_reconciliation_event"), \
          patch("engine.log_system_event"):
         engine._close_equity_position(MagicMock(), pos, current_price=100.0, position_id="pos-1",
