@@ -117,12 +117,23 @@ def close_position(
     exit_reason: str = "unknown",
     exit_bid: Optional[float] = None,
     exit_ask: Optional[float] = None,
+    exit_time: Optional[datetime] = None,
 ) -> None:
     """
     UPDATE nwt_portfolio_ledger: set status='closed', exit_price, exit_time,
     realized_slippage, exit_reason, and exit NBBO (feeds the pnl_adjusted haircut).
-    exit_reason: target | stop | hard_close | max_hold | kill_switch | manual
+    exit_reason: target | stop | hard_close | max_hold | kill_switch | manual |
+                 broker_closed_outside_force_close (reconciled from a broker
+                 fill found after Alpaca 404'd a FORCE_CLOSE liquidation —
+                 see execution/engine.py::_reconcile_force_close_404)
+
+    exit_time defaults to now — pass the real broker fill time when
+    reconciling a closing transaction that happened outside this call
+    (e.g. a FORCE_CLOSE 404 reconciliation) so the ledger reflects when the
+    position actually closed, not when NWT noticed.
     """
+    if exit_time is None:
+        exit_time = datetime.now(timezone.utc)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -136,7 +147,7 @@ def close_position(
                 exit_ask = %s
             WHERE position_id = %s
             """,
-            (exit_price, datetime.now(timezone.utc), slippage, exit_reason, exit_bid, exit_ask, position_id),
+            (exit_price, exit_time, slippage, exit_reason, exit_bid, exit_ask, position_id),
         )
         if cur.rowcount == 0:
             logger.warning("close_position: no rows updated for position_id=%s", position_id)

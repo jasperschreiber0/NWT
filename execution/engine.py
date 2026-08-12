@@ -1138,6 +1138,105 @@ def process_close_ticket(conn, ticket: dict) -> None:
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
 
 
+def _find_closing_order(asset: str, position: dict) -> dict | None:
+    """
+    Search recent order history for the fill that plausibly closed this
+    position — called ONLY after Alpaca has already confirmed (404 on the
+    liquidation DELETE) that it has no open position for `asset`, never
+    used to guess while a position might still be open. Matches on the
+    side opposite the position's own direction (the close side), a
+    'filled' status, and a fill time after this position's own entry_time
+    (so the original entry order can never be mistaken for its own close).
+    Returns the raw Alpaca order dict, or None if nothing matches.
+    """
+    close_side = "buy" if position.get("direction") == "short" else "sell"
+    entry_time = position.get("entry_time")
+    try:
+        orders = alpaca_get(f"/orders?status=all&symbols={asset}&direction=desc&limit=50")
+    except Exception as exc:
+        logger.error("FORCE_CLOSE 404 reconciliation: order history lookup failed for %s: %s",
+                     asset, exc)
+        return None
+    for o in orders:
+        if o.get("status") != "filled" or o.get("side") != close_side:
+            continue
+        try:
+            filled_qty = float(o.get("filled_qty") or 0)
+        except (TypeError, ValueError):
+            continue
+        if filled_qty <= 0:
+            continue
+        filled_at = o.get("filled_at")
+        if entry_time and filled_at:
+            try:
+                filled_dt = datetime.fromisoformat(filled_at.replace("Z", "+00:00"))
+                if filled_dt <= entry_time:
+                    continue
+            except ValueError:
+                pass
+        return o
+    return None
+
+
+def _reconcile_force_close_404(conn, ticket_id: str, position_id: str,
+                                position: dict, asset: str) -> None:
+    """
+    Alpaca has confirmed (404 on DELETE /positions/{asset}) that it has no
+    open position for this asset, while the ledger still shows it open —
+    a terminal broker state, not a retryable execution failure. Look for
+    the actual closing fill in order history; if found, reconcile the
+    ledger with that real broker data (never a fabricated price/time). If
+    no matching fill can be identified, mark the position 'suspect' — the
+    same convention recon_agent.py already uses for "ledger and broker
+    disagree, needs human review" — so risk_agent's status='open' query
+    (and the options monitor's) stops re-selecting it, instead of looping
+    FAILED forever or inventing a close.
+    """
+    closing_order = _find_closing_order(asset, position)
+
+    if closing_order is not None:
+        fill_price_str = closing_order.get("filled_avg_price")
+        fill_price = float(fill_price_str) if fill_price_str else 0.0
+        if fill_price > 0:
+            filled_at = closing_order.get("filled_at")
+            exit_time = None
+            if filled_at:
+                try:
+                    exit_time = datetime.fromisoformat(filled_at.replace("Z", "+00:00"))
+                except ValueError:
+                    exit_time = None
+            close_position(conn, position_id, fill_price, 0.0,
+                           "broker_closed_outside_force_close", exit_time=exit_time)
+            reason = (
+                f"FORCE_CLOSE: Alpaca reports no open position for {asset} (404). "
+                f"Reconciled from broker order {closing_order.get('id')}: "
+                f"filled_qty={closing_order.get('filled_qty')} @ {fill_price} "
+                f"at {filled_at}."
+            )
+            logger.warning("Ticket %s: %s", ticket_id, reason)
+            insert_decision(conn, ticket_id, "SKIPPED", reason)
+            log_system_event(conn, "WARNING", "execution_engine", reason,
+                             {"ticket_id": ticket_id, "position_id": position_id,
+                              "reconciled_alpaca_order_id": closing_order.get("id")})
+            return
+
+    reason = (
+        f"FORCE_CLOSE: Alpaca reports no open position for {asset} (404), but no "
+        f"matching closing fill was found in order history — marked 'suspect' for "
+        f"manual review rather than retried or fabricated."
+    )
+    logger.error("Ticket %s: %s", ticket_id, reason)
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE nwt_portfolio_ledger SET status = 'suspect' WHERE position_id = %s",
+            (position_id,),
+        )
+    conn.commit()
+    insert_decision(conn, ticket_id, "FAILED", reason)
+    log_system_event(conn, "CRITICAL", "execution_engine", reason,
+                     {"ticket_id": ticket_id, "position_id": position_id})
+
+
 def process_force_close(conn, ticket: dict) -> None:
     """
     Liquidate a ledger position on RISK_AGENT FORCE_CLOSE instruction.
@@ -1161,11 +1260,14 @@ def process_force_close(conn, ticket: dict) -> None:
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
         return
 
-    if position.get("status") == "closed":
+    if position.get("status") in ("closed", "suspect"):
         # P0-1 crash recovery (Scenario D): a resumed FORCE_CLOSE whose
         # prior attempt already liquidated at Alpaca and wrote the ledger
         # close lands here and stops — no second liquidation attempt.
-        reason = f"FORCE_CLOSE: position {position_id} already closed"
+        # 'suspect' is included so a repeat FORCE_CLOSE 404 on a position
+        # already reconciled (closed or flagged for manual review) by
+        # _reconcile_force_close_404 is idempotent too.
+        reason = f"FORCE_CLOSE: position {position_id} already {position['status']}"
         logger.info("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "SKIPPED", reason)
         return
@@ -1187,6 +1289,15 @@ def process_force_close(conn, ticket: dict) -> None:
         # this call 404s — caught below as FAILED, not a second live order).
         order = alpaca_delete(f"/positions/{asset}")
     except Exception as exc:
+        if (isinstance(exc, requests.exceptions.HTTPError)
+                and exc.response is not None and exc.response.status_code == 404):
+            # Terminal broker state, not a transient execution failure:
+            # Alpaca itself confirms there is nothing left to liquidate.
+            # Every other failure (422, 500, timeout, connection error,
+            # rate limit, auth) falls through to the unchanged FAILED path
+            # below exactly as before.
+            _reconcile_force_close_404(conn, ticket_id, position_id, position, asset)
+            return
         reason = f"FORCE_CLOSE: liquidation order failed for {asset}: {exc}"
         logger.error("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "FAILED", reason)
