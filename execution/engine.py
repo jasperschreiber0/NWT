@@ -4,11 +4,13 @@ Execution Engine — lifecycle service.
 Zero opinion on whether to trade. Executes only what has been approved.
 
 Each run (every 5 min via cron):
-  1. Check no_trade_mode flag — exit if set.
-  2. Upsert heartbeat.
+  1. Upsert heartbeat.
+  2. Check no_trade_mode flag — if set, still run steps 3-4 (closes are
+     risk-reducing and must go through even while halted); skip step 5.
   3. Run position monitor — close equity positions at stop/target/max-hold.
   4. Process pending FORCE_CLOSE / CLOSE_REQUEST tickets.
-  5. Process pending TRADE_REQUEST tickets (place new orders).
+  5. Process pending TRADE_REQUEST tickets (place new orders) — skipped
+     entirely while no_trade_mode is set.
 """
 
 import json
@@ -291,7 +293,26 @@ def poll_order_until_filled(order_id: str) -> dict:
             return order
         logger.info("Order %s status=%s (attempt %d/%d)", order_id, status, attempt + 1, POLL_MAX)
         time.sleep(POLL_INTERVAL)
-    return alpaca_get(f"/orders/{order_id}")
+
+    # Timed out without reaching a terminal state. The order (or a partial
+    # fill of it) is still live at the broker — leaving it running unpolled
+    # is how a slow partial fill gets marked FAILED here while it keeps
+    # working at Alpaca. Cancel what's left so the broker-side state stops
+    # changing after we walk away, then read back whatever actually settled
+    # (a cancel on a partially-filled order still leaves the filled portion
+    # as a real position).
+    try:
+        alpaca_delete(f"/orders/{order_id}")
+        logger.warning("Order %s did not reach terminal state after %d polls — canceled remainder",
+                        order_id, POLL_MAX)
+    except Exception as exc:
+        logger.warning("Order %s cancel-on-timeout failed (may have just filled/terminated): %s",
+                        order_id, exc)
+
+    final = alpaca_get(f"/orders/{order_id}")
+    logger.warning("Order %s post-timeout final status=%s filled_qty=%s",
+                    order_id, final.get("status"), final.get("filled_qty"))
+    return final
 
 
 def insert_decision(conn, ticket_id: str, decision: str, reasoning: str) -> None:
@@ -973,15 +994,27 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     fill_status = filled_order.get("status", "")
     fill_price_str = filled_order.get("filled_avg_price")
     fill_price = float(fill_price_str) if fill_price_str else None
+    filled_qty_str = filled_order.get("filled_qty")
+    has_partial_fill = fill_price is not None and float(filled_qty_str or 0) > 0
 
     # mleg orders report per-leg fills; the top-level price is the net debit/
-    # credit and may legitimately be absent — status alone decides for spreads
-    if fill_status != "filled" or (fill_price is None and not legs):
+    # credit and may legitimately be absent — status alone decides for spreads.
+    # A cancel-on-timeout (see poll_order_until_filled) can leave status
+    # "canceled"/"partially_filled" with a real fill on part of the order —
+    # that fill is a live position at the broker and must reach the ledger,
+    # not be dropped as FAILED, or it becomes an in_alpaca_not_ledger gap
+    # for recon to find later.
+    if fill_status != "filled" and not (has_partial_fill or legs):
         reason = f"Order did not fill — final status={fill_status}"
         insert_decision(conn, ticket_id, "FAILED", reason)
         log_system_event(conn, "WARNING", "execution_engine", reason,
                          {"ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id})
         return
+
+    if fill_status != "filled" and has_partial_fill:
+        logger.warning("Ticket %s: order %s ended status=%s with partial fill qty=%s — "
+                        "recording ledger position for the filled portion",
+                        ticket_id, alpaca_order_id, fill_status, filled_qty_str)
 
     if asset_type == "option" and legs:
         try:
@@ -992,7 +1025,6 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
             log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
         return
 
-    filled_qty_str = filled_order.get("filled_qty")
     filled_qty = float(filled_qty_str) if filled_qty_str else float(payload.get("qty", 1))
 
     slippage = (abs(fill_price - expected_price) / expected_price
@@ -1061,18 +1093,18 @@ def main() -> None:
     try:
         upsert_heartbeat(conn)
 
+        # no_trade_mode halts NEW entries only. It must never block
+        # risk-reducing closes (position-monitor stop/target exits,
+        # FORCE_CLOSE, CLOSE_REQUEST) — those are exactly the actions a
+        # halted system still needs to take to get flat. Blocking them
+        # is how a FORCE_CLOSE ticket gets stuck retrying forever while
+        # no_trade_mode stays set for the very reason the close was issued.
         halted, halt_reason = check_no_trade_mode(conn)
         if halted:
-            logger.warning("no_trade_mode is SET: %s — engine exiting without trading", halt_reason)
+            logger.warning("no_trade_mode is SET: %s — skipping new entries, "
+                            "still processing closes", halt_reason)
             log_system_event(conn, "WARNING", "execution_engine",
-                             f"no_trade_mode halted engine: {halt_reason}")
-            return
-
-        try:
-            directives = load_master_directives()
-        except Exception as exc:
-            logger.error("Cannot load master-directives.json: %s", exc)
-            sys.exit(1)
+                             f"no_trade_mode active (closes still processed): {halt_reason}")
 
         try:
             run_equity_position_monitor(conn)
@@ -1093,6 +1125,16 @@ def main() -> None:
                 except Exception as exc:
                     logger.error("Unhandled error in close ticket %s: %s",
                                  ticket.get("ticket_id"), exc)
+
+        if halted:
+            logger.info("no_trade_mode active — not processing new TRADE_REQUEST tickets")
+            return
+
+        try:
+            directives = load_master_directives()
+        except Exception as exc:
+            logger.error("Cannot load master-directives.json: %s", exc)
+            sys.exit(1)
 
         pending = fetch_pending_tickets(conn)
         logger.info("Found %d pending TRADE_REQUEST tickets", len(pending))
