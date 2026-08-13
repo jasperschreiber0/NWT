@@ -1226,6 +1226,7 @@ def _reconcile_force_close_404(conn, ticket_id: str, position_id: str,
                     exit_time = None
             close_position(conn, position_id, fill_price, 0.0,
                            "broker_closed_outside_force_close", exit_time=exit_time)
+            verify_post_fill_position(conn, asset, position.get("asset_type", "option"))
             reason = (
                 f"FORCE_CLOSE: Alpaca reports no open position for {asset} (404). "
                 f"Reconciled from broker order {closing_order.get('id')}: "

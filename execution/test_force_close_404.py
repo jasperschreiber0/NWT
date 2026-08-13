@@ -78,7 +78,8 @@ def run_test_1_404_with_closing_fill():
         "filled_at": "2026-08-12T19:45:05.43Z",
     }
     conn = FakeConn({})
-    calls = {"close_position": None, "insert_decision": None, "log_system_event": None}
+    calls = {"close_position": None, "insert_decision": None, "log_system_event": None,
+             "verify_post_fill_position": None}
 
     with mock.patch.object(engine, "alpaca_get", return_value=[closing_order]), \
          mock.patch.object(engine, "close_position",
@@ -86,10 +87,17 @@ def run_test_1_404_with_closing_fill():
          mock.patch.object(engine, "insert_decision",
                             side_effect=lambda *a: calls.__setitem__("insert_decision", a)), \
          mock.patch.object(engine, "log_system_event",
-                            side_effect=lambda *a, **k: calls.__setitem__("log_system_event", (a, k))):
+                            side_effect=lambda *a, **k: calls.__setitem__("log_system_event", (a, k))), \
+         mock.patch.object(engine, "verify_post_fill_position",
+                            side_effect=lambda *a: calls.__setitem__("verify_post_fill_position", a)):
         engine._reconcile_force_close_404(conn, "ticket-1", "pos-1", position, "SPY260812C00759000")
 
     assert calls["close_position"] is not None, "close_position was not called"
+    assert calls["verify_post_fill_position"] is not None, (
+        "verify_post_fill_position must run immediately after a reconciled close, "
+        "same as every other close path in the file"
+    )
+    assert calls["verify_post_fill_position"][1] == "SPY260812C00759000"
     args, kwargs = calls["close_position"]
     assert args[1] == "pos-1"
     assert args[2] == 13.76, f"expected real fill price 13.76, got {args[2]}"
