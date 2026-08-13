@@ -1046,7 +1046,26 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
             lambda: place_close_order(symbol, qty, "equity", client_order_id, side=close_side),
         )
         filled = poll_order_until_filled(order["id"])
-        fill_price = float(filled.get("filled_avg_price") or current_price)
+        fill_price_str = filled.get("filled_avg_price")
+        fill_status = filled.get("status", "")
+
+        if fill_status != "filled" or not fill_price_str:
+            # The close order never actually filled (e.g. canceled at the
+            # poll timeout with zero fill) — closing the ledger row anyway
+            # using current_price as a stand-in was exactly the bug behind
+            # the RIO incident: a fabricated exit on a position that was
+            # never really sold, silently opening a ledger/broker gap.
+            # Leave the row 'open' so this same monitor cycle picks it up
+            # again next run, instead of inventing a fill.
+            reason = (f"Equity close for {symbol} did not fill — "
+                     f"status={fill_status}, position left open for retry")
+            logger.warning("Ticket-less equity close %s: %s", position_id, reason)
+            log_system_event(conn, "WARNING", "execution_engine", reason,
+                             {"position_id": position_id, "exit_reason": exit_reason,
+                              "alpaca_order_id": order.get("id")})
+            return
+
+        fill_price = float(fill_price_str)
         slippage = abs(fill_price - current_price) / current_price if current_price > 0 else 0.0
         close_position(conn, position_id, fill_price, slippage, exit_reason)
         log_system_event(conn, "INFO", "execution_engine",
