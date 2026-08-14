@@ -1,0 +1,55 @@
+SHELL=/bin/bash
+TZ=UTC
+PATH=/usr/local/bin:/usr/bin:/bin
+NWT_DIR=/home/northworld/trading/nwt_agents
+
+# Server runs in UTC (confirmed via `timedatectl` — Etc/UTC).
+# All times below are literal UTC. No AEST conversion.
+
+# Conviction stack — 13:00-13:45 UTC Mon-Fri
+0 13 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 layer0_builder.py >> /var/log/nwt/layer0.log 2>&1
+15 13 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 prescreener.py >> /var/log/nwt/prescreener.log 2>&1
+30 13 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 conviction_engine.py >> /var/log/nwt/conviction.log 2>&1
+45 13 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 conviction_summary_writer.py >> /var/log/nwt/summary.log 2>&1
+
+# Track decisions — 14:00-14:30 UTC Mon-Fri
+0 14 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 track_c.py >> /var/log/nwt/track_c.log 2>&1
+0 14 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 track_d.py >> /var/log/nwt/track_d.log 2>&1
+30 14 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 track_e.py >> /var/log/nwt/track_e.log 2>&1
+
+# China bot — event-triggered (ADR liquidity confirmation post US open ~13:30 UTC).
+# strategist.py self-gates on check_adr_liquidity() and logs inactivity if not
+# confirmed yet, so polling every 30 min is safe. Window: 14:00-18:00 UTC Mon-Fri.
+0,30 14-18 * * 1-5 cd /home/northworld/trading/china && set -a && source .env && set +a && python3 strategist.py >> /var/log/nwt/china_strategist.log 2>&1
+5,35 14-18 * * 1-5 cd /home/northworld/trading/china && set -a && source .env && set +a && python3 executor.py >> /var/log/nwt/china_executor.log 2>&1
+
+# Risk agent every 5 min, 13:00-20:00 UTC Mon-Fri
+*/5 13-20 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 risk_agent.py >> /var/log/nwt/risk.log 2>&1
+
+# Execution agent every 5 min, 13:00-19:00 UTC Mon-Fri
+*/5 13-19 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 execution_agent.py >> /var/log/nwt/execution.log 2>&1
+
+# Execution engine every 5 min, 13:00-20:00 UTC Mon-Fri
+*/5 13-20 * * 1-5 cd /home/northworld/trading/execution && set -a && source .env && set +a && python3 engine.py >> /var/log/nwt/execution_engine.log 2>&1
+
+# Snapshot writer every 15 min, 13:00-20:00 UTC Mon-Fri
+*/15 13-20 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 snapshot_writer.py >> /var/log/nwt/snapshot.log 2>&1
+
+# Learning agent + cost agent — 21:00 UTC Mon-Fri
+0 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 learning_agent.py >> /var/log/nwt/learning.log 2>&1
+0 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 cost_agent.py >> /var/log/nwt/cost.log 2>&1
+
+# Session scorecard (green/red) — 21:15 UTC Mon-Fri, after learning agent
+15 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 session_scorecard.py >> /var/log/nwt/scorecard.log 2>&1
+
+# Morning triage digest — 21:30 UTC Mon-Fri, after the scorecard.
+# Read-only: classifies overnight errors benign vs escalate, dedups recurring
+# faults by signature, emits one digest (Postgres + notifier). No trade authority.
+30 21 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 triage_agent.py >> /var/log/nwt/triage.log 2>&1
+
+# Recon nightly — 23:00 UTC Mon-Fri (after learning agent, before next session)
+0 23 * * 1-5 cd $NWT_DIR && set -a && source .env && set +a && python3 recon_agent.py --nightly >> /var/log/nwt/recon.log 2>&1
+
+# DB backup — nightly 22:30 UTC, local dump + 7-day rotation
+# NOTE: offsite upload requires AWS CLI or rclone configured separately
+30 22 * * * mkdir -p /var/backups/nwt && set -a && source /home/northworld/trading/nwt_agents/.env && set +a && pg_dump "$NWT_DB_DSN" | gzip > /var/backups/nwt/nwt_$(date +\%Y\%m\%d_\%H\%M).sql.gz && find /var/backups/nwt/ -name "*.sql.gz" -mtime +7 -delete >> /var/log/nwt/backup.log 2>&1

@@ -1,0 +1,80 @@
+{
+  "built_at": "2026-08-13T13:00:18.554484+00:00",
+  "vix": 11.71,
+  "symbols": {
+    "SPY": {
+      "price": 772.49,
+      "momentum_5d": 0.0035,
+      "rsi_14": 61.71,
+      "atr_14": 8.4436,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    },
+    "QQQ": {
+      "price": 723.7,
+      "momentum_5d": 0.0089,
+      "rsi_14": 55.98,
+      "atr_14": 13.7524,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    },
+    "AAPL": {
+      "price": 302.25,
+      "momentum_5d": -0.0281,
+      "rsi_14": 31.87,
+      "atr_14": 9.4528,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    },
+    "TSLA": {
+      "price": 327.51,
+      "momentum_5d": 0.0185,
+      "rsi_14": 31.58,
+      "atr_14": 10.9703,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    },
+    "NVDA": {
+      "price": 224.09,
+      "momentum_5d": 0.0222,
+      "rsi_14": 60.48,
+      "atr_14": 7.8344,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    },
+    "VGK": {
+      "price": 92.25,
+      "momentum_5d": 0.0044,
+      "rsi_14": 66.17,
+      "atr_14": 0.9096,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    },
+    "FXI": {
+      "price": 35.23,
+      "momentum_5d": -0.0236,
+      "rsi_14": 52.33,
+      "atr_14": 0.473,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    },
+    "KWEB": {
+      "price": 27.54,
+      "momentum_5d": -0.035,
+      "rsi_14": 47.73,
+      "atr_14": 0.5329,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    },
+    "MCHI": {
+      "price": 55.08,
+      "momentum_5d": -0.0166,
+      "rsi_14": 52.21,
+      "atr_14": 0.6921,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    }
+  },
+  "put_call_ratio": 1.0,
+  "spy_iv_skew": 0.0
+}

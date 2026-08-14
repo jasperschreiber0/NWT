@@ -1,0 +1,147 @@
+[
+  {
+    "symbol": "SPY",
+    "strategy_type": "long_call",
+    "direction": "long",
+    "confidence": 0.62,
+    "conviction_score": 6,
+    "dte_target": 30,
+    "strike_preference": "ATM",
+    "entry_rationale": "Risk-on regime with moderate confidence (0.50) supports a bullish directional bias, but elevated transition risk (0.50) and secondary risk-off regime warrant a defined-risk spread structure rather than naked long calls. RSI at 61.7 indicates positive momentum without being overbought, and 5d momentum is mildly positive. VIX at 11.7 is historically low, making outright long options expensive on a volatility-adjusted basis; a bull call spread offsets long premium cost by selling the upper strike, reducing theta drag in a low-IV environment. ATR of 8.44 suggests moderate daily movement, supporting a spread width of approximately 10-15 points to capture expected directional move while capping cost. IV reported at 0.000 is likely a data anomaly, so conservative sizing is warranted pending IV confirmation.",
+    "regime_alignment": "aligned",
+    "signal_quality": {
+      "entry_timing_score": 0.62,
+      "thesis_validity": "Bullish thesis is moderately valid given risk-on regime, positive RSI trend, and mild upward momentum. However, the near-equal transition risk to risk-off and low VIX limit upside conviction. Spread structure mitigates premium risk while maintaining directional exposure.",
+      "expected_move_capture": 0.58
+    },
+    "override_note": "Strategy overridden: proposed=bull_call_spread \u2192 required=long_call (risk_on + IV<30 \u2192 long_call)",
+    "prescreener_score": 6,
+    "prescreener_direction": "long",
+    "iv_at_conviction": 0.0,
+    "vix_at_conviction": 11.71,
+    "regime_at_conviction": {
+      "primary_regime": "risk_on",
+      "confidence": 0.5,
+      "secondary_regime": "risk_off",
+      "transition_risk": 0.5
+    },
+    "created_at": "2026-08-13T13:30:14.256039+00:00",
+    "ticket_id": "d7af3385-2fd7-436a-8111-7c6285bacf88"
+  },
+  {
+    "symbol": "QQQ",
+    "strategy_type": "long_call",
+    "direction": "long",
+    "confidence": 0.58,
+    "conviction_score": 6,
+    "dte_target": 30,
+    "strike_preference": "ATM",
+    "entry_rationale": "Risk-on regime with moderate confidence (0.50) supports a bullish directional bias on QQQ. RSI at 56 indicates room to run without overbought conditions, and 5d momentum is mildly positive at 0.9%. VIX at 11.7 signals extremely low realized fear, making outright long calls expensive on a premium-efficiency basis despite reported IV of 0. A bull call spread caps upside premium outlay and reduces vega exposure in this low-vol environment, improving risk/reward. ATR of 13.75 (~1.9% of price) provides a reasonable spread width anchor. The secondary risk-off regime and high transition risk (0.50) temper conviction, warranting defined-risk structure over naked long calls. Spread width target: buy ATM ~724 strike, sell ~740 strike (approx 1 ATR above), financing the position meaningfully.",
+    "regime_alignment": "aligned",
+    "signal_quality": {
+      "entry_timing_score": 0.62,
+      "thesis_validity": "Mild bullish momentum with supportive macro regime, but transition risk at 0.50 and dual regime signals (risk_on/risk_off) reduce thesis strength. Low VIX confirms complacency but limits option cheapness advantage. Spread structure mitigates cost risk in flat-vol environment.",
+      "expected_move_capture": 0.55
+    },
+    "override_note": "Strategy overridden: proposed=bull_call_spread \u2192 required=long_call (risk_on + IV<30 \u2192 long_call)",
+    "prescreener_score": 7,
+    "prescreener_direction": "long",
+    "iv_at_conviction": 0.0,
+    "vix_at_conviction": 11.71,
+    "regime_at_conviction": {
+      "primary_regime": "risk_on",
+      "confidence": 0.5,
+      "secondary_regime": "risk_off",
+      "transition_risk": 0.5
+    },
+    "created_at": "2026-08-13T13:30:23.786279+00:00",
+    "ticket_id": "08c3f73d-0acc-4eb3-af01-2e6116e0141d"
+  },
+  {
+    "symbol": "TSLA",
+    "strategy_type": "long_call",
+    "direction": "long",
+    "confidence": 0.62,
+    "conviction_score": 6,
+    "dte_target": 30,
+    "strike_preference": "ATM",
+    "entry_rationale": "TSLA RSI at 31.6 signals oversold conditions with potential mean reversion bounce. Positive 5d momentum (0.018) suggests early stabilization despite recent weakness. Risk-on regime supports directional upside bias. VIX at 11.7 indicates low systemic fear, favorable for defined-risk debit spreads rather than naked longs. IV reported at zero is anomalous and likely a data gap, so bull call spread structure limits premium risk exposure. ATM long call paired with 1_OTM short call reduces net debit and theta drag while capturing expected mean reversion move from oversold RSI levels. ATR of 10.97 (~3.4% of price) supports a spread width of ~$10-15 to capture probable move without overextending.",
+    "regime_alignment": "aligned",
+    "signal_quality": {
+      "entry_timing_score": 0.68,
+      "thesis_validity": "RSI oversold bounce thesis is valid in risk-on environment with low VIX; momentum inflection supports near-term upside but conviction is tempered by uncertain IV data and moderate regime confidence of 0.50 with equal transition risk to risk-off",
+      "expected_move_capture": 0.6
+    },
+    "override_note": "Strategy overridden: proposed=bull_call_spread \u2192 required=long_call (risk_on + IV<30 \u2192 long_call)",
+    "prescreener_score": 6,
+    "prescreener_direction": "long",
+    "iv_at_conviction": 0.0,
+    "vix_at_conviction": 11.71,
+    "regime_at_conviction": {
+      "primary_regime": "risk_on",
+      "confidence": 0.5,
+      "secondary_regime": "risk_off",
+      "transition_risk": 0.5
+    },
+    "created_at": "2026-08-13T13:30:32.413994+00:00",
+    "ticket_id": "37fdeee5-ac97-42ba-8821-0c6f323dce75"
+  },
+  {
+    "symbol": "NVDA",
+    "strategy_type": "long_call",
+    "direction": "long",
+    "confidence": 0.65,
+    "conviction_score": 6,
+    "dte_target": 30,
+    "strike_preference": "1_OTM",
+    "entry_rationale": "NVDA shows positive 5d momentum (2.2%) with RSI at 60.5 indicating bullish trend without being overbought. Risk-on regime supports directional long exposure. VIX at 11.7 signals extremely low market fear, making outright long calls expensive on a relative basis despite IV data showing zero (likely data gap). Bull call spread is preferred over naked long call to reduce premium outlay in this low-vol environment while still capturing upside. Spread structure caps risk and improves breakeven in a low-IV regime where theta decay is a concern. ATR of 7.83 (~3.5% of price) suggests meaningful daily range supporting spread width of approximately 10-15 points. Regime confidence at 0.50 with transition risk at 0.50 warrants reduced position sizing and spread structure over uncapped risk plays.",
+    "regime_alignment": "aligned",
+    "signal_quality": {
+      "entry_timing_score": 0.65,
+      "thesis_validity": "Moderate-high. Bullish momentum and RSI confirm trend continuation bias. Low VIX environment historically favors equities in risk-on regimes but elevated transition risk (0.50) introduces uncertainty. No near-term earnings removes binary event risk. Spread structure mitigates cost drag in compressed IV environment.",
+      "expected_move_capture": 0.6
+    },
+    "override_note": "Strategy overridden: proposed=bull_call_spread \u2192 required=long_call (risk_on + IV<30 \u2192 long_call)",
+    "prescreener_score": 7,
+    "prescreener_direction": "long",
+    "iv_at_conviction": 0.0,
+    "vix_at_conviction": 11.71,
+    "regime_at_conviction": {
+      "primary_regime": "risk_on",
+      "confidence": 0.5,
+      "secondary_regime": "risk_off",
+      "transition_risk": 0.5
+    },
+    "created_at": "2026-08-13T13:30:45.198268+00:00",
+    "ticket_id": "acea5f51-6ce9-42fd-b1c9-329a2c62d718"
+  },
+  {
+    "symbol": "VGK",
+    "strategy_type": "long_call",
+    "direction": "long",
+    "confidence": 0.62,
+    "conviction_score": 6,
+    "dte_target": 45,
+    "strike_preference": "ATM",
+    "entry_rationale": "VGK shows mild bullish momentum (5d mom: 0.004) with RSI at 66.2 indicating upward trend without extreme overbought conditions. Risk-on regime supports European equity exposure. VIX at 11.7 reflects extremely low volatility environment, making outright long calls expensive on a relative basis despite near-zero reported IV suggesting illiquidity concerns. A bull call spread caps premium outlay while still capturing directional upside. ATR of 0.91 (~1% of price) implies limited daily movement, favoring defined-risk spread structure over naked long call. Spread width of approximately 2-3 ATR (~2.00-3.00) captures expected move efficiently. Regime confidence at 0.50 with transition risk at 0.50 warrants reduced position sizing and defined risk approach rather than uncapped directional exposure.",
+    "regime_alignment": "aligned",
+    "signal_quality": {
+      "entry_timing_score": 0.62,
+      "thesis_validity": "Bullish thesis supported by risk-on regime and positive price momentum, but weakened by low regime confidence (0.50) and high transition risk (0.50) to risk-off secondary regime. RSI near 66 leaves moderate upside room before overbought territory. Zero reported IV raises liquidity concerns for options execution and accurate premium assessment. Spread structure mitigates premium risk in low-vol environment.",
+      "expected_move_capture": 0.58
+    },
+    "override_note": "Strategy overridden: proposed=bull_call_spread \u2192 required=long_call (risk_on + IV<30 \u2192 long_call)",
+    "prescreener_score": 5,
+    "prescreener_direction": "long",
+    "iv_at_conviction": 0.0,
+    "vix_at_conviction": 11.71,
+    "regime_at_conviction": {
+      "primary_regime": "risk_on",
+      "confidence": 0.5,
+      "secondary_regime": "risk_off",
+      "transition_risk": 0.5
+    },
+    "created_at": "2026-08-13T13:30:55.400562+00:00",
+    "ticket_id": "36c32498-e7e7-42b8-9547-bbf65819d93c"
+  }
+]

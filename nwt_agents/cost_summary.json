@@ -1,0 +1,42 @@
+{
+  "generated_at": "2026-08-13T21:00:01.610335+00:00",
+  "date": "2026-08-13",
+  "today": {
+    "tokens": {
+      "haiku_in": 667,
+      "haiku_out": 789,
+      "sonnet_in": 1928,
+      "sonnet_out": 2046
+    },
+    "estimated_cost_usd": {
+      "haiku_cost_usd": 0.00369,
+      "sonnet_cost_usd": 0.036474,
+      "total_cost_usd": 0.040164
+    },
+    "trades_closed": 0,
+    "pnl_today": 0,
+    "cost_per_trade_usd": null,
+    "risk_approved": 1,
+    "risk_vetoed": 0,
+    "inactivity_tickets": 35
+  },
+  "cumulative": {
+    "tokens": {
+      "haiku_in": 41568,
+      "haiku_out": 46495,
+      "sonnet_in": 87127,
+      "sonnet_out": 89259
+    },
+    "estimated_cost_usd": {
+      "haiku_cost_usd": 0.219234,
+      "sonnet_cost_usd": 1.600266,
+      "total_cost_usd": 1.8195
+    }
+  },
+  "cost_rates": {
+    "haiku_input_per_m": 0.8,
+    "haiku_output_per_m": 4.0,
+    "sonnet_input_per_m": 3.0,
+    "sonnet_output_per_m": 15.0
+  }
+}

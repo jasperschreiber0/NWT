@@ -1,0 +1,69 @@
+{
+  "generated_at": "2026-08-13T10:30:00.898544+00:00",
+  "date": "2026-08-13",
+  "bot": "us",
+  "scan_type": "nightly_pre_screener",
+  "isolation_confirmed": "price+volume+options_flow only",
+  "symbols": [
+    {
+      "symbol": "SPY",
+      "last_close": 772.54,
+      "rsi_14": 68.09,
+      "iv_proxy_annualised": 0.137,
+      "momentum_ema_positive": true,
+      "volume_ratio_vs_avg": 0.685,
+      "price_vs_20d_mean_pct": 2.482,
+      "next_session_interest_score": 3,
+      "note": "Moderate interest",
+      "status": "ok"
+    },
+    {
+      "symbol": "QQQ",
+      "last_close": 723.61,
+      "rsi_14": 59.4,
+      "iv_proxy_annualised": 0.2466,
+      "momentum_ema_positive": true,
+      "volume_ratio_vs_avg": 0.598,
+      "price_vs_20d_mean_pct": 3.225,
+      "next_session_interest_score": 2,
+      "note": "Moderate interest",
+      "status": "ok"
+    },
+    {
+      "symbol": "AAPL",
+      "last_close": 302.2,
+      "rsi_14": 34.63,
+      "iv_proxy_annualised": 0.3555,
+      "momentum_ema_positive": false,
+      "volume_ratio_vs_avg": 0.916,
+      "price_vs_20d_mean_pct": -5.504,
+      "next_session_interest_score": 3,
+      "note": "Moderate interest",
+      "status": "ok"
+    },
+    {
+      "symbol": "TSLA",
+      "last_close": 327.46,
+      "rsi_14": 35.38,
+      "iv_proxy_annualised": 0.6721,
+      "momentum_ema_positive": false,
+      "volume_ratio_vs_avg": 0.548,
+      "price_vs_20d_mean_pct": -0.096,
+      "next_session_interest_score": 1,
+      "note": "Low interest",
+      "status": "ok"
+    },
+    {
+      "symbol": "NVDA",
+      "last_close": 224.11,
+      "rsi_14": 63.45,
+      "iv_proxy_annualised": 0.4049,
+      "momentum_ema_positive": true,
+      "volume_ratio_vs_avg": 0.799,
+      "price_vs_20d_mean_pct": 7.356,
+      "next_session_interest_score": 3,
+      "note": "Moderate interest",
+      "status": "ok"
+    }
+  ]
+}

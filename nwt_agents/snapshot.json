@@ -1,0 +1,162 @@
+{
+  "snapshot_at": "2026-08-13T20:45:01.855985+00:00",
+  "open_positions": 18,
+  "pending_proposals": 0,
+  "approved_awaiting_execution": 0,
+  "vetoed_today": 0,
+  "executed_today": 1,
+  "regime": {
+    "primary_regime": "risk_on",
+    "confidence": 0.5,
+    "secondary_regime": "risk_off",
+    "transition_risk": 0.5
+  },
+  "global_kill_switch": false,
+  "risk_agent_last_run": "2026-08-14T06:40:01.319317+10:00",
+  "positions": [
+    {
+      "bot_source": "EU_BOT",
+      "asset": "FEZ",
+      "asset_type": "equity",
+      "direction": "short",
+      "notional_risk": 2231.76,
+      "entry_time": "2026-08-11T23:34:45.164880+10:00"
+    },
+    {
+      "bot_source": "EU_BOT",
+      "asset": "VGK",
+      "asset_type": "equity",
+      "direction": "short",
+      "notional_risk": 2127.82,
+      "entry_time": "2026-08-11T23:34:27.915853+10:00"
+    },
+    {
+      "bot_source": "EU_BOT",
+      "asset": "FEZ",
+      "asset_type": "equity",
+      "direction": "short",
+      "notional_risk": 574.16,
+      "entry_time": "2026-08-10T23:36:16.038606+10:00"
+    },
+    {
+      "bot_source": "NWT_TRACK_D",
+      "asset": "NVDA260828C00220000",
+      "asset_type": "option",
+      "direction": "long",
+      "notional_risk": 1050.0,
+      "entry_time": "2026-08-08T00:10:08.883446+10:00"
+    },
+    {
+      "bot_source": "NWT_TRACK_D",
+      "asset": "SPY260828C00751000",
+      "asset_type": "option",
+      "direction": "long",
+      "notional_risk": 2437.0,
+      "entry_time": "2026-08-08T00:10:07.408186+10:00"
+    },
+    {
+      "bot_source": "EU_BOT",
+      "asset": "FEZ",
+      "asset_type": "equity",
+      "direction": "short",
+      "notional_risk": 2446.070024,
+      "entry_time": "2026-08-07T23:36:19.029549+10:00"
+    },
+    {
+      "bot_source": "EU_BOT",
+      "asset": "FEZ",
+      "asset_type": "equity",
+      "direction": "short",
+      "notional_risk": 2517.9,
+      "entry_time": "2026-08-07T23:35:53.684363+10:00"
+    },
+    {
+      "bot_source": "EU_BOT",
+      "asset": "VGK",
+      "asset_type": "equity",
+      "direction": "short",
+      "notional_risk": 1205.23,
+      "entry_time": "2026-08-07T23:34:56.931134+10:00"
+    },
+    {
+      "bot_source": "NWT_TRACK_D",
+      "asset": "NVDA260828C00220000",
+      "asset_type": "option",
+      "direction": "long",
+      "notional_risk": 1100.0,
+      "entry_time": "2026-08-07T00:10:07.603321+10:00"
+    },
+    {
+      "bot_source": "NWT_TRACK_D",
+      "asset": "TSLA260828C00320000",
+      "asset_type": "option",
+      "direction": "long",
+      "notional_risk": 1405.0,
+      "entry_time": "2026-08-07T00:10:06.123174+10:00"
+    },
+    {
+      "bot_source": "EU_BOT",
+      "asset": "FEZ",
+      "asset_type": "equity",
+      "direction": "short",
+      "notional_risk": 2928.2200000000003,
+      "entry_time": "2026-08-06T23:35:31.271155+10:00"
+    },
+    {
+      "bot_source": "EU_BOT",
+      "asset": "FEZ",
+      "asset_type": "equity",
+      "direction": "short",
+      "notional_risk": 2928.63,
+      "entry_time": "2026-08-06T23:35:14.963619+10:00"
+    },
+    {
+      "bot_source": "EU_BOT",
+      "asset": "VGK",
+      "asset_type": "equity",
+      "direction": "short",
+      "notional_risk": 2304.09,
+      "entry_time": "2026-08-06T23:34:58.513721+10:00"
+    },
+    {
+      "bot_source": "NWT_TRACK_D",
+      "asset": "NVDA260828C00220000",
+      "asset_type": "option",
+      "direction": "long",
+      "notional_risk": 1145.0,
+      "entry_time": "2026-08-06T00:10:04.617201+10:00"
+    },
+    {
+      "bot_source": "NWT_TRACK_D",
+      "asset": "SPY260828C00751000",
+      "asset_type": "option",
+      "direction": "long",
+      "notional_risk": 3083.0,
+      "entry_time": "2026-08-06T00:05:04.634791+10:00"
+    },
+    {
+      "bot_source": "EU_BOT",
+      "asset": "FEZ",
+      "asset_type": "equity",
+      "direction": "short",
+      "notional_risk": 571.44,
+      "entry_time": "2026-08-05T23:36:16.867075+10:00"
+    },
+    {
+      "bot_source": "EU_BOT",
+      "asset": "VGK",
+      "asset_type": "equity",
+      "direction": "short",
+      "notional_risk": 3408.07,
+      "entry_time": "2026-08-05T23:34:33.937905+10:00"
+    },
+    {
+      "bot_source": "UNATTRIBUTED",
+      "asset": "AAPL",
+      "asset_type": "equity",
+      "direction": "long",
+      "notional_risk": 90805.0,
+      "entry_time": "2026-07-22T14:24:08.871711+10:00"
+    }
+  ]
+}

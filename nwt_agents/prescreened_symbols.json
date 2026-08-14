@@ -1,0 +1,77 @@
+[
+  {
+    "symbol": "SPY",
+    "score": 6,
+    "direction": "long",
+    "primary_signal": "risk_on regime alignment with moderate momentum and elevated RSI near overbought; low IV provides cheap premium for defined-risk strategies",
+    "skip_reason": null,
+    "layer0": {
+      "price": 772.49,
+      "momentum_5d": 0.0035,
+      "rsi_14": 61.71,
+      "atr_14": 8.4436,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    }
+  },
+  {
+    "symbol": "QQQ",
+    "score": 7,
+    "direction": "long",
+    "primary_signal": "strongest momentum (0.009) in tech sector with risk_on regime; RSI mid-range supports trend continuation; elevated ATR provides strategy flexibility",
+    "skip_reason": null,
+    "layer0": {
+      "price": 723.7,
+      "momentum_5d": 0.0089,
+      "rsi_14": 55.98,
+      "atr_14": 13.7524,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    }
+  },
+  {
+    "symbol": "TSLA",
+    "score": 6,
+    "direction": "long",
+    "primary_signal": "positive momentum (0.018) with oversold RSI (31.6) suggests mean reversion opportunity; risk_on regime supports upside",
+    "skip_reason": null,
+    "layer0": {
+      "price": 327.51,
+      "momentum_5d": 0.0185,
+      "rsi_14": 31.58,
+      "atr_14": 10.9703,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    }
+  },
+  {
+    "symbol": "NVDA",
+    "score": 7,
+    "direction": "long",
+    "primary_signal": "strongest momentum (0.022) combined with elevated RSI (60.5) in risk_on regime; tight ATR suggests controlled volatility environment",
+    "skip_reason": null,
+    "layer0": {
+      "price": 224.09,
+      "momentum_5d": 0.0222,
+      "rsi_14": 60.48,
+      "atr_14": 7.8344,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    }
+  },
+  {
+    "symbol": "VGK",
+    "score": 5,
+    "direction": "long",
+    "primary_signal": "overbought RSI (66.2) with positive momentum in risk_on regime; European equity exposure aligns with secondary risk_off concerns",
+    "skip_reason": null,
+    "layer0": {
+      "price": 92.25,
+      "momentum_5d": 0.0044,
+      "rsi_14": 66.17,
+      "atr_14": 0.9096,
+      "iv": 0.0,
+      "earnings_within_5d": false
+    }
+  }
+]
