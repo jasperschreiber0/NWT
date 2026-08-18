@@ -127,19 +127,34 @@ def load_master_directives() -> dict:
         return json.load(f)
 
 
+def _previous_trading_day(d):
+    """
+    Walk back from `d` to the last Mon-Fri day — master-strategist only
+    runs weekdays (PM2 cron_restart '30 21 * * 1-5'), so the file in force
+    on a Monday is Friday's, not a plain calendar "yesterday". A single
+    calendar-day-back rule is only correct Tue-Fri; on Monday it lands on
+    Sunday, which never has a directives write, making every Monday look
+    stale even when Friday's file is exactly the expected one.
+    """
+    prev = d - timedelta(days=1)
+    while prev.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        prev -= timedelta(days=1)
+    return prev
+
+
 def directives_is_stale(directives: dict, now_utc: datetime = None) -> tuple:
     """
-    P0-5: master-strategist fires 21:30 UTC (after US close) and stamps
-    master-directives.json with THAT day's date — so the file in force for
-    the next session is always dated "yesterday" relative to a same-day
-    check made before the next 21:30 UTC run. This mirrors
-    session_scorecard.py's check_directives_fresh() acceptance window
-    exactly (today's date, or yesterday's) so the two checks never disagree
-    about what "fresh" means.
+    P0-5: master-strategist fires 21:30 UTC (after US close, weekdays only)
+    and stamps master-directives.json with THAT day's date — so the file in
+    force for the next session is dated the *previous trading day*, not
+    simply "yesterday" (which on a Monday is Sunday — a day nothing ever
+    writes). This mirrors session_scorecard.py's check_directives_fresh()
+    acceptance window (today's date, or the last trading day's) so the two
+    checks never disagree about what "fresh" means.
 
     Only the presence of a plausible "date" field is checked here — if
     master/strategist.py crashes before write_directives() runs, the file on
-    disk is simply yesterday's (or older), and until this check existed
+    disk is simply older than expected, and until this check existed
     nothing caught that at trade time: every consumer re-checked
     global_kill_switch fresh but silently traded all day against a stale
     regime/bot_permissions snapshot. global_kill_switch behaviour itself is
@@ -152,12 +167,12 @@ def directives_is_stale(directives: dict, now_utc: datetime = None) -> tuple:
     d = directives.get("date")
     if not d:
         return True, "master-directives.json has no 'date' field — treating as stale"
-    expected_yesterday = (today - timedelta(days=1)).isoformat()
+    expected_previous_trading_day = _previous_trading_day(today).isoformat()
     expected_today = today.isoformat()
-    if d not in (expected_yesterday, expected_today):
+    if d not in (expected_previous_trading_day, expected_today):
         return True, (
             f"master-directives.json is stale (date={d}, expected "
-            f"{expected_yesterday} or {expected_today})"
+            f"{expected_previous_trading_day} or {expected_today})"
         )
     return False, ""
 

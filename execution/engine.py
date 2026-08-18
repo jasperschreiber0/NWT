@@ -164,16 +164,31 @@ def load_master_directives() -> dict:
         return json.load(f)
 
 
+def _previous_trading_day(d):
+    """
+    Walk back from `d` to the last Mon-Fri day — master-strategist only
+    runs weekdays (PM2 cron_restart '30 21 * * 1-5'), so the file in force
+    on a Monday is Friday's, not a plain calendar "yesterday". A single
+    calendar-day-back rule is only correct Tue-Fri; on Monday it lands on
+    Sunday, which never has a directives write, making every Monday look
+    stale even when Friday's file is exactly the expected one.
+    """
+    prev = d - timedelta(days=1)
+    while prev.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        prev -= timedelta(days=1)
+    return prev
+
+
 def directives_is_stale(directives: dict, now_utc: datetime = None) -> tuple:
     """
-    P0-5: master-strategist fires 21:30 UTC and stamps master-directives.json
-    with THAT day's date, so the file in force for the next session is always
-    dated "yesterday" relative to a same-day check made before the next
-    21:30 UTC run — accept today's date or yesterday's, never anything
-    older. global_kill_switch is still re-read fresh separately below; this
-    is an additional, independent veto for the case where the whole file
-    (regime, bot_permissions) is stale because master/strategist.py crashed
-    before writing today's update.
+    P0-5: master-strategist fires 21:30 UTC (weekdays only) and stamps
+    master-directives.json with THAT day's date, so the file in force for
+    the next session is dated the *previous trading day* — accept today's
+    date or the last trading day's, never anything older. global_kill_switch
+    is still re-read fresh separately below; this is an additional,
+    independent veto for the case where the whole file (regime,
+    bot_permissions) is stale because master/strategist.py crashed before
+    writing today's update.
 
     Identical to nwt_agents/shared_context.py's directives_is_stale —
     duplicated here for the same reason load_master_directives above is a
@@ -186,12 +201,12 @@ def directives_is_stale(directives: dict, now_utc: datetime = None) -> tuple:
     d = directives.get("date")
     if not d:
         return True, "master-directives.json has no 'date' field — treating as stale"
-    expected_yesterday = (today - timedelta(days=1)).isoformat()
+    expected_previous_trading_day = _previous_trading_day(today).isoformat()
     expected_today = today.isoformat()
-    if d not in (expected_yesterday, expected_today):
+    if d not in (expected_previous_trading_day, expected_today):
         return True, (
             f"master-directives.json is stale (date={d}, expected "
-            f"{expected_yesterday} or {expected_today})"
+            f"{expected_previous_trading_day} or {expected_today})"
         )
     return False, ""
 

@@ -49,7 +49,7 @@ def _fetch_bot_trades(conn, bot_key: str, limit: int = LOOKBACK_TRADES) -> list:
             SELECT COALESCE(to_.pnl_adjusted, to_.pnl) AS pnl,
                    to_.regime_at_entry->>'primary_regime' AS primary_regime
             FROM nwt_trade_outcomes to_
-            JOIN nwt_portfolio_ledger pl ON pl.position_id::text = to_.position_id
+            JOIN nwt_portfolio_ledger pl ON pl.position_id = to_.position_id
             WHERE pl.bot_source = %s AND to_.closed_at IS NOT NULL
               AND COALESCE(to_.pnl_adjusted, to_.pnl) IS NOT NULL
             ORDER BY to_.closed_at DESC
@@ -119,6 +119,18 @@ def compute_dynamic_weights(
             logger.warning("Allocator: score computation failed for %s: %s", bot, exc)
             scores[bot] = {"bot": bot, "sample": 0, "total_sample": 0,
                            "expectancy": None, "sharpe_proxy": None, "basis": "error"}
+            # A failed query leaves Postgres in an aborted-transaction state
+            # ("current transaction is aborted, commands ignored until end
+            # of transaction block") until explicitly rolled back — without
+            # this, every subsequent bot's query, this function's own
+            # nwt_allocator_history write, AND the caller's unrelated
+            # nwt_system_log write all fail too, on this same connection.
+            # One bot's scoring failure must not cascade into the rest of
+            # the run being unable to write anything at all.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
 
     tiltable = {b: s for b, s in scores.items()
                 if s["total_sample"] >= MIN_SAMPLE_FOR_TILT and s["expectancy"] is not None}
@@ -186,3 +198,10 @@ def _record_history(conn, scores: dict, baseline_weights: dict, dynamic_weights:
         conn.commit()
     except Exception as exc:
         logger.warning("Allocator: failed to write nwt_allocator_history: %s", exc)
+        # Same principle as the per-bot scoring loop above: don't leave the
+        # connection aborted for whatever the caller does next (e.g.
+        # strategist.py's own nwt_system_log write).
+        try:
+            conn.rollback()
+        except Exception:
+            pass
