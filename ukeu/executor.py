@@ -151,6 +151,14 @@ def main() -> None:
                 "strategy_id": candidate["strategy_id"],
                 "signal_quality": candidate.get("signal_quality", {}),
                 "expected_payoff": candidate.get("expected_payoff", {}),
+                # Top-level, not just nested in expected_payoff — execution
+                # engine's equity position monitor reads stop_pct/target_pct
+                # off the ticket payload directly (insert_position, and its
+                # own preference over genome/hardcoded defaults). Leaving
+                # these only nested meant the strategist's actual per-signal
+                # exit levels were silently discarded at fill time.
+                "stop_pct": candidate.get("expected_payoff", {}).get("stop_pct"),
+                "target_pct": candidate.get("expected_payoff", {}).get("target_pct"),
                 "rationale": candidate.get("rationale", ""),
                 "generated_at": candidate.get("generated_at"),
                 # Sizing fields (added by executor)
