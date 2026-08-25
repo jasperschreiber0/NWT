@@ -109,6 +109,23 @@ def _entry_cutoff_utc(now: datetime = None) -> datetime:
     return cutoff.astimezone(timezone.utc)
 
 
+def _is_options_market_hours(now: datetime = None) -> bool:
+    """
+    Alpaca only accepts option market orders during the regular equity
+    session, 9:30-16:00 ET — it 422s ("options market orders are only
+    allowed during market hours") outside that window. The 13:00 UTC cron
+    tick fires 30 min before 9:30 ET open (13:30 UTC in EDT), so any
+    stop/target hit computed off a stale pre-market quote at that first
+    tick was hitting this every day. Callers must defer (skip without
+    inserting a decision) rather than fail, so the ticket is retried once
+    the market actually opens instead of dying as a terminal FAILED.
+    """
+    et_now = (now or datetime.now(timezone.utc)).astimezone(ET_TZ)
+    open_t = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_t = et_now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_t <= et_now < close_t
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -699,6 +716,10 @@ def process_close_ticket(conn, ticket: dict) -> None:
     asset_type = payload.get("asset_type", "option")
     qty = int(payload.get("qty", 1))
 
+    if asset_type == "option" and not _is_options_market_hours():
+        logger.info("Ticket %s: options market closed — deferring close to next cycle", ticket_id)
+        return
+
     pos_direction = payload.get("direction", "long")
     if position_id:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -773,6 +794,10 @@ def process_force_close(conn, ticket: dict) -> None:
 
     asset = position.get("asset") or asset
     asset_type = position.get("asset_type", "option")
+
+    if asset_type == "option" and not _is_options_market_hours():
+        logger.info("Ticket %s: options market closed — deferring FORCE_CLOSE to next cycle", ticket_id)
+        return
 
     exit_bid, exit_ask = get_latest_quote(asset, asset_type)
     expected_price = (exit_bid + exit_ask) / 2.0 if (exit_bid and exit_ask) else None
@@ -936,6 +961,10 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     legs = payload.get("legs") or []
     expected_price = None
     entry_bid = entry_ask = None
+
+    if asset_type == "option" and not _is_options_market_hours():
+        logger.info("Ticket %s: options market closed — deferring to next cycle", ticket_id)
+        return
 
     try:
         if asset_type == "equity":
