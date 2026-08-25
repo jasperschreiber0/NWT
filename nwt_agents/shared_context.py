@@ -74,6 +74,27 @@ def get_db() -> psycopg2.extensions.connection:
     return psycopg2.connect(os.environ["NWT_DB_DSN"])
 
 
+def try_acquire_singleton_lock(conn, lock_name: str) -> bool:
+    """
+    P0-2: prevent two instances of the same cron-scheduled script (e.g. a
+    slow run overlapping the next 5-minute firing) from processing the same
+    tickets/positions concurrently.
+
+    Uses a Postgres SESSION-level advisory lock, held for the lifetime of
+    `conn`. No new table, no lockfile: if this process is killed outright
+    (OOM, host reboot, SIGKILL), Postgres detects the dropped backend
+    connection and releases the lock automatically — there is no stale-lock
+    state to clean up by hand, unlike a filesystem lockfile.
+
+    Returns True if the lock was acquired (caller should proceed) or False
+    if another instance already holds it (caller should log and exit
+    cleanly without doing any work this cycle).
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(hashtext(%s)::bigint)", (lock_name,))
+        return bool(cur.fetchone()[0])
+
+
 # ---------------------------------------------------------------------------
 # File loaders
 # ---------------------------------------------------------------------------
@@ -104,6 +125,56 @@ def load_master_directives() -> dict:
             path.write_text(example.read_text())
     with open(path) as f:
         return json.load(f)
+
+
+def _previous_trading_day(d):
+    """
+    Walk back from `d` to the last Mon-Fri day — master-strategist only
+    runs weekdays (PM2 cron_restart '30 21 * * 1-5'), so the file in force
+    on a Monday is Friday's, not a plain calendar "yesterday". A single
+    calendar-day-back rule is only correct Tue-Fri; on Monday it lands on
+    Sunday, which never has a directives write, making every Monday look
+    stale even when Friday's file is exactly the expected one.
+    """
+    prev = d - timedelta(days=1)
+    while prev.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        prev -= timedelta(days=1)
+    return prev
+
+
+def directives_is_stale(directives: dict, now_utc: datetime = None) -> tuple:
+    """
+    P0-5: master-strategist fires 21:30 UTC (after US close, weekdays only)
+    and stamps master-directives.json with THAT day's date — so the file in
+    force for the next session is dated the *previous trading day*, not
+    simply "yesterday" (which on a Monday is Sunday — a day nothing ever
+    writes). This mirrors session_scorecard.py's check_directives_fresh()
+    acceptance window (today's date, or the last trading day's) so the two
+    checks never disagree about what "fresh" means.
+
+    Only the presence of a plausible "date" field is checked here — if
+    master/strategist.py crashes before write_directives() runs, the file on
+    disk is simply older than expected, and until this check existed
+    nothing caught that at trade time: every consumer re-checked
+    global_kill_switch fresh but silently traded all day against a stale
+    regime/bot_permissions snapshot. global_kill_switch behaviour itself is
+    unchanged — this is an additional, independent veto.
+
+    Returns (is_stale: bool, reason: str). reason is empty when not stale.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    today = now_utc.date()
+    d = directives.get("date")
+    if not d:
+        return True, "master-directives.json has no 'date' field — treating as stale"
+    expected_previous_trading_day = _previous_trading_day(today).isoformat()
+    expected_today = today.isoformat()
+    if d not in (expected_previous_trading_day, expected_today):
+        return True, (
+            f"master-directives.json is stale (date={d}, expected "
+            f"{expected_previous_trading_day} or {expected_today})"
+        )
+    return False, ""
 
 
 def load_conviction_tickets() -> list:
@@ -404,14 +475,19 @@ def pre_trade_veto(conn, track: str) -> tuple:
     """
     Final synchronous gate before submitting an order for a NEW position.
     Re-reads master-directives.json fresh (kill switch may have been activated
-    since this process started) and re-checks track cooling-off and the
-    new-entry cutoff. Returns (vetoed: bool, reason: str).
+    since this process started), verifies it's actually from the current
+    trading day (P0-5 — see directives_is_stale), and re-checks track
+    cooling-off and the new-entry cutoff. Returns (vetoed: bool, reason: str).
     Closes/liquidations must NOT go through this gate.
     """
     try:
         directives = load_master_directives()
     except FileNotFoundError:
         return True, "pre_trade_veto: master-directives.json missing — NO-TRADE MODE"
+
+    stale, stale_reason = directives_is_stale(directives)
+    if stale:
+        return True, f"pre_trade_veto: {stale_reason}"
 
     if directives.get("global_kill_switch", False):
         return True, "pre_trade_veto: global kill switch active"
@@ -444,6 +520,7 @@ _INACTIVITY_CLASS_MAP = {
     "NO_TRADE_MODE": "regime_skip",
     "REGIME_MISMATCH": "regime_skip",
     "ARCHETYPE_CONSOLIDATED": "no_edge",
+    "STALE_DIRECTIVES": "regime_skip",
 }
 
 

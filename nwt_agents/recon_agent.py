@@ -13,9 +13,14 @@ Logic:
   3. Match on symbol + side.
   4. Classify mismatches:
      - in_alpaca_not_ledger → CRITICAL: set no_trade_mode, exit 1
+     - side_mismatch        → CRITICAL: set no_trade_mode, exit 1
+                               (symbol exists on both sides but the ledger's
+                               direction disagrees with Alpaca's — checked for
+                               every asset type)
      - qty_mismatch         → CRITICAL: set no_trade_mode, exit 1
-                               (options only — compares Alpaca qty against the
-                               SUM of real filled qty per ledger row, not row count)
+                               (equities and options — compares Alpaca qty
+                               against the SUM of real filled qty per ledger
+                               row, not row count)
      - in_ledger_not_alpaca → mark suspect, non-critical, exit 1
 
 Clean recon writes type='recon_ok'. Absence of recon is itself detectable.
@@ -125,6 +130,25 @@ def run_recon(conn, mode: str) -> bool:
             mismatches.append(entry)
             critical = True
 
+    # 1b: Side/direction mismatch → CRITICAL. Symbol presence alone (block 1)
+    # does not prove the ledger and the broker agree about WHAT is held —
+    # a symbol can exist on both sides while one thinks it's long and the
+    # other thinks it's short (e.g. a crash-and-retry that flipped a fill,
+    # or a bug in ledger_direction derivation at order time). Ledger rows
+    # for one symbol are expected to agree on direction; the first row's
+    # direction is used the same way block 3 already uses the first row's
+    # asset_type.
+    for sym in set(alpaca_map) & set(ledger_map):
+        apos = alpaca_map[sym]
+        ledger_direction = ledger_map[sym][0].get("direction")
+        if ledger_direction and ledger_direction != apos["side"]:
+            entry = {"class": "side_mismatch", "symbol": sym,
+                     "alpaca_side": apos["side"], "ledger_direction": ledger_direction}
+            logger.error("CRITICAL side mismatch: %s alpaca=%s ledger=%s",
+                        sym, apos["side"], ledger_direction)
+            mismatches.append(entry)
+            critical = True
+
     # 2: In ledger but not in Alpaca → mark suspect (non-critical)
     for sym, rows in ledger_map.items():
         if sym not in alpaca_map:
@@ -139,15 +163,16 @@ def run_recon(conn, mode: str) -> bool:
                     )
                 conn.commit()
 
-    # 3: Qty mismatch → CRITICAL
-    # Compares Alpaca's live qty against the SUM of real filled qty recorded
-    # per ledger row (nwt_portfolio_ledger.qty, populated from the Alpaca fill
-    # at order time) — not row count. A single order can fill more than one
-    # contract, so "1 row = 1 contract" does not hold.
+    # 3: Qty mismatch → CRITICAL. Checked for both equities and options —
+    # this used to skip equities entirely ("options only"), which meant a
+    # quantity discrepancy on an equity position (partial-fill accounting
+    # bug, etc.) was invisible to recon as long as the symbol still existed
+    # on both sides. Compares Alpaca's live qty against the SUM of real
+    # filled qty recorded per ledger row (nwt_portfolio_ledger.qty,
+    # populated from the Alpaca fill at order time) — not row count. A
+    # single order can fill more than one contract/share, so "1 row = 1
+    # unit" does not hold for either asset type.
     for sym in set(alpaca_map) & set(ledger_map):
-        asset_type = ledger_map[sym][0].get("asset_type", "equity")
-        if asset_type != "option":
-            continue
         alpaca_qty = alpaca_map[sym]["qty"]
         ledger_qty = sum(float(row.get("qty") or 0) for row in ledger_map[sym])
         if abs(alpaca_qty - ledger_qty) > 0.5:

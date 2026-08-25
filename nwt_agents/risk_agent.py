@@ -34,6 +34,7 @@ from shared_context import (
     log_system_event,
     option_dte,
     set_no_trade_mode,
+    try_acquire_singleton_lock,
 )
 
 logging.basicConfig(
@@ -626,6 +627,15 @@ def force_close_past_hard_close(conn, positions: list) -> None:
 
 def main() -> None:
     conn = get_db()
+
+    # P0-2: refuse to run a second cycle concurrently with one already in
+    # progress (e.g. a slow prior run still going when the next 5-minute
+    # cron firing starts). Released automatically if this process crashes.
+    if not try_acquire_singleton_lock(conn, "risk_agent"):
+        logger.warning("risk_agent: another instance already holds the lock — skipping this cycle")
+        conn.close()
+        return
+
     try:
         halted, halt_reason = check_no_trade_mode(conn)
         if halted:

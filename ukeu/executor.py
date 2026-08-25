@@ -4,7 +4,8 @@ Reads eu-candidates.json, computes sizing from directives, writes trade
 requests to nwt_tickets. Does NOT place orders — that is the Execution Engine's role.
 
 Capital base: $20,000 allocated to EU bot.
-time_in_force: 'gtc' (EU instruments, multi-day holds).
+time_in_force: 'gtc' for longs (EU instruments, multi-day holds); 'day' for
+shorts — Alpaca rejects GTC short-sale orders on hard-to-borrow assets.
 """
 
 import json
@@ -150,6 +151,14 @@ def main() -> None:
                 "strategy_id": candidate["strategy_id"],
                 "signal_quality": candidate.get("signal_quality", {}),
                 "expected_payoff": candidate.get("expected_payoff", {}),
+                # Top-level, not just nested in expected_payoff — execution
+                # engine's equity position monitor reads stop_pct/target_pct
+                # off the ticket payload directly (insert_position, and its
+                # own preference over genome/hardcoded defaults). Leaving
+                # these only nested meant the strategist's actual per-signal
+                # exit levels were silently discarded at fill time.
+                "stop_pct": candidate.get("expected_payoff", {}).get("stop_pct"),
+                "target_pct": candidate.get("expected_payoff", {}).get("target_pct"),
                 "rationale": candidate.get("rationale", ""),
                 "generated_at": candidate.get("generated_at"),
                 # Sizing fields (added by executor)
@@ -158,7 +167,11 @@ def main() -> None:
                 "sized_notional": sized_notional,
                 "capital_weight": capital_weight,
                 "size_cap": size_cap,
-                "time_in_force": "gtc",  # EU: multi-day, GTC required
+                # EU: multi-day GTC for longs. Short sales use day-only TIF —
+                # Alpaca rejects GTC short orders on hard-to-borrow assets
+                # (422 "only day orders are allowed for hard-to-borrow asset"),
+                # a broker-side rule that applies to any HTB short, not just EWU.
+                "time_in_force": "day" if candidate["direction"] == "short" else "gtc",
                 "regime_at_submission": regime,
                 "submitted_at": datetime.now(timezone.utc).isoformat(),
             }

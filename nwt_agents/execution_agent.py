@@ -27,6 +27,7 @@ load_dotenv(Path(__file__).parent / ".env")
 from shared_context import (
     check_no_trade_mode,
     clean_alpaca_base_url,
+    directives_is_stale,
     get_db,
     insert_decision,
     insert_ticket,
@@ -34,6 +35,7 @@ from shared_context import (
     log_system_event,
     option_dte,
     pre_trade_veto,
+    try_acquire_singleton_lock,
 )
 
 logging.basicConfig(
@@ -529,6 +531,14 @@ def monitor_options_positions(conn) -> None:
 def main() -> None:
     conn = get_db()
 
+    # P0-2: refuse to run a second cycle concurrently with one already in
+    # progress (e.g. a slow prior run still going when the next 5-minute
+    # cron firing starts). Released automatically if this process crashes.
+    if not try_acquire_singleton_lock(conn, "execution_agent"):
+        logger.warning("execution_agent: another instance already holds the lock — skipping this cycle")
+        conn.close()
+        return
+
     try:
         # no_trade_mode check
         halted, halt_reason = check_no_trade_mode(conn)
@@ -543,6 +553,12 @@ def main() -> None:
         except FileNotFoundError:
             logger.error("master-directives.json not found — exiting")
             sys.exit(1)
+
+        stale, stale_reason = directives_is_stale(directives)
+        if stale:
+            logger.warning("%s — execution agent exiting", stale_reason)
+            log_system_event(conn, "WARNING", "execution_agent", stale_reason)
+            return
 
         if directives.get("global_kill_switch", False):
             logger.warning("Global kill switch active — execution agent exiting")

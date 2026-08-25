@@ -4,6 +4,8 @@
 
 > Read this before touching anything.
 
+> **Forward-looking design:** `docs/STRATEGY_DISCOVERY_PLATFORM.md` is a companion architecture document describing the next evolution of this system — a Strategy Factory capable of continuously discovering, validating, deploying, and retiring many strategies at once, built on top of (not replacing) everything below. It is a design document only; nothing in it is implemented yet. This file remains the source of truth for what is currently deployed.
+
 ---
 
 ## Current Status
@@ -18,6 +20,7 @@
 | Discord webhook | Dead, not replaced — Telegram (`nwt_agents/notifier.py`) is the live alerting channel instead | 2026-07-11 |
 | Postgres nwt_agents DB *(server)* | Last confirmed state: wiped for rebuild | 2026-05-18 |
 | PM2 stack *(repo)* | `ecosystem.config.cjs` defines all Track A bots + dashboard, `time_zone: 'UTC'` explicit on every app | 2026-07-11 |
+| US bot execution path *(repo)* | Built — `us/executor.py` added 2026-08-25; previously `us-candidates.json` had no consumer at all, so the US bot (largest allocation, $35k) generated signals that never became trades | 2026-08-25 |
 | nwt_agents cron *(repo)* | `crontab.txt` defines the full conviction stack + risk/execution/learning/recon schedule, `SHELL=/bin/bash` first line, confirmed UTC | 2026-07-11 |
 | db/schema.sql + migrate_*.sql *(repo)* | Present; apply in filename/date order — schema.sql alone is the Day-1 baseline only | 2026-07-11 |
 | recon_agent.py *(repo)* | Built; `--gate` now auto-runs cold-start import first; `--clear-if-clean` added for human-acknowledged recovery | 2026-07-11 |
@@ -26,6 +29,7 @@
 | Directional cap (60%) *(repo)* | Built in `execution/engine.py` (`DIRECTIONAL_CAP_PCT`); distinct from `master/strategist.py`'s `PER_BOT_WEIGHT_CEILING` (0.65) — see Stack 3 | 2026-07-11 |
 | Risk Agent sizing-reduction rules (3, 7) *(repo)* | Built — `sizing_multiplier` on `nwt_ticket_decisions`, applied by `execution_agent.py`; used to only log a warning | 2026-07-11 |
 | Exit lifecycle (equity monitor + options close) *(repo)* | Built; equity monitor now prefers the ticket's own `stop_pct`/`target_pct` (persisted on the ledger row) over genome/hardcoded defaults | 2026-07-11 |
+| Track A stop_pct/target_pct wiring *(repo)* | Fixed 2026-08-25 — all 4 executors (`us`/`ukeu`/`asx`/`china`) were only nesting `stop_pct`/`target_pct` inside `expected_payoff`, never setting the top-level payload keys the equity monitor above actually reads; every Track A equity exit was silently falling back to genome/hardcoded -1.5%/+2.5% instead of the strategist's per-signal levels | 2026-08-25 |
 | Defined-risk options execution *(repo)* | Built — `bull_call_spread`/`bear_put_spread`/`iron_condor` resolve real multi-leg Alpaca `mleg` orders (`nwt_agents/execution_agent.py::resolve_spread_legs`); single-leg entries (`long_call`/`long_put`/`vix_calls`) are always buy-to-open. Closes a prior gap where any bearish single-leg ticket placed a naked sell-to-open. Ledger keeps one row per leg, tied by `spread_group_id`. See Stack 5. | 2026-07-12 |
 | Inactivity ticket taxonomy *(repo)* | Built; session scorecard now counts both Track A's `nwt_inactivity_log` and Track C/D/E's `nwt_tickets(type='inactivity')` | 2026-07-11 |
 | Same-regime 5+ sessions rule *(repo)* | Built — `nwt_regime_history` + `regime_classifier.py`'s session-persistence check | 2026-07-11 |
@@ -196,6 +200,7 @@ Process manager: PM2 — all processes must be in this file to survive reboot.
 | ukeu-executor | 10:00 | ukeu/ |
 | us-nightly | 10:30 | us/ |
 | us-trader | 18:05 (14:05 ET ORB) | us/ |
+| us-executor | 18:10 | us/ |
 | perf-tracker | 00:00 | performance/ |
 | nwt-dashboard | always-on (FastAPI, port 8080) | dashboard/ |
 
@@ -220,6 +225,7 @@ Script: `us/workspace-northworldtrading/bot/trade_1400_with_brackets.py`
 - Output: `shared/us-candidates.json` only
 - ORB scoring: SPY>=4, QQQ>=3, AAPL>=3, TSLA>=4, NVDA>=3
 - Fire time: 18:05 UTC (14:05 ET) — NOT 18:00 (SIP data not ready at exactly 14:00 ET)
+- `us/executor.py` (18:10 UTC) reads `us-candidates.json`, sizes from `master-directives.json`'s `bot_permissions.us`, and writes `TRADE_REQUEST` tickets — mirrors `ukeu/executor.py`. Added 2026-08-25: previously no component consumed `us-candidates.json` at all, so the US bot's signals (largest single allocation, $35k) never became trades.
 
 > **CRITICAL** Any version of this script that calls Alpaca order endpoints is wrong.
 
@@ -874,7 +880,7 @@ All model env vars overridable via `nwt_agents/.env`
 |---|---|
 | SHELL=/bin/bash | Must be first line of crontab — silently fails otherwise |
 | NWT_ALPACA_BASE_URL trailing /v2 | Causes double /v2/v2/ → 404 |
-| GTC orders | Required for ASX/UKEU; day orders for US only |
+| GTC orders | Required for ASX/UKEU long entries; day orders for US only. UKEU **shorts** use day-only TIF regardless — Alpaca 422s ("only day orders are allowed for hard-to-borrow asset") on GTC short-sale orders for hard-to-borrow names (fixed in `ukeu/executor.py`, 2026-08-25) |
 | ASX options | Not traded — liquidity too thin |
 | VIX feed returns 0 | Treat as missing data, not a signal — do not use 0 |
 | ORB timing | Fire at 18:05 UTC not 18:00 — SIP data not ready at exactly 14:00 ET |
