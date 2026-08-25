@@ -874,7 +874,7 @@ All model env vars overridable via `nwt_agents/.env`
 |---|---|
 | SHELL=/bin/bash | Must be first line of crontab — silently fails otherwise |
 | NWT_ALPACA_BASE_URL trailing /v2 | Causes double /v2/v2/ → 404 |
-| GTC orders | Required for ASX/UKEU; day orders for US only |
+| GTC orders | Required for ASX/UKEU long entries; day orders for US only. UKEU **shorts** use day-only TIF regardless — Alpaca 422s ("only day orders are allowed for hard-to-borrow asset") on GTC short-sale orders for hard-to-borrow names (fixed in `ukeu/executor.py`, 2026-08-25) |
 | ASX options | Not traded — liquidity too thin |
 | VIX feed returns 0 | Treat as missing data, not a signal — do not use 0 |
 | ORB timing | Fire at 18:05 UTC not 18:00 — SIP data not ready at exactly 14:00 ET |
