@@ -151,6 +151,28 @@ def main() -> None:
                     reason = "NO_CONVICTION_MATCH"
                 logger.info("%s: %s", strategy_id, reason)
                 log_inactivity(conn, strategy_id, "D", reason, regime)
+
+                # CONVICTION_BELOW_THRESHOLD is a genuine directional read (a
+                # symbol matched, conviction_engine assigned it a score) that
+                # was blocked by Track D's own entry bar — unlike the other
+                # three reasons above, no candidate exists at all for those.
+                # Log it so signal_strength buckets below TRACK_D_MIN_CONVICTION
+                # are visible to the Learning Agent instead of silently absent.
+                if reason == "CONVICTION_BELOW_THRESHOLD":
+                    weakest = max(symbol_match, key=lambda t: t.get("conviction_score", 0))
+                    weak_symbol = weakest.get("symbol")
+                    entry_price_ref = layer0.get("symbols", {}).get(weak_symbol, {}).get("price") or None
+                    log_decision_input(
+                        conn, run_date=run_date, symbol=weak_symbol, strategy_id=strategy_id,
+                        track="D", regime=regime, signal_strength=weakest.get("conviction_score", 0),
+                        archetype=genome.get("archetype") or strategy_id, is_winner=False,
+                        decision="REJECTED_TRACK", rejection_reason=reason,
+                        direction=weakest.get("direction", "long"), entry_price_ref=entry_price_ref,
+                        target_pct=float(genome["profit_target_pct"]),
+                        stop_pct=-abs(float(genome["stop_loss_pct"])),
+                        dte_target=genome.get("dte_min", 14),
+                        stage_reached="SIGNAL", outcome_reason="BELOW_THRESHOLD",
+                    )
                 continue
 
             candidates.append((strategy_id, genome, best_ticket))
@@ -190,12 +212,13 @@ def main() -> None:
                 winner_id, _, winner_ticket = winners[arch]
                 log_decision_input(
                     conn, run_date=run_date, symbol=ticket.get("symbol"), strategy_id=strategy_id,
-                    track="D", regime=regime, conviction_score=ticket.get("conviction_score", 0),
+                    track="D", regime=regime, signal_strength=ticket.get("conviction_score", 0),
                     archetype=arch, is_winner=False, decision="REJECTED_TRACK",
                     rejection_reason=(
                         f"ARCHETYPE_CONSOLIDATED: conviction {ticket.get('conviction_score', 0)} "
                         f"< winner {winner_id} conviction {winner_ticket.get('conviction_score', 0)}"
                     ),
+                    stage_reached="SIGNAL", outcome_reason="NO_EDGE",
                     **_shadow_fields(genome, ticket),
                 )
 
@@ -209,9 +232,11 @@ def main() -> None:
                 log_inactivity(conn, strategy_id, "D", "ZERO_SIZING", regime)
                 log_decision_input(
                     conn, run_date=run_date, symbol=best_ticket.get("symbol"), strategy_id=strategy_id,
-                    track="D", regime=regime, conviction_score=best_ticket.get("conviction_score", 0),
+                    track="D", regime=regime, signal_strength=best_ticket.get("conviction_score", 0),
                     archetype=archetype, is_winner=True, decision="REJECTED_TRACK",
-                    rejection_reason="ZERO_SIZING", **shadow_fields,
+                    rejection_reason="ZERO_SIZING",
+                    stage_reached="SIGNAL", outcome_reason="RISK_VETOED",
+                    **shadow_fields,
                 )
                 continue
 
@@ -257,9 +282,9 @@ def main() -> None:
                 proposals_submitted += 1
                 log_decision_input(
                     conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
-                    track="D", regime=regime, conviction_score=best_ticket.get("conviction_score", 0),
+                    track="D", regime=regime, signal_strength=best_ticket.get("conviction_score", 0),
                     archetype=archetype, is_winner=True, decision="TRADE_PROPOSED",
-                    ticket_id=ticket_id, **shadow_fields,
+                    ticket_id=ticket_id, stage_reached="SIGNAL", **shadow_fields,
                 )
             except Exception as exc:
                 logger.error("%s: failed to insert ticket: %s", strategy_id, exc)

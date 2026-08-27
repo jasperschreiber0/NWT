@@ -57,6 +57,15 @@ def fetch_pending_candidates(conn) -> list:
     shadow-evaluated yet. entry_price_ref must be present — candidates
     logged without a layer0 price (rare, missing data) are left NULL
     forever rather than guessed at.
+
+    Excludes outcome_reason='EXECUTED': a row that became a real trade has
+    a real nwt_trade_outcomes row already — shadow-evaluating it too would
+    produce a second, counterfactual PnL figure sitting next to the real
+    one, exactly the "pretend shadow PnL is realized PnL" confusion this
+    table must not create. Track-agnostic by construction — the underlying
+    IS the tradeable instrument for Track A (no proxy needed), and the
+    directional-proxy walk already used for Track C/D/E options applies
+    unchanged.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -69,6 +78,7 @@ def fetch_pending_candidates(conn) -> list:
               AND target_pct IS NOT NULL
               AND stop_pct IS NOT NULL
               AND dte_target IS NOT NULL
+              AND (outcome_reason IS NULL OR outcome_reason != 'EXECUTED')
               AND run_date + (dte_target || ' days')::interval <= NOW()
             ORDER BY run_date ASC
             LIMIT 500
@@ -99,11 +109,17 @@ def fetch_bars(symbol: str, start: date, end: date) -> list:
 
 def simulate_outcome(bars: list, direction: str, entry_price: float, target_pct: float, stop_pct: float):
     """
-    Walk bars chronologically; return (would_have_won, exit_price, pnl_pct).
+    Walk bars chronologically; return
+    (would_have_won, exit_price, pnl_pct, mfe_pct, mae_pct, completion).
     First threshold touched wins (stop wins same-day ties, conservative).
-    If neither threshold is touched by the last bar, resolve at final close.
+    If neither threshold is touched by the last bar, resolve at final close
+    (completion='HORIZON_EXPIRED'). mfe_pct/mae_pct are the best/worst
+    favorable-direction excursion seen at any point during the walk, tracked
+    independently of which threshold eventually resolves the trade.
     """
     sign = 1.0 if direction != "short" else -1.0
+    mfe_pct = 0.0
+    mae_pct = 0.0
 
     for bar in bars:
         high = float(bar.get("h", 0))
@@ -119,19 +135,25 @@ def simulate_outcome(bars: list, direction: str, entry_price: float, target_pct:
             favorable_pct = (high - entry_price) / entry_price
             adverse_pct = (entry_price - low) / entry_price
 
+        mfe_pct = max(mfe_pct, favorable_pct)
+        mae_pct = max(mae_pct, adverse_pct)
+
         if adverse_pct >= abs(stop_pct):
             exit_price = entry_price * (1 - sign * abs(stop_pct))
-            return False, round(exit_price, 4), round(-abs(stop_pct), 6)
+            return (False, round(exit_price, 4), round(-abs(stop_pct), 6),
+                    round(mfe_pct, 6), round(mae_pct, 6), "STOP_HIT")
         if favorable_pct >= abs(target_pct):
             exit_price = entry_price * (1 + sign * abs(target_pct))
-            return True, round(exit_price, 4), round(abs(target_pct), 6)
+            return (True, round(exit_price, 4), round(abs(target_pct), 6),
+                    round(mfe_pct, 6), round(mae_pct, 6), "TARGET_HIT")
 
     if not bars:
-        return None, None, None
+        return None, None, None, None, None, None
 
     final_close = float(bars[-1].get("c", entry_price))
     pnl_pct = sign * (final_close - entry_price) / entry_price
-    return pnl_pct > 0, round(final_close, 4), round(pnl_pct, 6)
+    return (pnl_pct > 0, round(final_close, 4), round(pnl_pct, 6),
+            round(mfe_pct, 6), round(mae_pct, 6), "HORIZON_EXPIRED")
 
 
 def main() -> None:
@@ -153,7 +175,7 @@ def main() -> None:
                 skipped_no_bars += 1
                 continue
 
-            would_have_won, exit_price, pnl_pct = simulate_outcome(
+            would_have_won, exit_price, pnl_pct, mfe_pct, mae_pct, completion = simulate_outcome(
                 bars,
                 row["direction"] or "long",
                 float(row["entry_price_ref"]),
@@ -172,10 +194,13 @@ def main() -> None:
                     SET shadow_evaluated_at = NOW(),
                         would_have_won = %s,
                         shadow_exit_price = %s,
-                        shadow_pnl_pct = %s
+                        shadow_pnl_pct = %s,
+                        shadow_mfe_pct = %s,
+                        shadow_mae_pct = %s,
+                        shadow_completion = %s
                     WHERE id = %s
                     """,
-                    (would_have_won, exit_price, pnl_pct, row["id"]),
+                    (would_have_won, exit_price, pnl_pct, mfe_pct, mae_pct, completion, row["id"]),
                 )
             conn.commit()
             evaluated += 1

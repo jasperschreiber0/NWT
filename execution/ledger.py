@@ -25,7 +25,12 @@ def insert_position(conn, data: dict) -> str:
     Optional keys:
         strategy_id, direction, delta_exposure, notional_risk, qty, entry_price,
         entry_time, entry_bid, entry_ask, alpaca_order_id, stop_pct, target_pct,
-        spread_group_id
+        spread_group_id, ticket_id
+
+    ticket_id is the deterministic link back to nwt_decision_inputs: learning_
+    agent.py resolves the originating decision observation through it (see
+    db/migrate_2026_08_canonical_decisions.sql) instead of the older fuzzy
+    alpaca_order_id/symbol search.
 
     spread_group_id ties together the per-leg ledger rows of one multi-leg
     (defined-risk) structure — recon matches Alpaca per contract, so legs are
@@ -47,8 +52,8 @@ def insert_position(conn, data: dict) -> str:
             INSERT INTO nwt_portfolio_ledger
                 (bot_source, strategy_id, asset, asset_type, direction, delta_exposure,
                  notional_risk, qty, entry_price, entry_time, entry_bid, entry_ask,
-                 alpaca_order_id, stop_pct, target_pct, spread_group_id, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
+                 alpaca_order_id, stop_pct, target_pct, spread_group_id, ticket_id, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
             RETURNING position_id
             """,
             (
@@ -68,6 +73,7 @@ def insert_position(conn, data: dict) -> str:
                 data.get("stop_pct"),
                 data.get("target_pct"),
                 data.get("spread_group_id"),
+                data.get("ticket_id"),
             ),
         )
         position_id = cur.fetchone()[0]

@@ -75,6 +75,7 @@ def test_short_on_non_shortable_asset_is_blocked_not_silently_dropped(mock_short
     assert blocked["symbol"] == "EWU"
     assert blocked["direction"] == "short"
     assert blocked["shortability"] == NOT_SHORTABLE
+    assert blocked["outcome_reason"] == "STRUCTURALLY_IMPOSSIBLE"
     mock_shortability.assert_called_once_with("EWU")
 
 
@@ -121,14 +122,37 @@ def test_no_signal_in_neutral_band_is_unaffected():
     assert candidate is None and blocked is None
 
 
-def test_confidence_below_entry_threshold_is_unaffected():
-    """A short too weak to be a genuine opportunity is NO_SIGNAL, not blocked."""
-    bars = _bars_for_z_score(1.6)  # just past the +-1.5 direction threshold, low confidence
-    weak_genome = {**GENOME, "entry_threshold": 0.9}
+def test_confidence_below_entry_threshold_is_a_learning_observation_not_dropped():
+    """
+    A direction was assigned (|z-score| > 1.5) but confidence didn't clear
+    entry_threshold — a genuine, weaker opportunity. Per the canonical
+    decision-observation model this must be reported as BELOW_THRESHOLD,
+    not silently dropped as if no thesis had formed at all — the shortability
+    check must still never run (never got past the earlier threshold gate).
+    """
+    bars = _bars_for_z_score(2.2)
+    weak_genome = {**GENOME, "entry_threshold": 0.95}
     with patch.object(strategist, "get_shortability") as mock_shortability:
-        candidate, blocked = strategist.analyse_symbol("EWU", bars, weak_genome)
+        candidate, observation = strategist.analyse_symbol("EWU", bars, weak_genome)
         mock_shortability.assert_not_called()
-    assert candidate is None and blocked is None
+    assert candidate is None
+    assert observation is not None
+    assert observation["outcome_reason"] == "BELOW_THRESHOLD"
+    assert observation["direction"] == "short"
+    assert observation["entry_price_ref"] is not None
+    assert observation["target_pct"] == weak_genome["profit_target_pct"]
+    assert observation["stop_pct"] == -abs(weak_genome["stop_loss_pct"])
+
+
+def test_neutral_band_still_produces_no_observation_at_all():
+    """
+    z-score inside (-1.5, 1.5): no direction is ever assigned, so per the
+    canonical model's own rule (only a GENUINE directional read is logged)
+    this must stay (None, None), not become a manufactured BELOW_THRESHOLD row.
+    """
+    bars = _bars_for_z_score(0.3)
+    candidate, observation = strategist.analyse_symbol("EWU", bars, GENOME)
+    assert candidate is None and observation is None
 
 
 # ---------------------------------------------------------------------------

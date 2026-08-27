@@ -188,6 +188,53 @@ def get_shortability(symbol: str) -> dict | None:
         return entry  # stale cache entry if any, else None
 
 
+def log_decision_input(
+    conn, run_date, symbol: str, strategy_id: str, genome_version: int, regime: dict,
+    signal_strength: float, direction: str, entry_price_ref: float | None,
+    target_pct: float, stop_pct: float, outcome_reason: str | None = None,
+) -> int | None:
+    """
+    INSERT one canonical learning observation for a genuine directional
+    read (see db/migrate_2026_08_canonical_decisions.sql) — the Track A
+    equivalent of nwt_agents/shared_context.py's log_decision_input,
+    duplicated here per this repo's existing convention (Track A bots have
+    no shared import path to nwt_agents/). archetype = strategy_id, matching
+    migrate_2026_06_archetypes.sql's "Track A: each strategy is already its
+    own bucket". is_winner=TRUE — Track A has no archetype-consolidation
+    concept, every genuine read logged here is by definition the only one.
+    Idempotent via the same (strategy_id, genome_version, symbol, run_date)
+    key every track uses — a strategist retry on the same day is a no-op.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_decision_inputs
+                    (run_date, symbol, strategy_id, track, regime, signal_strength,
+                     asset_class, archetype, is_winner, decision, direction,
+                     entry_price_ref, target_pct, stop_pct, genome_version,
+                     stage_reached, outcome_reason)
+                VALUES (%s, %s, %s, 'A', %s, %s, 'equity', %s, TRUE, 'CANDIDATE', %s,
+                        %s, %s, %s, %s, 'SIGNAL', %s)
+                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date)
+                DO UPDATE SET id = nwt_decision_inputs.id
+                RETURNING id
+                """,
+                (
+                    run_date, symbol, strategy_id, json.dumps(regime), signal_strength,
+                    strategy_id, direction, entry_price_ref, target_pct, stop_pct,
+                    genome_version, outcome_reason,
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    except Exception as exc:
+        conn.rollback()
+        log.warning("log_decision_input failed for %s: %s", symbol, exc)
+        return None
+
+
 def log_inactivity(conn, strategy_id: str, reason: str, regime: dict) -> None:
     try:
         with conn.cursor() as cur:
@@ -266,16 +313,26 @@ def analyse_symbol(symbol: str, bars_df, genome: dict) -> tuple[dict | None, dic
     """
     Run mean reversion analysis on one EU symbol.
 
-    Returns (candidate, blocked_info) — exactly one is non-None, or both are
-    None (no signal at all). `blocked_info` is set when a genuine short
-    signal was found (passed the entry_threshold, i.e. a real opportunity)
-    but is structurally unexecutable — the asset isn't shortable on Alpaca.
-    That must never be conflated with "no signal": the caller logs it as
-    STRUCTURALLY_IMPOSSIBLE, not NO_SIGNAL, so the Learning System can tell
-    "no edge" apart from "edge found, broker won't let us take it".
+    Returns (candidate, observation) — exactly one is non-None, or both are
+    None when no directional thesis forms at all (z-score in the neutral
+    band — nothing to observe, per the canonical-decision model's own rule:
+    a symbol-level observation is only logged for a GENUINE directional
+    read, never manufactured for "nothing happened").
 
-    Only short signals are gated — a long candidate is never blocked by
-    shortability, since it never needs to borrow the asset.
+    `observation` is set for two distinct blocked-but-genuine cases, tagged
+    by observation["outcome_reason"]:
+      - BELOW_THRESHOLD: a direction was assigned (|z-score| > 1.5) but
+        confidence didn't clear entry_threshold. This is exactly the
+        "genuine opportunity, just weak" case the Learning System needs to
+        see signal_strength buckets below the live threshold.
+      - STRUCTURALLY_IMPOSSIBLE: confidence cleared entry_threshold (a real
+        opportunity) but the asset isn't shortable on Alpaca.
+    Neither may be conflated with "no signal" — the caller logs each by its
+    own outcome_reason, not a generic NO_SIGNAL, so the Learning System can
+    tell "no edge" apart from "edge found, blocked before/after threshold".
+
+    Only short signals are gated by shortability — a long candidate is
+    never blocked by it, since it never needs to borrow the asset.
     """
     _enforce_isolation("european_mean_reversion")
 
@@ -304,10 +361,27 @@ def analyse_symbol(symbol: str, bars_df, genome: dict) -> tuple[dict | None, dic
     ecb_boost = ecb_lag_confidence_boost(z_score) if direction == "long" else 0.0
     confidence = round(min(base_confidence + ecb_boost, 0.95), 4)
 
+    # Parameters from genome — never hardcoded. Computed before the
+    # threshold/shortability gates below so a blocked-but-genuine
+    # observation still carries real target/stop, not a guess.
+    target_pct = float(genome.get("profit_target_pct") or 0.03)
+    stop_pct = -abs(float(genome.get("stop_loss_pct") or 0.015))
+    strategy_id = genome["strategy_id"]
+    entry_price_ref = float(closes[-1])
+
     entry_threshold = float(genome.get("entry_threshold") or 0.5)
     if confidence < entry_threshold:
         log.info("%s: confidence %.3f < entry_threshold %.3f — no signal", symbol, confidence, entry_threshold)
-        return None, None
+        return None, {
+            "symbol": symbol,
+            "direction": direction,
+            "z_score": round(z_score, 4),
+            "confidence": confidence,
+            "entry_price_ref": entry_price_ref,
+            "target_pct": target_pct,
+            "stop_pct": stop_pct,
+            "outcome_reason": "BELOW_THRESHOLD",
+        }
 
     # Shortability gate — this is a genuine opportunity (confidence cleared
     # entry_threshold); if it's a short and the asset can't be shorted, it
@@ -323,12 +397,11 @@ def analyse_symbol(symbol: str, bars_df, genome: dict) -> tuple[dict | None, dic
                 "z_score": round(z_score, 4),
                 "confidence": confidence,
                 "shortability": shortability,
+                "entry_price_ref": entry_price_ref,
+                "target_pct": target_pct,
+                "stop_pct": stop_pct,
+                "outcome_reason": "STRUCTURALLY_IMPOSSIBLE",
             }
-
-    # Parameters from genome — never hardcoded
-    target_pct = float(genome.get("profit_target_pct") or 0.03)
-    stop_pct = -abs(float(genome.get("stop_loss_pct") or 0.015))
-    strategy_id = genome["strategy_id"]
 
     window_mean = float(np.mean(closes[-LOOKBACK_DAYS:]))
     window_std = float(np.std(closes[-LOOKBACK_DAYS:], ddof=1))
@@ -346,6 +419,7 @@ def analyse_symbol(symbol: str, bars_df, genome: dict) -> tuple[dict | None, dic
         "direction": direction,
         "confidence": confidence,
         "strategy_id": strategy_id,
+        "genome_version": genome.get("version"),
         "signal_quality": {
             "entry_timing_score": round(min(abs(z_score) / 2.5, 1.0), 4),
             "thesis_validity": thesis,
@@ -439,6 +513,8 @@ def main() -> None:
         sys.exit(1)
 
     # Step 4: Analyse each symbol
+    run_date = datetime.now(timezone.utc).date()
+    genome_version = genome.get("version")
     candidates = []
     for symbol in EU_SYMBOLS:
         bars = bars_by_symbol.get(symbol)
@@ -447,17 +523,36 @@ def main() -> None:
             log_inactivity(conn, genome["strategy_id"], f"NO_DATA_{symbol}", regime)
             continue
 
-        candidate, blocked = analyse_symbol(symbol, bars, genome)
-        if blocked:
-            reason = f"STRUCTURALLY_IMPOSSIBLE_SHORT_{symbol}"
+        candidate, observation = analyse_symbol(symbol, bars, genome)
+        if observation:
+            outcome_reason = observation["outcome_reason"]
+            reason = f"{outcome_reason}_{symbol}" if outcome_reason == "BELOW_THRESHOLD" \
+                else f"STRUCTURALLY_IMPOSSIBLE_SHORT_{symbol}"
             log_inactivity(conn, genome["strategy_id"], reason, regime)
             log_to_db(conn, "WARNING",
-                      f"{symbol}: genuine short signal blocked — not shortable on Alpaca",
-                      blocked)
+                      f"{symbol}: genuine {observation['direction']} signal blocked ({outcome_reason})",
+                      observation)
+            log_decision_input(
+                conn, run_date=run_date, symbol=symbol, strategy_id=genome["strategy_id"],
+                genome_version=genome_version, regime=regime,
+                signal_strength=observation["z_score"], direction=observation["direction"],
+                entry_price_ref=observation["entry_price_ref"], target_pct=observation["target_pct"],
+                stop_pct=observation["stop_pct"], outcome_reason=outcome_reason,
+            )
         elif candidate:
             candidates.append(candidate)
             log.info("%s: candidate generated (direction=%s confidence=%.3f)",
                      symbol, candidate["direction"], candidate["confidence"])
+            dbg = candidate["_debug"]
+            log_decision_input(
+                conn, run_date=run_date, symbol=symbol, strategy_id=genome["strategy_id"],
+                genome_version=genome_version, regime=regime,
+                signal_strength=dbg["z_score"], direction=candidate["direction"],
+                entry_price_ref=dbg["last_close"],
+                target_pct=candidate["expected_payoff"]["target_pct"],
+                stop_pct=candidate["expected_payoff"]["stop_pct"],
+                outcome_reason=None,  # pending — executor links ticket_id, downstream resolves it
+            )
         else:
             log_inactivity(conn, genome["strategy_id"], f"NO_SIGNAL_{symbol}", regime)
 

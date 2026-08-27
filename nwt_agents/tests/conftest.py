@@ -12,11 +12,20 @@ import os
 import psycopg2
 import pytest
 
+# Some nwt_agents modules (e.g. shadow_decision_evaluator.py) read Alpaca
+# credentials from os.environ[...] (strict) at import time. Tests never talk
+# to a real broker — this just supplies harmless dummy values so those
+# modules can be imported at all.
+os.environ.setdefault("NWT_ALPACA_KEY_ID", "test-key")
+os.environ.setdefault("NWT_ALPACA_SECRET_KEY", "test-secret")
+os.environ.setdefault("NWT_ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+os.environ.setdefault("NWT_ALPACA_DATA_URL", "https://data.alpaca.markets")
+
 TEST_DSN = os.environ.get("NWT_TEST_DB_DSN")
 
 SCHEMA_SQL = """
-DROP TABLE IF EXISTS nwt_trade_outcomes;
-DROP TABLE IF EXISTS nwt_portfolio_ledger;
+DROP TABLE IF EXISTS nwt_trade_outcomes CASCADE;
+DROP TABLE IF EXISTS nwt_portfolio_ledger CASCADE;
 
 CREATE TABLE nwt_portfolio_ledger (
     position_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

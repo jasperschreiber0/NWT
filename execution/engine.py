@@ -306,6 +306,33 @@ def insert_decision(conn, ticket_id: str, decision: str, reasoning: str) -> None
     conn.commit()
 
 
+def mark_decision_outcome(conn, ticket_id: str, outcome_reason: str) -> None:
+    """
+    Set the terminal outcome_reason on the nwt_decision_inputs row this
+    ticket_id was linked to. Own copy of nwt_agents/shared_context.py's
+    helper — execution/ has no import path to that module (separate
+    deployable directory, same convention as get_shortability above). Only
+    fills a NULL, never overwrites an already-set outcome_reason, and never
+    raises — a learning-data write must not break order processing.
+    """
+    if not ticket_id:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nwt_decision_inputs
+                SET outcome_reason = %s
+                WHERE ticket_id = %s AND outcome_reason IS NULL
+                """,
+                (outcome_reason, ticket_id),
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        logger.warning("mark_decision_outcome failed for ticket %s: %s", ticket_id, exc)
+
+
 def fetch_pending_tickets(conn) -> list:
     """Return approved TRADE_REQUEST tickets with no EXECUTION_ENGINE decision yet."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -935,6 +962,7 @@ def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
         ledger_data = {
             "bot_source": payload["bot_source"],
             "strategy_id": payload.get("strategy_id"),
+            "ticket_id": ticket_id,
             "asset": leg_symbol,
             "asset_type": "option",
             "direction": leg_direction,
@@ -955,6 +983,7 @@ def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
     reasoning = (f"mleg filled — {len(position_ids)} legs, "
                  f"spread_group_id={spread_group_id}, alpaca_order_id={alpaca_order_id}")
     insert_decision(conn, ticket_id, "EXECUTED", reasoning)
+    mark_decision_outcome(conn, payload.get("source_proposal_ticket_id") or ticket_id, "EXECUTED")
     log_system_event(conn, "INFO", "execution_engine",
                      f"Executed spread {payload.get('strategy_type', '')} on {payload.get('symbol', '')}",
                      {"ticket_id": ticket_id, "spread_group_id": spread_group_id,
@@ -968,6 +997,13 @@ def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
 def process_ticket(conn, ticket: dict, directives: dict) -> None:
     ticket_id = str(ticket["ticket_id"])
     payload = ticket.get("payload") or {}
+
+    # Track C/D/E tickets carry the TRADE_PROPOSAL ticket_id they were built
+    # from (execution_agent.py sets source_proposal_ticket_id) — that, not
+    # this TRADE_REQUEST's own id, is what nwt_decision_inputs.ticket_id was
+    # set to at track_c/d/e.py write time. Track A tickets have no separate
+    # proposal stage, so their own ticket_id IS the decision row's key.
+    decision_ticket_id = payload.get("source_proposal_ticket_id") or ticket_id
 
     missing = REQUIRED_FIELDS - set(payload.keys())
     if missing:
@@ -987,6 +1023,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     if vetoed:
         logger.warning("Ticket %s rejected: %s", ticket_id, veto_reason)
         insert_decision(conn, ticket_id, "REJECTED", veto_reason)
+        mark_decision_outcome(conn, decision_ticket_id, "RISK_VETOED")
         log_system_event(conn, "WARNING", "execution_engine", veto_reason, {"ticket_id": ticket_id})
         return
 
@@ -999,6 +1036,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
                   f"> {cap:.0f} (60% of equity)")
         logger.warning("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "REJECTED", reason)
+        mark_decision_outcome(conn, decision_ticket_id, "RISK_VETOED")
         log_system_event(conn, "WARNING", "execution_engine", reason,
                          {"ticket_id": ticket_id, "type": "directional_cap_reject",
                           "total_exposure": total_exposure, "cap": cap})
@@ -1024,6 +1062,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
             )
             logger.warning("Ticket %s: %s", ticket_id, reason)
             insert_decision(conn, ticket_id, "STRUCTURALLY_IMPOSSIBLE", reason)
+            mark_decision_outcome(conn, decision_ticket_id, "STRUCTURALLY_IMPOSSIBLE")
             log_system_event(conn, "WARNING", "execution_engine", reason,
                              {"ticket_id": ticket_id, "symbol": symbol, "shortability": shortability})
             return
@@ -1043,11 +1082,13 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         else:
             reason = f"Unknown asset_type: {asset_type}"
             insert_decision(conn, ticket_id, "FAILED", reason)
+            mark_decision_outcome(conn, decision_ticket_id, "EXECUTION_FAILED")
             return
     except Exception as exc:
         reason = f"Order placement failed: {exc}"
         logger.error("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "FAILED", reason)
+        mark_decision_outcome(conn, decision_ticket_id, "EXECUTION_FAILED")
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
         return
 
@@ -1058,6 +1099,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     except Exception as exc:
         reason = f"Order poll failed: {exc}"
         insert_decision(conn, ticket_id, "FAILED", reason)
+        mark_decision_outcome(conn, decision_ticket_id, "EXECUTION_FAILED")
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
         return
 
@@ -1070,6 +1112,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     if fill_status != "filled" or (fill_price is None and not legs):
         reason = f"Order did not fill — final status={fill_status}"
         insert_decision(conn, ticket_id, "FAILED", reason)
+        mark_decision_outcome(conn, decision_ticket_id, "EXECUTION_FAILED")
         log_system_event(conn, "WARNING", "execution_engine", reason,
                          {"ticket_id": ticket_id, "alpaca_order_id": alpaca_order_id})
         return
@@ -1080,6 +1123,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         except Exception as exc:
             reason = f"Ledger insert failed: {exc}"
             insert_decision(conn, ticket_id, "FAILED", reason)
+            mark_decision_outcome(conn, decision_ticket_id, "EXECUTION_FAILED")
             log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
         return
 
@@ -1106,6 +1150,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     ledger_data = {
         "bot_source": payload["bot_source"],
         "strategy_id": payload.get("strategy_id"),
+        "ticket_id": ticket_id,
         "asset": payload.get("option_symbol", symbol) if asset_type == "option" else symbol,
         "asset_type": asset_type,
         "direction": ledger_direction,
@@ -1126,12 +1171,14 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     except Exception as exc:
         reason = f"Ledger insert failed: {exc}"
         insert_decision(conn, ticket_id, "FAILED", reason)
+        mark_decision_outcome(conn, decision_ticket_id, "EXECUTION_FAILED")
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
         return
 
     reasoning = (f"Filled at {fill_price:.4f}, slippage={slippage:.4f}, "
                  f"position_id={position_id}, alpaca_order_id={alpaca_order_id}")
     insert_decision(conn, ticket_id, "EXECUTED", reasoning)
+    mark_decision_outcome(conn, decision_ticket_id, "EXECUTED")
     log_system_event(conn, "INFO", "execution_engine",
                      f"Executed {symbol} ({asset_type}) — {direction}",
                      {"ticket_id": ticket_id, "position_id": position_id,

@@ -229,6 +229,22 @@ def main() -> None:
                     strategy_id, reason, symbol, quant_edge["edge_magnitude"],
                 )
                 log_inactivity(conn, strategy_id, "E", reason, regime)
+
+                # A genuine directional read (best_ticket matched, edge computed)
+                # blocked by Track E's own quant-edge bar — distinct from
+                # NO_CONVICTION_MATCH above, where no candidate exists at all.
+                entry_price_ref = layer0.get("symbols", {}).get(symbol, {}).get("price") or None
+                log_decision_input(
+                    conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
+                    track="E", regime=regime, signal_strength=quant_edge["edge_magnitude"],
+                    archetype=genome.get("archetype") or strategy_id, is_winner=False,
+                    decision="REJECTED_TRACK", rejection_reason=reason,
+                    direction=best_ticket.get("direction", "long"), entry_price_ref=entry_price_ref,
+                    target_pct=float(genome["profit_target_pct"]),
+                    stop_pct=-abs(float(genome["stop_loss_pct"])),
+                    dte_target=genome.get("dte_min", 14),
+                    stage_reached="SIGNAL", outcome_reason="BELOW_THRESHOLD",
+                )
                 continue
 
             base_notional = ACCOUNT_SIZE * TRADE_PCT
@@ -250,9 +266,11 @@ def main() -> None:
                 log_inactivity(conn, strategy_id, "E", "ZERO_SIZING", regime)
                 log_decision_input(
                     conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
-                    track="E", regime=regime, conviction_score=best_ticket.get("conviction_score", 0),
+                    track="E", regime=regime, signal_strength=best_ticket.get("conviction_score", 0),
                     archetype=genome.get("archetype") or strategy_id, is_winner=True,
-                    decision="REJECTED_TRACK", rejection_reason="ZERO_SIZING", **shadow_fields,
+                    decision="REJECTED_TRACK", rejection_reason="ZERO_SIZING",
+                    stage_reached="SIGNAL", outcome_reason="RISK_VETOED",
+                    **shadow_fields,
                 )
                 continue
 
@@ -298,9 +316,10 @@ def main() -> None:
                 proposals_submitted += 1
                 log_decision_input(
                     conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
-                    track="E", regime=regime, conviction_score=best_ticket.get("conviction_score", 0),
+                    track="E", regime=regime, signal_strength=best_ticket.get("conviction_score", 0),
                     archetype=genome.get("archetype") or strategy_id, is_winner=True,
-                    decision="TRADE_PROPOSED", ticket_id=ticket_id, **shadow_fields,
+                    decision="TRADE_PROPOSED", ticket_id=ticket_id,
+                    stage_reached="SIGNAL", **shadow_fields,
                 )
             except Exception as exc:
                 logger.error("%s: failed to insert ticket: %s", strategy_id, exc)
