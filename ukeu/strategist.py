@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import psycopg2
+import requests
 from alpaca.data import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -53,6 +54,22 @@ DISALLOWED_SIGNALS = frozenset([
     "US_MOMENTUM", "SPY", "QQQ", "DXY", "US_TECH", "AAPL", "TSLA", "NVDA",
     "sector_rotation_us",
 ])
+
+# Shortability gate — a short signal on an asset Alpaca won't let this
+# account short (e.g. EWU: shortable=False, hard-to-borrow) must never
+# become a candidate. Checked against Alpaca's own /v2/assets/{symbol},
+# cached to shared/asset-shortability-cache.json (same shared/ directory
+# already used for candidates.json / master-directives.json) with a bounded
+# TTL so borrowability changes are eventually picked up without hitting the
+# API on every symbol evaluation. execution/engine.py holds an independent
+# copy of this same check as a defense-in-depth backstop.
+ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+ALPACA_HEADERS = {
+    "APCA-API-KEY-ID": os.environ.get("ALPACA_API_KEY", ""),
+    "APCA-API-SECRET-KEY": os.environ.get("ALPACA_SECRET_KEY", ""),
+}
+SHORTABILITY_CACHE_FILE = SHARED_DIR / "asset-shortability-cache.json"
+SHORTABILITY_CACHE_TTL_HOURS = 24
 
 
 def _enforce_isolation(label: str) -> None:
@@ -119,6 +136,56 @@ def log_to_db(conn, level: str, message: str, payload: dict | None = None) -> No
         conn.commit()
     except Exception as exc:
         log.warning("DB log failed: %s", exc)
+
+
+def _load_shortability_cache() -> dict:
+    try:
+        return json.loads(SHORTABILITY_CACHE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_shortability_cache(cache: dict) -> None:
+    try:
+        SHORTABILITY_CACHE_FILE.write_text(json.dumps(cache, indent=2))
+    except OSError as exc:
+        log.warning("Failed to write shortability cache: %s", exc)
+
+
+def get_shortability(symbol: str) -> dict | None:
+    """
+    {'shortable': bool, 'easy_to_borrow': bool, 'borrow_status': str} for
+    `symbol`, from Alpaca's own /v2/assets/{symbol}. Cached with a bounded
+    TTL (SHORTABILITY_CACHE_TTL_HOURS) — never hits the API on every symbol
+    evaluation, but re-checks once the cached entry goes stale so a future
+    change in borrowability is picked up. Returns None only if there is no
+    usable cache entry AND the live lookup also failed — callers must treat
+    None as "unknown", never as "shortable".
+    """
+    cache = _load_shortability_cache()
+    entry = cache.get(symbol)
+    if entry:
+        checked_at = datetime.fromisoformat(entry["checked_at"])
+        if datetime.now(timezone.utc) - checked_at < timedelta(hours=SHORTABILITY_CACHE_TTL_HOURS):
+            return entry
+
+    try:
+        url = f"{ALPACA_BASE_URL}/v2/assets/{symbol}"
+        resp = requests.get(url, headers=ALPACA_HEADERS, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        fresh = {
+            "shortable": bool(data.get("shortable", False)),
+            "easy_to_borrow": bool(data.get("easy_to_borrow", False)),
+            "borrow_status": data.get("borrow_status", "unknown"),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        cache[symbol] = fresh
+        _save_shortability_cache(cache)
+        return fresh
+    except Exception as exc:
+        log.warning("Shortability lookup failed for %s: %s", symbol, exc)
+        return entry  # stale cache entry if any, else None
 
 
 def log_inactivity(conn, strategy_id: str, reason: str, regime: dict) -> None:
@@ -195,17 +262,27 @@ def ecb_lag_confidence_boost(z_score: float) -> float:
     return 0.0
 
 
-def analyse_symbol(symbol: str, bars_df, genome: dict) -> dict | None:
+def analyse_symbol(symbol: str, bars_df, genome: dict) -> tuple[dict | None, dict | None]:
     """
     Run mean reversion analysis on one EU symbol.
-    Returns candidate dict or None if no signal.
+
+    Returns (candidate, blocked_info) — exactly one is non-None, or both are
+    None (no signal at all). `blocked_info` is set when a genuine short
+    signal was found (passed the entry_threshold, i.e. a real opportunity)
+    but is structurally unexecutable — the asset isn't shortable on Alpaca.
+    That must never be conflated with "no signal": the caller logs it as
+    STRUCTURALLY_IMPOSSIBLE, not NO_SIGNAL, so the Learning System can tell
+    "no edge" apart from "edge found, broker won't let us take it".
+
+    Only short signals are gated — a long candidate is never blocked by
+    shortability, since it never needs to borrow the asset.
     """
     _enforce_isolation("european_mean_reversion")
 
     closes = bars_df["close"].values.astype(float)
     if len(closes) < LOOKBACK_DAYS:
         log.warning("%s: only %d days of data (need %d) — skipping", symbol, len(closes), LOOKBACK_DAYS)
-        return None
+        return None, None
 
     z_score = compute_z_score(closes, LOOKBACK_DAYS)
     log.info("%s: z-score=%.3f last_close=%.4f", symbol, z_score, closes[-1])
@@ -217,7 +294,7 @@ def analyse_symbol(symbol: str, bars_df, genome: dict) -> dict | None:
         direction = "short"  # overbought — expect reversion down
     else:
         log.info("%s: z-score %.3f within neutral band (-1.5, +1.5) — no signal", symbol, z_score)
-        return None
+        return None, None
 
     # Base confidence from z-score magnitude
     # Stronger deviation = higher confidence, capped at 0.9
@@ -230,7 +307,23 @@ def analyse_symbol(symbol: str, bars_df, genome: dict) -> dict | None:
     entry_threshold = float(genome.get("entry_threshold") or 0.5)
     if confidence < entry_threshold:
         log.info("%s: confidence %.3f < entry_threshold %.3f — no signal", symbol, confidence, entry_threshold)
-        return None
+        return None, None
+
+    # Shortability gate — this is a genuine opportunity (confidence cleared
+    # entry_threshold); if it's a short and the asset can't be shorted, it
+    # must be reported as structurally impossible, not silently dropped.
+    if direction == "short":
+        shortability = get_shortability(symbol)
+        if shortability is None or not shortability.get("shortable", False):
+            log.warning("%s: genuine short signal blocked — not shortable (%s)",
+                        symbol, shortability)
+            return None, {
+                "symbol": symbol,
+                "direction": direction,
+                "z_score": round(z_score, 4),
+                "confidence": confidence,
+                "shortability": shortability,
+            }
 
     # Parameters from genome — never hardcoded
     target_pct = float(genome.get("profit_target_pct") or 0.03)
@@ -247,7 +340,7 @@ def analyse_symbol(symbol: str, bars_df, genome: dict) -> dict | None:
     if ecb_boost > 0:
         thesis += f", ECB lag boost +{ecb_boost:.2f}"
 
-    return {
+    candidate = {
         "bot": BOT_NAME,
         "symbol": symbol,
         "direction": direction,
@@ -275,6 +368,7 @@ def analyse_symbol(symbol: str, bars_df, genome: dict) -> dict | None:
             "last_close": float(closes[-1]),
         },
     }
+    return candidate, None
 
 
 # ---------------------------------------------------------------------------
@@ -353,8 +447,14 @@ def main() -> None:
             log_inactivity(conn, genome["strategy_id"], f"NO_DATA_{symbol}", regime)
             continue
 
-        candidate = analyse_symbol(symbol, bars, genome)
-        if candidate:
+        candidate, blocked = analyse_symbol(symbol, bars, genome)
+        if blocked:
+            reason = f"STRUCTURALLY_IMPOSSIBLE_SHORT_{symbol}"
+            log_inactivity(conn, genome["strategy_id"], reason, regime)
+            log_to_db(conn, "WARNING",
+                      f"{symbol}: genuine short signal blocked — not shortable on Alpaca",
+                      blocked)
+        elif candidate:
             candidates.append(candidate)
             log.info("%s: candidate generated (direction=%s confidence=%.3f)",
                      symbol, candidate["direction"], candidate["confidence"])
