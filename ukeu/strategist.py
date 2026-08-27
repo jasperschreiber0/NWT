@@ -71,6 +71,16 @@ ALPACA_HEADERS = {
 SHORTABILITY_CACHE_FILE = SHARED_DIR / "asset-shortability-cache.json"
 SHORTABILITY_CACHE_TTL_HOURS = 24
 
+# Shadow-evaluation horizon — CLAUDE.md's documented EU holding period is
+# 2-20 days; using the upper bound means the shadow evaluator always waits
+# the full possible hold before resolving at HORIZON_EXPIRED, never cutting
+# a legitimately still-developing trade short. Without this, dte_target
+# stays NULL forever and shadow_decision_evaluator.fetch_pending_candidates
+# (which requires dte_target IS NOT NULL) never picks the row up at all —
+# every EU observation would be permanently ineligible for counterfactual
+# evaluation, silently.
+EVAL_HORIZON_DAYS = 20
+
 
 def _enforce_isolation(label: str) -> None:
     """Hard isolation: EU bot must not use US momentum or DXY signals."""
@@ -212,18 +222,18 @@ def log_decision_input(
                 INSERT INTO nwt_decision_inputs
                     (run_date, symbol, strategy_id, track, regime, signal_strength,
                      asset_class, archetype, is_winner, decision, direction,
-                     entry_price_ref, target_pct, stop_pct, genome_version,
-                     stage_reached, outcome_reason)
+                     entry_price_ref, target_pct, stop_pct, dte_target, genome_version,
+                     stage_reached, outcome_reason, poll_slot)
                 VALUES (%s, %s, %s, 'A', %s, %s, 'equity', %s, TRUE, 'CANDIDATE', %s,
-                        %s, %s, %s, %s, 'SIGNAL', %s)
-                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date)
+                        %s, %s, %s, %s, %s, 'SIGNAL', %s, '')
+                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date, poll_slot)
                 DO UPDATE SET id = nwt_decision_inputs.id
                 RETURNING id
                 """,
                 (
                     run_date, symbol, strategy_id, json.dumps(regime), signal_strength,
                     strategy_id, direction, entry_price_ref, target_pct, stop_pct,
-                    genome_version, outcome_reason,
+                    EVAL_HORIZON_DAYS, genome_version, outcome_reason,
                 ),
             )
             row = cur.fetchone()

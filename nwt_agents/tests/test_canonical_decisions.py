@@ -107,11 +107,12 @@ CREATE TABLE nwt_decision_inputs (
     shadow_completion TEXT CHECK (shadow_completion IS NULL OR shadow_completion IN (
         'TARGET_HIT', 'STOP_HIT', 'HORIZON_EXPIRED'
     )),
+    poll_slot TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE UNIQUE INDEX idx_decision_inputs_dedup
-  ON nwt_decision_inputs (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date);
+  ON nwt_decision_inputs (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date, poll_slot);
 
 CREATE TABLE IF NOT EXISTS nwt_system_log (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

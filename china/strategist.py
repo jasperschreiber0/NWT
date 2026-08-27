@@ -54,6 +54,13 @@ STRATEGY_ID = "CHINA-POL-001"
 # All 5 China/HK proxy symbols
 CHINA_SYMBOLS = ["FXI", "KWEB", "MCHI", "BABA", "TCEHY"]
 
+# Shadow-evaluation horizon — CLAUDE.md's documented China holding period is
+# 1 day to 3 weeks; using the upper bound (21 days) means shadow_decision_
+# evaluator always waits the full possible hold. Without dte_target set, a
+# row is permanently ineligible for counterfactual evaluation (fetch_
+# pending_candidates requires dte_target IS NOT NULL) — silently, forever.
+EVAL_HORIZON_DAYS = 21
+
 # ADR spread threshold — if bid-ask > 3% of mid, liquidity is too thin
 ADR_SPREAD_THRESHOLD = 0.03  # 3%
 
@@ -134,10 +141,27 @@ def log_to_db(conn, level: str, message: str, payload: dict | None = None) -> No
         log.warning("DB log failed: %s", exc)
 
 
+def current_poll_slot(now: datetime | None = None) -> str:
+    """
+    Which of China's scheduled 30-minute polls (crontab.txt: 14:00-18:00 UTC)
+    `now` belongs to, as 'HH:MM'. China's strategist re-fetches live price
+    data and recomputes momentum/confidence on EVERY poll — a later poll is
+    a genuinely new directional read, not a retry of an earlier one (unlike
+    every other Track A bot, which evaluates each symbol once a day). This
+    is the idempotency-key component that keeps those distinct reads from
+    being collapsed into one row by log_decision_input's ON CONFLICT, while
+    still collapsing a true retry of the SAME poll (cron overlap, restart
+    within the slot). See db/migrate_2026_08_read_identity_and_shadow_fix.sql.
+    """
+    now = now or datetime.now(timezone.utc)
+    slot_minute = 30 if now.minute >= 30 else 0
+    return f"{now.hour:02d}:{slot_minute:02d}"
+
+
 def log_decision_input(
     conn, run_date, symbol: str | None, strategy_id: str, genome_version: int, regime: dict,
     signal_strength: float, direction: str, entry_price_ref: float | None,
-    target_pct: float, stop_pct: float, outcome_reason: str | None = None,
+    target_pct: float, stop_pct: float, poll_slot: str, outcome_reason: str | None = None,
 ) -> int | None:
     """
     Canonical learning observation for a genuine directional read — see
@@ -146,6 +170,11 @@ def log_decision_input(
     evaluated once across the whole symbol basket, before any individual
     symbol is selected — there is no single symbol to attribute it to
     (same shape as shared_context.py's SHADOW_MUTATION_NO_MATCH rows).
+
+    poll_slot (required, not defaulted, for this bot specifically) must be
+    current_poll_slot()'s value at the moment this read was formed — see
+    that function's docstring for why China needs finer-than-daily
+    idempotency granularity.
     """
     try:
         with conn.cursor() as cur:
@@ -154,18 +183,18 @@ def log_decision_input(
                 INSERT INTO nwt_decision_inputs
                     (run_date, symbol, strategy_id, track, regime, signal_strength,
                      asset_class, archetype, is_winner, decision, direction,
-                     entry_price_ref, target_pct, stop_pct, genome_version,
-                     stage_reached, outcome_reason)
+                     entry_price_ref, target_pct, stop_pct, dte_target, genome_version,
+                     stage_reached, outcome_reason, poll_slot)
                 VALUES (%s, %s, %s, 'A', %s, %s, 'equity', %s, TRUE, 'CANDIDATE', %s,
-                        %s, %s, %s, %s, 'SIGNAL', %s)
-                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date)
+                        %s, %s, %s, %s, %s, 'SIGNAL', %s, %s)
+                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date, poll_slot)
                 DO UPDATE SET id = nwt_decision_inputs.id
                 RETURNING id
                 """,
                 (
                     run_date, symbol, strategy_id, json.dumps(regime), signal_strength,
                     strategy_id, direction, entry_price_ref, target_pct, stop_pct,
-                    genome_version, outcome_reason,
+                    EVAL_HORIZON_DAYS, genome_version, outcome_reason, poll_slot,
                 ),
             )
             row = cur.fetchone()
@@ -473,6 +502,7 @@ def main() -> None:
 
     run_date = datetime.now(timezone.utc).date()
     genome_version = genome.get("version")
+    poll_slot = current_poll_slot()
 
     if confidence < entry_threshold:
         reason = f"NO_POLICY_EDGE: confidence {confidence:.3f} < threshold {entry_threshold:.3f}"
@@ -485,7 +515,7 @@ def main() -> None:
             conn, run_date=run_date, symbol=None, strategy_id=STRATEGY_ID,
             genome_version=genome_version, regime=regime, signal_strength=confidence,
             direction="long", entry_price_ref=None, target_pct=target_pct, stop_pct=stop_pct,
-            outcome_reason="BELOW_THRESHOLD",
+            poll_slot=poll_slot, outcome_reason="BELOW_THRESHOLD",
         )
         CANDIDATES_FILE.write_text(json.dumps([], indent=2))
         conn.close()
@@ -538,6 +568,7 @@ def main() -> None:
             "confidence": sym_confidence,
             "strategy_id": STRATEGY_ID,
             "genome_version": genome_version,
+            "poll_slot": poll_slot,
             "signal_quality": {
                 "entry_timing_score": round(min(sym_momentum * 5, 1.0), 4) if sym_momentum > 0 else 0.5,
                 "thesis_validity": thesis,
@@ -565,7 +596,7 @@ def main() -> None:
             conn, run_date=run_date, symbol=symbol, strategy_id=STRATEGY_ID,
             genome_version=genome_version, regime=regime, signal_strength=sym_confidence,
             direction="long", entry_price_ref=entry_price_ref,
-            target_pct=target_pct, stop_pct=stop_pct, outcome_reason=None,
+            target_pct=target_pct, stop_pct=stop_pct, poll_slot=poll_slot, outcome_reason=None,
         )
 
     CANDIDATES_FILE.write_text(json.dumps(candidates, indent=2))

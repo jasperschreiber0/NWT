@@ -70,6 +70,7 @@ def link_decision_ticket(conn, strategy_id: str, symbol: str, genome_version, ru
                   AND COALESCE(genome_version, 0) = COALESCE(%s, 0)
                   AND COALESCE(symbol, '') = COALESCE(%s, '')
                   AND run_date = %s
+                  AND poll_slot = ''
                   AND ticket_id IS NULL
                 """,
                 (ticket_id, strategy_id, genome_version, symbol, run_date),

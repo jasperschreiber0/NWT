@@ -499,6 +499,7 @@ def log_decision_input(
     asset_class: str = None,
     stage_reached: str = None,
     outcome_reason: str = None,
+    poll_slot: str = "",
 ) -> int | None:
     """
     INSERT one row into nwt_decision_inputs — the canonical learning
@@ -506,6 +507,13 @@ def log_decision_input(
     trade. entry_price_ref/target_pct/stop_pct/dte_target are required for
     shadow_decision_evaluator.py to later compute would_have_won; leave them
     None if unavailable (e.g. no layer0 price data) rather than guessing.
+
+    poll_slot distinguishes a genuinely new read from a retry for
+    poll-cadence strategists (China: fires every 30 minutes, 14:00-18:00
+    UTC, and re-evaluates with fresh data each time — a later poll is NOT a
+    retry of an earlier one). Leave '' (default) for every once-daily
+    strategist, where day-granularity alone is already correct. See
+    db/migrate_2026_08_read_identity_and_shadow_fix.sql.
 
     signal_strength is the strategy's actual numeric directional signal
     (conviction score for Track C/D/E; z-score, ORB score, or confidence for
@@ -547,10 +555,11 @@ def log_decision_input(
                     (run_date, symbol, strategy_id, track, regime, conviction_score,
                      signal_strength, asset_class, archetype, is_winner, decision,
                      direction, rejection_reason, entry_price_ref, target_pct, stop_pct,
-                     dte_target, ticket_id, genome_version, stage_reached, outcome_reason)
+                     dte_target, ticket_id, genome_version, stage_reached, outcome_reason,
+                     poll_slot)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s)
-                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date)
+                        %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date, poll_slot)
                 DO UPDATE SET id = nwt_decision_inputs.id
                 RETURNING id
                 """,
@@ -559,6 +568,7 @@ def log_decision_input(
                     signal_strength, asset_class, archetype, is_winner, decision,
                     direction, rejection_reason, entry_price_ref, target_pct, stop_pct,
                     dte_target, ticket_id, genome_version, stage_reached, outcome_reason,
+                    poll_slot,
                 ),
             )
             row = cur.fetchone()
@@ -628,6 +638,7 @@ def link_decision_outcome(conn, ticket_id: str, outcome_id: str) -> None:
 
 def link_decision_ticket(
     conn, strategy_id: str, symbol: str, run_date, ticket_id: str, genome_version: int = None,
+    poll_slot: str = "",
 ) -> None:
     """
     Set ticket_id on a decision_inputs row that was written before the
@@ -636,6 +647,8 @@ def link_decision_ticket(
     the ticket later). Uses the same deterministic idempotency key as
     log_decision_input's ON CONFLICT target — exact match, never a fuzzy
     timestamp/symbol search. No-op if the row already has a ticket_id.
+    poll_slot must match what the strategist wrote (propagated through the
+    candidate, same as genome_version) for poll-cadence strategists.
     """
     try:
         with conn.cursor() as cur:
@@ -647,9 +660,10 @@ def link_decision_ticket(
                   AND COALESCE(genome_version, 0) = COALESCE(%s, 0)
                   AND COALESCE(symbol, '') = COALESCE(%s, '')
                   AND run_date = %s
+                  AND poll_slot = %s
                   AND ticket_id IS NULL
                 """,
-                (ticket_id, strategy_id, genome_version, symbol, run_date),
+                (ticket_id, strategy_id, genome_version, symbol, run_date, poll_slot),
             )
         conn.commit()
     except Exception as exc:

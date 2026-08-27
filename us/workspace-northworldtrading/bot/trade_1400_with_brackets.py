@@ -58,6 +58,13 @@ SYMBOL_THRESHOLDS = {
 }
 MAX_SCORE = 5  # 5 scoring components per symbol
 
+# Shadow-evaluation horizon — CLAUDE.md's documented US holding period is
+# intraday to 5 days; using the upper bound means shadow_decision_evaluator
+# always waits the full possible hold. Without dte_target set, a row is
+# permanently ineligible for counterfactual evaluation (fetch_pending_
+# candidates requires dte_target IS NOT NULL) — silently, forever.
+EVAL_HORIZON_DAYS = 5
+
 # ORB window: 9:30–10:00 ET = 14:30–15:00 UTC
 ORB_START_UTC = 14 * 60 + 30   # minutes since midnight UTC
 ORB_END_UTC   = 15 * 60 + 0
@@ -160,18 +167,18 @@ def log_decision_input(
                 INSERT INTO nwt_decision_inputs
                     (run_date, symbol, strategy_id, track, regime, signal_strength,
                      asset_class, archetype, is_winner, decision, direction,
-                     entry_price_ref, target_pct, stop_pct, genome_version,
-                     stage_reached, outcome_reason)
+                     entry_price_ref, target_pct, stop_pct, dte_target, genome_version,
+                     stage_reached, outcome_reason, poll_slot)
                 VALUES (%s, %s, %s, 'A', %s, %s, 'equity', %s, TRUE, 'CANDIDATE', %s,
-                        %s, %s, %s, %s, 'SIGNAL', %s)
-                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date)
+                        %s, %s, %s, %s, %s, 'SIGNAL', %s, '')
+                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date, poll_slot)
                 DO UPDATE SET id = nwt_decision_inputs.id
                 RETURNING id
                 """,
                 (
                     run_date, symbol, STRATEGY_ID, json.dumps(regime), signal_strength,
                     STRATEGY_ID, direction, entry_price_ref, target_pct, stop_pct,
-                    genome_version, outcome_reason,
+                    EVAL_HORIZON_DAYS, genome_version, outcome_reason,
                 ),
             )
             row = cur.fetchone()

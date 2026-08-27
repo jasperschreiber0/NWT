@@ -47,6 +47,13 @@ BOT_NAME = "aus"
 AUS_SYMBOLS = ["EWA", "BHP", "RIO"]
 FETCH_DAYS = 35  # buffer for weekends/holidays
 
+# Shadow-evaluation horizon — CLAUDE.md's documented AUS holding period is
+# 1-8 weeks; using the upper bound (56 days) means shadow_decision_evaluator
+# always waits the full possible hold. Without dte_target set, a row is
+# permanently ineligible for counterfactual evaluation (fetch_pending_
+# candidates requires dte_target IS NOT NULL) — silently, forever.
+EVAL_HORIZON_DAYS = 56
+
 # ISOLATION: disallow all intraday and US technical signals
 DISALLOWED_SIGNALS = frozenset([
     "intraday", "ORB", "VWAP", "options", "US_MOMENTUM",
@@ -189,18 +196,18 @@ def log_decision_input(
                 INSERT INTO nwt_decision_inputs
                     (run_date, symbol, strategy_id, track, regime, signal_strength,
                      asset_class, archetype, is_winner, decision, direction,
-                     entry_price_ref, target_pct, stop_pct, genome_version,
-                     stage_reached, outcome_reason)
+                     entry_price_ref, target_pct, stop_pct, dte_target, genome_version,
+                     stage_reached, outcome_reason, poll_slot)
                 VALUES (%s, %s, %s, 'A', %s, %s, 'equity', %s, TRUE, 'CANDIDATE', %s,
-                        %s, %s, %s, %s, 'SIGNAL', %s)
-                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date)
+                        %s, %s, %s, %s, %s, 'SIGNAL', %s, '')
+                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date, poll_slot)
                 DO UPDATE SET id = nwt_decision_inputs.id
                 RETURNING id
                 """,
                 (
                     run_date, symbol, strategy_id, json.dumps(regime), signal_strength,
                     strategy_id, direction, entry_price_ref, target_pct, stop_pct,
-                    genome_version, outcome_reason,
+                    EVAL_HORIZON_DAYS, genome_version, outcome_reason,
                 ),
             )
             row = cur.fetchone()
