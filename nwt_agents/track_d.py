@@ -165,6 +165,7 @@ def main() -> None:
                     log_decision_input(
                         conn, run_date=run_date, symbol=weak_symbol, strategy_id=strategy_id,
                         track="D", regime=regime, signal_strength=weakest.get("conviction_score", 0),
+                        genome_version=genome.get("version"),
                         archetype=genome.get("archetype") or strategy_id, is_winner=False,
                         decision="REJECTED_TRACK", rejection_reason=reason,
                         direction=weakest.get("direction", "long"), entry_price_ref=entry_price_ref,
@@ -213,6 +214,7 @@ def main() -> None:
                 log_decision_input(
                     conn, run_date=run_date, symbol=ticket.get("symbol"), strategy_id=strategy_id,
                     track="D", regime=regime, signal_strength=ticket.get("conviction_score", 0),
+                    genome_version=genome.get("version"),
                     archetype=arch, is_winner=False, decision="REJECTED_TRACK",
                     rejection_reason=(
                         f"ARCHETYPE_CONSOLIDATED: conviction {ticket.get('conviction_score', 0)} "
@@ -233,6 +235,7 @@ def main() -> None:
                 log_decision_input(
                     conn, run_date=run_date, symbol=best_ticket.get("symbol"), strategy_id=strategy_id,
                     track="D", regime=regime, signal_strength=best_ticket.get("conviction_score", 0),
+                    genome_version=genome.get("version"),
                     archetype=archetype, is_winner=True, decision="REJECTED_TRACK",
                     rejection_reason="ZERO_SIZING",
                     stage_reached="SIGNAL", outcome_reason="RISK_VETOED",
@@ -283,6 +286,7 @@ def main() -> None:
                 log_decision_input(
                     conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
                     track="D", regime=regime, signal_strength=best_ticket.get("conviction_score", 0),
+                    genome_version=genome.get("version"),
                     archetype=archetype, is_winner=True, decision="TRADE_PROPOSED",
                     ticket_id=ticket_id, stage_reached="SIGNAL", **shadow_fields,
                 )
