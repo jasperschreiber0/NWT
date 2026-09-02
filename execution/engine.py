@@ -760,18 +760,38 @@ def run_equity_position_monitor(conn) -> None:
 
 def _close_equity_position(conn, pos, current_price, position_id, symbol,
                             notional, entry_price, exit_reason) -> None:
+    """
+    Side must match the position's own direction: closing a short means
+    BUYING it back, not selling more of it. place_close_order() defaults to
+    side="sell" (correct only for longs) — this path must pass the direction
+    explicitly, exactly like process_close_ticket() already does.
+    """
     try:
+        direction = pos.get("direction", "long")
+        close_side = "buy" if direction == "short" else "sell"
         qty = compute_qty_from_notional(notional, entry_price)
-        order = place_close_order(symbol, qty, "equity")
+        order = place_close_order(symbol, qty, "equity", side=close_side)
         filled = poll_order_until_filled(order["id"])
-        fill_price = float(filled.get("filled_avg_price") or current_price)
+        fill_price = float(filled.get("filled_avg_price") or 0)
+        fill_status = filled.get("status", "")
+
+        if fill_status != "filled" or fill_price <= 0:
+            logger.error("Equity close for %s (position_id=%s) not filled — status=%s",
+                        symbol, position_id, fill_status)
+            log_system_event(conn, "ERROR", "execution_engine",
+                             f"Equity close for {symbol} not filled — status={fill_status}",
+                             {"position_id": position_id, "exit_reason": exit_reason,
+                              "order_id": order.get("id")})
+            return
+
         slippage = abs(fill_price - current_price) / current_price if current_price > 0 else 0.0
         close_position(conn, position_id, fill_price, slippage, exit_reason)
         log_system_event(conn, "INFO", "execution_engine",
                          f"Closed equity {symbol} reason={exit_reason} fill={fill_price:.4f}",
                          {"position_id": position_id, "exit_reason": exit_reason,
-                          "fill_price": fill_price})
-        logger.info("Closed equity %s at %.4f reason=%s", symbol, fill_price, exit_reason)
+                          "fill_price": fill_price, "side": close_side,
+                          "order_id": order.get("id")})
+        logger.info("Closed equity %s at %.4f reason=%s side=%s", symbol, fill_price, exit_reason, close_side)
     except Exception as exc:
         logger.error("Failed to close equity position %s: %s", position_id, exc)
         log_system_event(conn, "ERROR", "execution_engine",
