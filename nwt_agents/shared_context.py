@@ -484,7 +484,7 @@ def log_decision_input(
     strategy_id: str,
     track: str,
     regime: dict,
-    conviction_score: float,
+    signal_strength: float,
     archetype: str,
     is_winner: bool,
     decision: str,
@@ -496,42 +496,205 @@ def log_decision_input(
     dte_target: int = None,
     ticket_id: str = None,
     genome_version: int = None,
-) -> None:
+    asset_class: str = None,
+    stage_reached: str = None,
+    outcome_reason: str = None,
+    poll_slot: str = "",
+) -> int | None:
     """
-    INSERT one row into nwt_decision_inputs for a candidate that was eligible
-    to trade this run (matched regime + asset_universe + entry_threshold),
-    whether or not it was the archetype winner. entry_price_ref/target_pct/
-    stop_pct/dte_target are required for shadow_decision_evaluator.py to
-    later compute would_have_won; leave them None if unavailable (e.g. no
-    layer0 price data) rather than guessing.
+    INSERT one row into nwt_decision_inputs — the canonical learning
+    observation for a genuine directional read, whether or not it becomes a
+    trade. entry_price_ref/target_pct/stop_pct/dte_target are required for
+    shadow_decision_evaluator.py to later compute would_have_won; leave them
+    None if unavailable (e.g. no layer0 price data) rather than guessing.
+
+    poll_slot distinguishes a genuinely new read from a retry for
+    poll-cadence strategists (China: fires every 30 minutes, 14:00-18:00
+    UTC, and re-evaluates with fresh data each time — a later poll is NOT a
+    retry of an earlier one). Leave '' (default) for every once-daily
+    strategist, where day-granularity alone is already correct. See
+    db/migrate_2026_08_read_identity_and_shadow_fix.sql.
+
+    signal_strength is the strategy's actual numeric directional signal
+    (conviction score for Track C/D/E; z-score, ORB score, or confidence for
+    Track A) — written to BOTH the new signal_strength column and (when
+    track is C/D/E) the legacy conviction_score column, so existing readers
+    of conviction_score are unaffected.
+
+    asset_class defaults to 'option' for track in ('C','D','E'), 'equity'
+    otherwise — pass explicitly to override.
 
     genome_version ties a row to the specific genome version it was
     evaluated against — set it when logging a Strategy Mutator shadow
     evaluation (decision='SHADOW_MUTATION') so the promotion job can group
     a mutation candidate's outcomes separately from its baseline's.
+
+    outcome_reason is the controlled-vocabulary terminal state (NO_EDGE /
+    BELOW_THRESHOLD / RISK_VETOED / EXECUTION_FAILED / STRUCTURALLY_IMPOSSIBLE
+    / DUPLICATE_POSITION / EXECUTED) when already known at write time (e.g. a
+    strategist rejecting its own candidate); leave None when the observation
+    is still pending a downstream decision — mark_decision_outcome() fills it
+    in later, keyed by ticket_id.
+
+    Idempotent: a retry with the same (strategy_id, genome_version, symbol,
+    run_date) — cron retry, process restart, recovery job — is a no-op that
+    still returns the existing row's id, never a duplicate row.
+
+    Returns the row id (new or pre-existing), or None if the write failed
+    (never raises — a learning-data write must not break the calling agent).
     """
+    if asset_class is None:
+        asset_class = "option" if track in ("C", "D", "E") else "equity"
+    conviction_score = signal_strength if track in ("C", "D", "E") else None
+
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO nwt_decision_inputs
                     (run_date, symbol, strategy_id, track, regime, conviction_score,
-                     archetype, is_winner, decision, direction, rejection_reason,
-                     entry_price_ref, target_pct, stop_pct, dte_target, ticket_id,
-                     genome_version)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     signal_strength, asset_class, archetype, is_winner, decision,
+                     direction, rejection_reason, entry_price_ref, target_pct, stop_pct,
+                     dte_target, ticket_id, genome_version, stage_reached, outcome_reason,
+                     poll_slot)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date, poll_slot)
+                DO UPDATE SET id = nwt_decision_inputs.id
+                RETURNING id
                 """,
                 (
                     run_date, symbol, strategy_id, track, json.dumps(regime), conviction_score,
-                    archetype, is_winner, decision, direction, rejection_reason,
-                    entry_price_ref, target_pct, stop_pct, dte_target, ticket_id,
-                    genome_version,
+                    signal_strength, asset_class, archetype, is_winner, decision,
+                    direction, rejection_reason, entry_price_ref, target_pct, stop_pct,
+                    dte_target, ticket_id, genome_version, stage_reached, outcome_reason,
+                    poll_slot,
                 ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        try:
+            from opportunity_outcomes import opportunity_id_for, upsert_outcome
+            opportunity_id = opportunity_id_for(
+                strategy_id, symbol, run_date, track, genome_version, poll_slot)
+            upsert_outcome(conn, opportunity_id, "RAW_SHADOW", {
+                "strategy_id": strategy_id,
+                "symbol": symbol,
+                "direction": direction,
+                "track": track,
+                "regime": regime,
+                "proposed_qty": None,
+                "entry_price": entry_price_ref,
+                "decision": decision,
+                "decision_reason": rejection_reason or outcome_reason,
+                "source_ticket_id": ticket_id,
+                "source_decision_id": row[0] if row else None,
+            })
+        except Exception:
+            # Canonical logging committed above. Recover the failed analytics
+            # transaction before handing the connection back to the caller.
+            conn.rollback()
+            import logging
+            logging.getLogger(__name__).warning(
+                "Raw opportunity write failed for decision %s; retry required",
+                row[0] if row else None)
+        return row[0] if row else None
+    except Exception as exc:
+        conn.rollback()
+        log_system_event(conn, "WARNING", f"track_{track.lower()}",
+                         f"log_decision_input insert failed for {strategy_id}: {exc}")
+        return None
+
+
+def mark_decision_outcome(conn, ticket_id: str, outcome_reason: str) -> None:
+    """
+    Set the terminal outcome_reason on the nwt_decision_inputs row this
+    ticket_id was linked to (log_decision_input's ticket_id param, or a
+    later executor-side UPDATE for Track A). Only fills a NULL — never
+    overwrites an outcome_reason already set, so an out-of-order or
+    duplicate call from a retry can't clobber a real terminal state.
+    Never raises — an outcome-linking failure must not break the caller.
+    """
+    if not ticket_id:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nwt_decision_inputs
+                SET outcome_reason = %s
+                WHERE ticket_id = %s AND outcome_reason IS NULL
+                """,
+                (outcome_reason, ticket_id),
             )
         conn.commit()
     except Exception as exc:
-        log_system_event(conn, "WARNING", f"track_{track.lower()}",
-                         f"log_decision_input insert failed for {strategy_id}: {exc}")
+        conn.rollback()
+        log_system_event(conn, "WARNING", "shared_context",
+                         f"mark_decision_outcome failed for ticket {ticket_id}: {exc}")
+
+
+def link_decision_outcome(conn, ticket_id: str, outcome_id: str) -> None:
+    """
+    Set outcome_id on the nwt_decision_inputs row this ticket_id was linked
+    to, once its trade has actually closed and produced a nwt_trade_outcomes
+    row. ticket_id must be resolved deterministically by the caller (e.g.
+    via nwt_portfolio_ledger.ticket_id, not a fuzzy alpaca_order_id/symbol
+    search) — see learning_agent.py. Only fills a NULL; never raises.
+    """
+    if not ticket_id or not outcome_id:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nwt_decision_inputs
+                SET outcome_id = %s, outcome_reason = COALESCE(outcome_reason, 'EXECUTED')
+                WHERE ticket_id = %s AND outcome_id IS NULL
+                """,
+                (outcome_id, ticket_id),
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        log_system_event(conn, "WARNING", "shared_context",
+                         f"link_decision_outcome failed for ticket {ticket_id}: {exc}")
+
+
+def link_decision_ticket(
+    conn, strategy_id: str, symbol: str, run_date, ticket_id: str, genome_version: int = None,
+    poll_slot: str = "",
+) -> None:
+    """
+    Set ticket_id on a decision_inputs row that was written before the
+    ticket existed (Track A: strategist and executor are separate daily
+    processes — the strategist writes the observation, the executor creates
+    the ticket later). Uses the same deterministic idempotency key as
+    log_decision_input's ON CONFLICT target — exact match, never a fuzzy
+    timestamp/symbol search. No-op if the row already has a ticket_id.
+    poll_slot must match what the strategist wrote (propagated through the
+    candidate, same as genome_version) for poll-cadence strategists.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nwt_decision_inputs
+                SET ticket_id = %s
+                WHERE strategy_id = %s
+                  AND COALESCE(genome_version, 0) = COALESCE(%s, 0)
+                  AND COALESCE(symbol, '') = COALESCE(%s, '')
+                  AND run_date = %s
+                  AND poll_slot = %s
+                  AND ticket_id IS NULL
+                """,
+                (ticket_id, strategy_id, genome_version, symbol, run_date, poll_slot),
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        log_system_event(conn, "WARNING", "shared_context",
+                         f"link_decision_ticket failed for {strategy_id}/{symbol}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +738,7 @@ def evaluate_shadow_mutation(
     if ticket is None:
         log_decision_input(
             conn, run_date=run_date, symbol=None, strategy_id=strategy_id,
-            track=track, regime=current_regime, conviction_score=0,
+            track=track, regime=current_regime, signal_strength=0,
             archetype=shadow_genome.get("archetype") or strategy_id, is_winner=False,
             decision="SHADOW_MUTATION_NO_MATCH", genome_version=version,
         )
@@ -588,7 +751,7 @@ def evaluate_shadow_mutation(
 
     log_decision_input(
         conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
-        track=track, regime=current_regime, conviction_score=ticket.get("conviction_score", 0),
+        track=track, regime=current_regime, signal_strength=ticket.get("conviction_score", 0),
         archetype=shadow_genome.get("archetype") or strategy_id, is_winner=True,
         decision="SHADOW_MUTATION", direction=ticket.get("direction", "long"),
         entry_price_ref=entry_price_ref,
@@ -760,3 +923,4 @@ def insert_decision(
             (ticket_id, decision, reasoning, decided_by, sizing_multiplier),
         )
     conn.commit()
+

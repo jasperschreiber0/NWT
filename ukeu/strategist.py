@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import psycopg2
+import requests
 from alpaca.data import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -53,6 +54,32 @@ DISALLOWED_SIGNALS = frozenset([
     "US_MOMENTUM", "SPY", "QQQ", "DXY", "US_TECH", "AAPL", "TSLA", "NVDA",
     "sector_rotation_us",
 ])
+
+# Shortability gate — a short signal on an asset Alpaca won't let this
+# account short (e.g. EWU: shortable=False, hard-to-borrow) must never
+# become a candidate. Checked against Alpaca's own /v2/assets/{symbol},
+# cached to shared/asset-shortability-cache.json (same shared/ directory
+# already used for candidates.json / master-directives.json) with a bounded
+# TTL so borrowability changes are eventually picked up without hitting the
+# API on every symbol evaluation. execution/engine.py holds an independent
+# copy of this same check as a defense-in-depth backstop.
+ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+ALPACA_HEADERS = {
+    "APCA-API-KEY-ID": os.environ.get("ALPACA_API_KEY", ""),
+    "APCA-API-SECRET-KEY": os.environ.get("ALPACA_SECRET_KEY", ""),
+}
+SHORTABILITY_CACHE_FILE = SHARED_DIR / "asset-shortability-cache.json"
+SHORTABILITY_CACHE_TTL_HOURS = 24
+
+# Shadow-evaluation horizon — CLAUDE.md's documented EU holding period is
+# 2-20 days; using the upper bound means the shadow evaluator always waits
+# the full possible hold before resolving at HORIZON_EXPIRED, never cutting
+# a legitimately still-developing trade short. Without this, dte_target
+# stays NULL forever and shadow_decision_evaluator.fetch_pending_candidates
+# (which requires dte_target IS NOT NULL) never picks the row up at all —
+# every EU observation would be permanently ineligible for counterfactual
+# evaluation, silently.
+EVAL_HORIZON_DAYS = 20
 
 
 def _enforce_isolation(label: str) -> None:
@@ -119,6 +146,107 @@ def log_to_db(conn, level: str, message: str, payload: dict | None = None) -> No
         conn.commit()
     except Exception as exc:
         log.warning("DB log failed: %s", exc)
+
+
+def _load_shortability_cache() -> dict:
+    try:
+        return json.loads(SHORTABILITY_CACHE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_shortability_cache(cache: dict) -> None:
+    try:
+        SHORTABILITY_CACHE_FILE.write_text(json.dumps(cache, indent=2))
+    except OSError as exc:
+        log.warning("Failed to write shortability cache: %s", exc)
+
+
+def get_shortability(symbol: str) -> dict | None:
+    """
+    {'shortable': bool, 'easy_to_borrow': bool, 'borrow_status': str} for
+    `symbol`, from Alpaca's own /v2/assets/{symbol}. Cached with a bounded
+    TTL (SHORTABILITY_CACHE_TTL_HOURS) — never hits the API on every symbol
+    evaluation, but re-checks once the cached entry goes stale so a future
+    change in borrowability is picked up. Returns None only if there is no
+    usable cache entry AND the live lookup also failed — callers must treat
+    None as "unknown", never as "shortable".
+    """
+    cache = _load_shortability_cache()
+    entry = cache.get(symbol)
+    if entry:
+        checked_at_raw = entry.get("checked_at")
+        if checked_at_raw:
+            checked_at = datetime.fromisoformat(checked_at_raw)
+        else:
+            checked_at = datetime.fromtimestamp(SHORTABILITY_CACHE_FILE.stat().st_mtime, tz=timezone.utc)
+        if datetime.now(timezone.utc) - checked_at < timedelta(hours=SHORTABILITY_CACHE_TTL_HOURS):
+            return entry
+
+    try:
+        url = f"{ALPACA_BASE_URL}/v2/assets/{symbol}"
+        resp = requests.get(url, headers=ALPACA_HEADERS, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        fresh = {
+            "shortable": bool(data.get("shortable", False)),
+            "easy_to_borrow": bool(data.get("easy_to_borrow", False)),
+            "borrow_status": data.get("borrow_status", "unknown"),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        cache[symbol] = fresh
+        _save_shortability_cache(cache)
+        return fresh
+    except Exception as exc:
+        log.warning("Shortability lookup failed for %s: %s", symbol, exc)
+        return entry  # stale cache entry if any, else None
+
+
+def log_decision_input(
+    conn, run_date, symbol: str, strategy_id: str, genome_version: int, regime: dict,
+    signal_strength: float, direction: str, entry_price_ref: float | None,
+    target_pct: float, stop_pct: float, outcome_reason: str | None = None,
+) -> int | None:
+    """
+    INSERT one canonical learning observation for a genuine directional
+    read (see db/migrate_2026_08_canonical_decisions.sql) — the Track A
+    equivalent of nwt_agents/shared_context.py's log_decision_input,
+    duplicated here per this repo's existing convention (Track A bots have
+    no shared import path to nwt_agents/). archetype = strategy_id, matching
+    migrate_2026_06_archetypes.sql's "Track A: each strategy is already its
+    own bucket". is_winner=TRUE — Track A has no archetype-consolidation
+    concept, every genuine read logged here is by definition the only one.
+    Idempotent via the same (strategy_id, genome_version, symbol, run_date)
+    key every track uses — a strategist retry on the same day is a no-op.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_decision_inputs
+                    (run_date, symbol, strategy_id, track, regime, signal_strength,
+                     asset_class, archetype, is_winner, decision, direction,
+                     entry_price_ref, target_pct, stop_pct, dte_target, genome_version,
+                     stage_reached, outcome_reason, poll_slot)
+                VALUES (%s, %s, %s, 'A', %s, %s, 'equity', %s, TRUE, 'CANDIDATE', %s,
+                        %s, %s, %s, %s, %s, 'SIGNAL', %s, '')
+                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date, poll_slot)
+                DO UPDATE SET id = nwt_decision_inputs.id
+                RETURNING id
+                """,
+                (
+                    run_date, symbol, strategy_id, json.dumps(regime), signal_strength,
+                    strategy_id, direction, entry_price_ref, target_pct, stop_pct,
+                    EVAL_HORIZON_DAYS, genome_version, outcome_reason,
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    except Exception as exc:
+        conn.rollback()
+        log.warning("log_decision_input failed for %s: %s", symbol, exc)
+        return None
 
 
 def log_inactivity(conn, strategy_id: str, reason: str, regime: dict) -> None:
@@ -195,17 +323,37 @@ def ecb_lag_confidence_boost(z_score: float) -> float:
     return 0.0
 
 
-def analyse_symbol(symbol: str, bars_df, genome: dict) -> dict | None:
+def analyse_symbol(symbol: str, bars_df, genome: dict) -> tuple[dict | None, dict | None]:
     """
     Run mean reversion analysis on one EU symbol.
-    Returns candidate dict or None if no signal.
+
+    Returns (candidate, observation) — exactly one is non-None, or both are
+    None when no directional thesis forms at all (z-score in the neutral
+    band — nothing to observe, per the canonical-decision model's own rule:
+    a symbol-level observation is only logged for a GENUINE directional
+    read, never manufactured for "nothing happened").
+
+    `observation` is set for two distinct blocked-but-genuine cases, tagged
+    by observation["outcome_reason"]:
+      - BELOW_THRESHOLD: a direction was assigned (|z-score| > 1.5) but
+        confidence didn't clear entry_threshold. This is exactly the
+        "genuine opportunity, just weak" case the Learning System needs to
+        see signal_strength buckets below the live threshold.
+      - STRUCTURALLY_IMPOSSIBLE: confidence cleared entry_threshold (a real
+        opportunity) but the asset isn't shortable on Alpaca.
+    Neither may be conflated with "no signal" — the caller logs each by its
+    own outcome_reason, not a generic NO_SIGNAL, so the Learning System can
+    tell "no edge" apart from "edge found, blocked before/after threshold".
+
+    Only short signals are gated by shortability — a long candidate is
+    never blocked by it, since it never needs to borrow the asset.
     """
     _enforce_isolation("european_mean_reversion")
 
     closes = bars_df["close"].values.astype(float)
     if len(closes) < LOOKBACK_DAYS:
         log.warning("%s: only %d days of data (need %d) — skipping", symbol, len(closes), LOOKBACK_DAYS)
-        return None
+        return None, None
 
     z_score = compute_z_score(closes, LOOKBACK_DAYS)
     log.info("%s: z-score=%.3f last_close=%.4f", symbol, z_score, closes[-1])
@@ -217,7 +365,7 @@ def analyse_symbol(symbol: str, bars_df, genome: dict) -> dict | None:
         direction = "short"  # overbought — expect reversion down
     else:
         log.info("%s: z-score %.3f within neutral band (-1.5, +1.5) — no signal", symbol, z_score)
-        return None
+        return None, None
 
     # Base confidence from z-score magnitude
     # Stronger deviation = higher confidence, capped at 0.9
@@ -227,15 +375,47 @@ def analyse_symbol(symbol: str, bars_df, genome: dict) -> dict | None:
     ecb_boost = ecb_lag_confidence_boost(z_score) if direction == "long" else 0.0
     confidence = round(min(base_confidence + ecb_boost, 0.95), 4)
 
-    entry_threshold = float(genome.get("entry_threshold") or 0.5)
-    if confidence < entry_threshold:
-        log.info("%s: confidence %.3f < entry_threshold %.3f — no signal", symbol, confidence, entry_threshold)
-        return None
-
-    # Parameters from genome — never hardcoded
+    # Parameters from genome — never hardcoded. Computed before the
+    # threshold/shortability gates below so a blocked-but-genuine
+    # observation still carries real target/stop, not a guess.
     target_pct = float(genome.get("profit_target_pct") or 0.03)
     stop_pct = -abs(float(genome.get("stop_loss_pct") or 0.015))
     strategy_id = genome["strategy_id"]
+    entry_price_ref = float(closes[-1])
+
+    entry_threshold = float(genome.get("entry_threshold") or 0.5)
+    if confidence < entry_threshold:
+        log.info("%s: confidence %.3f < entry_threshold %.3f — no signal", symbol, confidence, entry_threshold)
+        return None, {
+            "symbol": symbol,
+            "direction": direction,
+            "z_score": round(z_score, 4),
+            "confidence": confidence,
+            "entry_price_ref": entry_price_ref,
+            "target_pct": target_pct,
+            "stop_pct": stop_pct,
+            "outcome_reason": "BELOW_THRESHOLD",
+        }
+
+    # Shortability gate — this is a genuine opportunity (confidence cleared
+    # entry_threshold); if it's a short and the asset can't be shorted, it
+    # must be reported as structurally impossible, not silently dropped.
+    if direction == "short":
+        shortability = get_shortability(symbol)
+        if shortability is None or not shortability.get("shortable", False):
+            log.warning("%s: genuine short signal blocked — not shortable (%s)",
+                        symbol, shortability)
+            return None, {
+                "symbol": symbol,
+                "direction": direction,
+                "z_score": round(z_score, 4),
+                "confidence": confidence,
+                "shortability": shortability,
+                "entry_price_ref": entry_price_ref,
+                "target_pct": target_pct,
+                "stop_pct": stop_pct,
+                "outcome_reason": "STRUCTURALLY_IMPOSSIBLE",
+            }
 
     window_mean = float(np.mean(closes[-LOOKBACK_DAYS:]))
     window_std = float(np.std(closes[-LOOKBACK_DAYS:], ddof=1))
@@ -247,12 +427,13 @@ def analyse_symbol(symbol: str, bars_df, genome: dict) -> dict | None:
     if ecb_boost > 0:
         thesis += f", ECB lag boost +{ecb_boost:.2f}"
 
-    return {
+    candidate = {
         "bot": BOT_NAME,
         "symbol": symbol,
         "direction": direction,
         "confidence": confidence,
         "strategy_id": strategy_id,
+        "genome_version": genome.get("version"),
         "signal_quality": {
             "entry_timing_score": round(min(abs(z_score) / 2.5, 1.0), 4),
             "thesis_validity": thesis,
@@ -275,6 +456,7 @@ def analyse_symbol(symbol: str, bars_df, genome: dict) -> dict | None:
             "last_close": float(closes[-1]),
         },
     }
+    return candidate, None
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +527,8 @@ def main() -> None:
         sys.exit(1)
 
     # Step 4: Analyse each symbol
+    run_date = datetime.now(timezone.utc).date()
+    genome_version = genome.get("version")
     candidates = []
     for symbol in EU_SYMBOLS:
         bars = bars_by_symbol.get(symbol)
@@ -353,11 +537,36 @@ def main() -> None:
             log_inactivity(conn, genome["strategy_id"], f"NO_DATA_{symbol}", regime)
             continue
 
-        candidate = analyse_symbol(symbol, bars, genome)
-        if candidate:
+        candidate, observation = analyse_symbol(symbol, bars, genome)
+        if observation:
+            outcome_reason = observation["outcome_reason"]
+            reason = f"{outcome_reason}_{symbol}" if outcome_reason == "BELOW_THRESHOLD" \
+                else f"STRUCTURALLY_IMPOSSIBLE_SHORT_{symbol}"
+            log_inactivity(conn, genome["strategy_id"], reason, regime)
+            log_to_db(conn, "WARNING",
+                      f"{symbol}: genuine {observation['direction']} signal blocked ({outcome_reason})",
+                      observation)
+            log_decision_input(
+                conn, run_date=run_date, symbol=symbol, strategy_id=genome["strategy_id"],
+                genome_version=genome_version, regime=regime,
+                signal_strength=observation["z_score"], direction=observation["direction"],
+                entry_price_ref=observation["entry_price_ref"], target_pct=observation["target_pct"],
+                stop_pct=observation["stop_pct"], outcome_reason=outcome_reason,
+            )
+        elif candidate:
             candidates.append(candidate)
             log.info("%s: candidate generated (direction=%s confidence=%.3f)",
                      symbol, candidate["direction"], candidate["confidence"])
+            dbg = candidate["_debug"]
+            log_decision_input(
+                conn, run_date=run_date, symbol=symbol, strategy_id=genome["strategy_id"],
+                genome_version=genome_version, regime=regime,
+                signal_strength=dbg["z_score"], direction=candidate["direction"],
+                entry_price_ref=dbg["last_close"],
+                target_pct=candidate["expected_payoff"]["target_pct"],
+                stop_pct=candidate["expected_payoff"]["stop_pct"],
+                outcome_reason=None,  # pending — executor links ticket_id, downstream resolves it
+            )
         else:
             log_inactivity(conn, genome["strategy_id"], f"NO_SIGNAL_{symbol}", regime)
 
@@ -379,3 +588,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

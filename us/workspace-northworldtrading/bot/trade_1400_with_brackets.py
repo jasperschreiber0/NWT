@@ -58,6 +58,13 @@ SYMBOL_THRESHOLDS = {
 }
 MAX_SCORE = 5  # 5 scoring components per symbol
 
+# Shadow-evaluation horizon — CLAUDE.md's documented US holding period is
+# intraday to 5 days; using the upper bound means shadow_decision_evaluator
+# always waits the full possible hold. Without dte_target set, a row is
+# permanently ineligible for counterfactual evaluation (fetch_pending_
+# candidates requires dte_target IS NOT NULL) — silently, forever.
+EVAL_HORIZON_DAYS = 5
+
 # ORB window: 9:30–10:00 ET = 14:30–15:00 UTC
 ORB_START_UTC = 14 * 60 + 30   # minutes since midnight UTC
 ORB_END_UTC   = 15 * 60 + 0
@@ -135,6 +142,52 @@ def log_to_db(conn, level: str, message: str, payload: dict | None = None) -> No
         conn.commit()
     except Exception as exc:
         log.warning("DB log failed: %s", exc)
+
+
+def log_decision_input(
+    conn, run_date, symbol: str, genome_version: int, regime: dict,
+    signal_strength: float, direction: str, entry_price_ref: float,
+    target_pct: float, stop_pct: float, outcome_reason: str | None = None,
+) -> int | None:
+    """
+    Canonical learning observation for a genuine directional read — see
+    db/migrate_2026_08_canonical_decisions.sql. Duplicated per-bot per this
+    repo's convention. ticket_id is never set here and stays NULL forever:
+    no us/executor.py exists in this repo (a real, separate architectural
+    gap — see the Learning Data Integrity Audit) — this script only ever
+    writes candidates to us-candidates.json, and nothing downstream turns
+    them into a TRADE_REQUEST ticket. Recording the observation honestly is
+    still correct: it's a genuine directional read whether or not the
+    pipeline currently acts on it.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_decision_inputs
+                    (run_date, symbol, strategy_id, track, regime, signal_strength,
+                     asset_class, archetype, is_winner, decision, direction,
+                     entry_price_ref, target_pct, stop_pct, dte_target, genome_version,
+                     stage_reached, outcome_reason, poll_slot)
+                VALUES (%s, %s, %s, 'A', %s, %s, 'equity', %s, TRUE, 'CANDIDATE', %s,
+                        %s, %s, %s, %s, %s, 'SIGNAL', %s, '')
+                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date, poll_slot)
+                DO UPDATE SET id = nwt_decision_inputs.id
+                RETURNING id
+                """,
+                (
+                    run_date, symbol, STRATEGY_ID, json.dumps(regime), signal_strength,
+                    STRATEGY_ID, direction, entry_price_ref, target_pct, stop_pct,
+                    EVAL_HORIZON_DAYS, genome_version, outcome_reason,
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    except Exception as exc:
+        conn.rollback()
+        log.warning("log_decision_input failed for %s: %s", symbol, exc)
+        return None
 
 
 def log_inactivity(conn, reason: str, regime: dict) -> None:
@@ -485,6 +538,8 @@ def main() -> None:
         sys.exit(1)
 
     # Step 4: Score each symbol
+    run_date = datetime.now(timezone.utc).date()
+    genome_version = genome.get("version")
     candidates = []
     for symbol, threshold in SYMBOL_THRESHOLDS.items():
         bars = intraday.get(symbol)
@@ -507,13 +562,38 @@ def main() -> None:
                  symbol, score, MAX_SCORE, direction,
                  orb_high, orb_low, vwap, details.get("rsi_14", 0))
 
+        current_price = float(bars["close"].values[-1])
+        target_pct = float(genome.get("profit_target_pct") or 0.012)
+        stop_pct = -abs(float(genome.get("stop_loss_pct") or 0.006))
+
         if score >= threshold and direction != "none":
             candidate = build_candidate(symbol, score, direction, details, avg_vol, bars, genome)
             candidates.append(candidate)
             log.info("%s: PASS — candidate generated (confidence=%.2f)", symbol, candidate["confidence"])
-        else:
-            reason = f"score {score}/{MAX_SCORE} < threshold {threshold}" if score < threshold else "price inside ORB"
+            log_decision_input(
+                conn, run_date=run_date, symbol=symbol, genome_version=genome_version,
+                regime=regime, signal_strength=score, direction=direction,
+                entry_price_ref=current_price, target_pct=target_pct, stop_pct=stop_pct,
+                outcome_reason=None,  # pending — no us/executor.py exists to ever resolve this (see docstring)
+            )
+        elif direction == "none":
+            # No thesis at all — price never left the opening range. Not a
+            # genuine directional read, matches every other track's rule.
+            reason = "price inside ORB"
             log.info("%s: SKIP — %s", symbol, reason)
+            log_inactivity(conn, reason, regime)
+        else:
+            # A direction WAS assigned (ORB broken) but score fell short —
+            # a genuine, weaker opportunity, not "nothing happened".
+            reason = f"score {score}/{MAX_SCORE} < threshold {threshold}"
+            log.info("%s: SKIP — %s", symbol, reason)
+            log_inactivity(conn, reason, regime)
+            log_decision_input(
+                conn, run_date=run_date, symbol=symbol, genome_version=genome_version,
+                regime=regime, signal_strength=score, direction=direction,
+                entry_price_ref=current_price, target_pct=target_pct, stop_pct=stop_pct,
+                outcome_reason="BELOW_THRESHOLD",
+            )
             log_inactivity(conn, reason, regime)
 
     # Step 5: Write candidates

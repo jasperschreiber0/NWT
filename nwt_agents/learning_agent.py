@@ -30,6 +30,7 @@ load_dotenv(Path(__file__).parent / ".env")
 from shared_context import (
     get_db,
     get_distinct_trade_pnls,
+    link_decision_outcome,
     load_layer0_data,
     load_master_directives,
     log_system_event,
@@ -143,6 +144,33 @@ def find_original_ticket(conn, alpaca_order_id: str, asset: str) -> Optional[dic
     return ticket
 
 
+def resolve_decision_ticket_id(conn, ledger_ticket_id: str) -> Optional[str]:
+    """
+    Deterministic path from a closed ledger position to the ticket_id its
+    nwt_decision_inputs observation was keyed on — exact primary-key lookups
+    only, no fuzzy alpaca_order_id/symbol matching (that's find_original_
+    ticket's job, for a different purpose: enrichment metadata on legacy
+    rows with no ledger.ticket_id).
+
+    ledger_ticket_id is nwt_portfolio_ledger.ticket_id, set by execution/
+    engine.py at fill time — the TRADE_REQUEST ticket. For Track A that IS
+    the same ticket_id the strategist/executor wrote onto the decision row.
+    For Track C/D/E, the TRADE_REQUEST payload carries
+    source_proposal_ticket_id — the TRADE_PROPOSAL ticket_id, which is what
+    track_c/d/e.py actually wrote onto the decision row. Returns None if
+    ledger_ticket_id is unset (legacy rows, or UNATTRIBUTED recon imports).
+    """
+    if not ledger_ticket_id:
+        return None
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM nwt_tickets WHERE ticket_id = %s", (ledger_ticket_id,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    payload = row[0] or {}
+    return payload.get("source_proposal_ticket_id") or str(ledger_ticket_id)
+
+
 def _half_spread(price: float, bid, ask, asset_type: str) -> tuple:
     """
     (half_spread, spread_pct) from captured NBBO, falling back to the
@@ -184,6 +212,78 @@ def compute_pnl_adjusted(
         adj_pct = (adj_entry - adj_exit) / entry_price if entry_price > 0 else 0.0
 
     return adj_pct * notional, adj_pct, entry_spread_pct, exit_spread_pct
+
+
+def compute_edge_summary(conn, bucket_width: float = 0.5) -> list:
+    """
+    The actual statistical question this whole model exists to answer:
+    "which strategy/version/signal has edge under which regime, regardless
+    of whether the directional read became a trade?"
+
+    Groups the COMPLETE decision population — nwt_decision_inputs — by
+    (strategy_id, genome_version, regime, direction, signal_strength bucket),
+    and within each bucket compares two separately-labeled populations:
+
+      REALIZED — outcome_reason='EXECUTED' rows, joined to their real PnL
+      via outcome_id -> nwt_trade_outcomes.pnl_adjusted.
+
+      SHADOW — every other terminal row (RISK_VETOED, EXECUTION_FAILED,
+      STRUCTURALLY_IMPOSSIBLE, BELOW_THRESHOLD, NO_EDGE, DUPLICATE_POSITION)
+      that has been shadow-evaluated, using shadow_pnl_pct.
+
+    These two populations are never merged into one number — REALIZED and
+    SHADOW stay separate columns in every row this returns, so a caller can
+    see "the strategy trades this bucket at 60% win rate, and would have
+    won 55% of the ones it never took" without conflating real and
+    counterfactual PnL. signal_strength is bucketed by absolute value in
+    `bucket_width`-wide bands (default 0.5) — deliberately track-agnostic:
+    the same bucketing works whether the underlying signal is a z-score,
+    conviction_score, or ORB score, since it buckets by magnitude, not by
+    track-specific scale.
+
+    Returns a list of dicts, does not persist a new table (a query, not
+    infrastructure) — the caller logs or otherwise surfaces it.
+    """
+    query = """
+        WITH realized AS (
+            SELECT di.strategy_id, di.genome_version,
+                   COALESCE(di.regime->>'primary_regime', 'unknown') AS regime,
+                   di.direction,
+                   FLOOR(ABS(COALESCE(di.signal_strength, 0)) / %(bw)s) * %(bw)s AS strength_bucket,
+                   COALESCE(to_.pnl_adjusted, to_.pnl) AS pnl
+            FROM nwt_decision_inputs di
+            JOIN nwt_trade_outcomes to_ ON to_.id = di.outcome_id
+            WHERE di.outcome_reason = 'EXECUTED'
+        ),
+        shadow AS (
+            SELECT strategy_id, genome_version,
+                   COALESCE(regime->>'primary_regime', 'unknown') AS regime,
+                   direction,
+                   FLOOR(ABS(COALESCE(signal_strength, 0)) / %(bw)s) * %(bw)s AS strength_bucket,
+                   shadow_pnl_pct AS pnl
+            FROM nwt_decision_inputs
+            WHERE outcome_reason IS DISTINCT FROM 'EXECUTED'
+              AND shadow_evaluated_at IS NOT NULL
+              AND shadow_pnl_pct IS NOT NULL
+        )
+        SELECT 'REALIZED' AS population, strategy_id, genome_version, regime, direction,
+               strength_bucket, COUNT(*) AS n,
+               ROUND(AVG(pnl)::numeric, 6) AS avg_pnl,
+               ROUND(AVG(CASE WHEN pnl > 0 THEN 1.0 ELSE 0.0 END)::numeric, 4) AS win_rate
+        FROM realized
+        GROUP BY strategy_id, genome_version, regime, direction, strength_bucket
+        UNION ALL
+        SELECT 'SHADOW', strategy_id, genome_version, regime, direction,
+               strength_bucket, COUNT(*),
+               ROUND(AVG(pnl)::numeric, 6),
+               ROUND(AVG(CASE WHEN pnl > 0 THEN 1.0 ELSE 0.0 END)::numeric, 4)
+        FROM shadow
+        GROUP BY strategy_id, genome_version, regime, direction, strength_bucket
+        ORDER BY strategy_id, genome_version, regime, direction, strength_bucket, population
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, {"bw": bucket_width})
+        return [dict(r) for r in cur.fetchall()]
 
 
 def get_archetype(conn, strategy_id: str) -> Optional[str]:
@@ -383,6 +483,7 @@ def main() -> None:
             realized_slippage = float(pos.get("realized_slippage") or 0)
             alpaca_order_id = pos.get("alpaca_order_id", "")
             bot_source = pos.get("bot_source", "")
+            ledger_ticket_id = pos.get("ticket_id")
 
             if entry_price <= 0 or exit_price <= 0:
                 logger.warning("Skipping position %s — missing entry/exit price", position_id)
@@ -498,6 +599,7 @@ def main() -> None:
                              %s,
                              %s, %s,
                              %s)
+                        RETURNING id
                         """,
                         (
                             position_id,
@@ -530,9 +632,15 @@ def main() -> None:
                             exit_time,
                         ),
                     )
+                    outcome_row_id = cur.fetchone()[0]
                 conn.commit()
                 outcomes_inserted += 1
                 strategies_seen.add(strategy_id)
+
+                # Deterministic decision -> outcome wiring (never a fuzzy
+                # timestamp/symbol join — see resolve_decision_ticket_id).
+                decision_ticket_id = resolve_decision_ticket_id(conn, ledger_ticket_id)
+                link_decision_outcome(conn, decision_ticket_id, str(outcome_row_id))
                 logger.info(
                     "Logged outcome for %s (%s/%s): pnl=%.4f pnl_adjusted=%.4f exit_timing=%.2f entry_timing=%.2f",
                     asset, strategy_id, archetype, pnl_dollars, pnl_adjusted, exit_timing_score, entry_timing_score,
@@ -567,6 +675,17 @@ def main() -> None:
             except Exception as exc:
                 logger.error("Archetype decay computation failed for %s: %s", arch, exc)
 
+        # Realized-vs-shadow edge summary over the complete decision
+        # population — see compute_edge_summary's docstring. Logged rather
+        # than persisted to a new table: this is a query result, not a
+        # durable fact, and can be recomputed any time from
+        # nwt_decision_inputs + nwt_trade_outcomes.
+        try:
+            edge_summary = compute_edge_summary(conn)
+        except Exception as exc:
+            logger.error("compute_edge_summary failed: %s", exc)
+            edge_summary = []
+
         log_system_event(
             conn,
             "INFO",
@@ -578,6 +697,13 @@ def main() -> None:
                 "total_strategies_in_db": len(all_strategy_ids_with_data),
             },
         )
+        if edge_summary:
+            log_system_event(
+                conn, "INFO", "learning_agent",
+                f"Decision population edge summary: {len(edge_summary)} "
+                f"(strategy, version, regime, direction, signal_strength bucket, population) rows",
+                {"rows": edge_summary},
+            )
         logger.info(
             "Learning agent done — %d outcomes logged, %d strategies processed for decay",
             outcomes_inserted, len(all_strategy_ids_with_data),

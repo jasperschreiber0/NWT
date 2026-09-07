@@ -58,6 +58,39 @@ def log_to_db(conn, level: str, message: str, payload: dict | None = None) -> No
         log.warning("DB log failed: %s", exc)
 
 
+def link_decision_ticket(
+    conn, strategy_id: str, symbol: str, genome_version, run_date, ticket_id: str, poll_slot: str = "",
+) -> None:
+    """
+    Set ticket_id on the decision_inputs row the strategist wrote for this
+    candidate. poll_slot must be the SAME value the strategist computed
+    (propagated via the candidate dict, like genome_version) — never
+    recomputed here independently: the executor runs 5 minutes after the
+    strategist (crontab.txt), close enough that an independent recomputation
+    would usually agree, but "usually" is exactly the kind of approximate
+    timestamp matching this model is required not to rely on.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nwt_decision_inputs
+                SET ticket_id = %s
+                WHERE strategy_id = %s
+                  AND COALESCE(genome_version, 0) = COALESCE(%s, 0)
+                  AND COALESCE(symbol, '') = COALESCE(%s, '')
+                  AND run_date = %s
+                  AND poll_slot = %s
+                  AND ticket_id IS NULL
+                """,
+                (ticket_id, strategy_id, genome_version, symbol, run_date, poll_slot),
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        log.warning("link_decision_ticket failed for %s: %s", symbol, exc)
+
+
 def write_ticket(conn, payload: dict) -> str:
     """Insert a TRADE_REQUEST ticket. Returns ticket_id."""
     with conn.cursor() as cur:
@@ -167,6 +200,11 @@ def main() -> None:
                 "Ticket written: %s %s %s sized_notional=$%.0f ticket_id=%s",
                 candidate["symbol"], candidate["direction"], candidate["strategy_id"],
                 sized_notional, ticket_id,
+            )
+            link_decision_ticket(
+                conn, candidate["strategy_id"], candidate["symbol"],
+                candidate.get("genome_version"), datetime.now(timezone.utc).date(), ticket_id,
+                poll_slot=candidate.get("poll_slot", ""),
             )
             tickets_written += 1
 

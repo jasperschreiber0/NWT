@@ -47,6 +47,13 @@ BOT_NAME = "aus"
 AUS_SYMBOLS = ["EWA", "BHP", "RIO"]
 FETCH_DAYS = 35  # buffer for weekends/holidays
 
+# Shadow-evaluation horizon — CLAUDE.md's documented AUS holding period is
+# 1-8 weeks; using the upper bound (56 days) means shadow_decision_evaluator
+# always waits the full possible hold. Without dte_target set, a row is
+# permanently ineligible for counterfactual evaluation (fetch_pending_
+# candidates requires dte_target IS NOT NULL) — silently, forever.
+EVAL_HORIZON_DAYS = 56
+
 # ISOLATION: disallow all intraday and US technical signals
 DISALLOWED_SIGNALS = frozenset([
     "intraday", "ORB", "VWAP", "options", "US_MOMENTUM",
@@ -170,6 +177,46 @@ def log_to_db(conn, level: str, message: str, payload: dict | None = None) -> No
         conn.commit()
     except Exception as exc:
         log.warning("DB log failed: %s", exc)
+
+
+def log_decision_input(
+    conn, run_date, symbol: str, strategy_id: str, genome_version: int, regime: dict,
+    signal_strength: float, direction: str, entry_price_ref: float | None,
+    target_pct: float, stop_pct: float, outcome_reason: str | None = None,
+) -> int | None:
+    """
+    Canonical learning observation for a genuine directional read — see
+    db/migrate_2026_08_canonical_decisions.sql. Duplicated per-bot per this
+    repo's convention (Track A bots have no shared import to nwt_agents/).
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nwt_decision_inputs
+                    (run_date, symbol, strategy_id, track, regime, signal_strength,
+                     asset_class, archetype, is_winner, decision, direction,
+                     entry_price_ref, target_pct, stop_pct, dte_target, genome_version,
+                     stage_reached, outcome_reason, poll_slot)
+                VALUES (%s, %s, %s, 'A', %s, %s, 'equity', %s, TRUE, 'CANDIDATE', %s,
+                        %s, %s, %s, %s, %s, 'SIGNAL', %s, '')
+                ON CONFLICT (strategy_id, COALESCE(genome_version, 0), COALESCE(symbol, ''), run_date, poll_slot)
+                DO UPDATE SET id = nwt_decision_inputs.id
+                RETURNING id
+                """,
+                (
+                    run_date, symbol, strategy_id, json.dumps(regime), signal_strength,
+                    strategy_id, direction, entry_price_ref, target_pct, stop_pct,
+                    EVAL_HORIZON_DAYS, genome_version, outcome_reason,
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    except Exception as exc:
+        conn.rollback()
+        log.warning("log_decision_input failed for %s: %s", symbol, exc)
+        return None
 
 
 def log_inactivity(conn, strategy_id: str, reason: str, regime: dict) -> None:
@@ -384,6 +431,8 @@ def main() -> None:
         sys.exit(1)
 
     today = datetime.now(timezone.utc).date()
+    run_date = today
+    genome_version = genome.get("version")
     entry_threshold = float(genome.get("entry_threshold") or 0.5)
     target_pct = float(genome.get("profit_target_pct") or 0.04)
     stop_pct = -abs(float(genome.get("stop_loss_pct") or 0.02))
@@ -407,9 +456,17 @@ def main() -> None:
             details["ewa_breadth_positive"],
         )
 
+        # AUS always assigns a direction (long-only bot) — confidence below
+        # threshold is still a genuine directional read, just a weak one.
         if confidence < entry_threshold:
             log.info("%s: confidence %.3f < threshold %.3f — no signal", symbol, confidence, entry_threshold)
             log_inactivity(conn, strategy_id, f"CONFIDENCE_BELOW_THRESHOLD_{symbol}", regime)
+            log_decision_input(
+                conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
+                genome_version=genome_version, regime=regime, signal_strength=confidence,
+                direction=direction, entry_price_ref=details["last_close"],
+                target_pct=target_pct, stop_pct=stop_pct, outcome_reason="BELOW_THRESHOLD",
+            )
             continue
 
         thesis_parts = [f"Dividend capture ({details['days_to_next_exdiv']}d to ex-div)"]
@@ -424,6 +481,7 @@ def main() -> None:
             "direction": direction,
             "confidence": confidence,
             "strategy_id": strategy_id,
+            "genome_version": genome_version,
             "signal_quality": {
                 "entry_timing_score": round(min(confidence, 1.0), 4),
                 "thesis_validity": " + ".join(thesis_parts),
@@ -443,6 +501,12 @@ def main() -> None:
         }
         candidates.append(candidate)
         log.info("%s: candidate generated (confidence=%.3f)", symbol, confidence)
+        log_decision_input(
+            conn, run_date=run_date, symbol=symbol, strategy_id=strategy_id,
+            genome_version=genome_version, regime=regime, signal_strength=confidence,
+            direction=direction, entry_price_ref=details["last_close"],
+            target_pct=target_pct, stop_pct=stop_pct, outcome_reason=None,
+        )
 
     CANDIDATES_FILE.write_text(json.dumps(candidates, indent=2))
     log.info("Wrote %d candidate(s) to %s", len(candidates), CANDIDATES_FILE)

@@ -32,6 +32,7 @@ from shared_context import (
     insert_ticket,
     load_master_directives,
     log_system_event,
+    mark_decision_outcome,
     option_dte,
     set_no_trade_mode,
 )
@@ -677,6 +678,12 @@ def main() -> None:
                 )
 
             insert_decision(conn, ticket_id, decision, reasoning, "RISK_AGENT", sizing_multiplier)
+            if decision == "VETOED":
+                # ticket_id here IS the TRADE_PROPOSAL ticket_id — the exact
+                # same id track_c/d/e.py's log_decision_input() wrote onto
+                # the originating decision_inputs row, so this is a direct
+                # PK match, not a fuzzy lookup.
+                mark_decision_outcome(conn, ticket_id, "RISK_VETOED")
             payload = ticket.get("payload") or {}
 
             if decision == "APPROVED":

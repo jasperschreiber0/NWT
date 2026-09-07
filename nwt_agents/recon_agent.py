@@ -134,7 +134,7 @@ def run_recon(conn, mode: str) -> bool:
                 mismatches.append({"class": "in_ledger_not_alpaca", "symbol": sym, "position_id": pid})
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE nwt_portfolio_ledger SET status='suspect' WHERE position_id=%s",
+                        "UPDATE nwt_portfolio_ledger SET status='suspect', lifecycle_state='RECON_PENDING' WHERE position_id=%s",
                         (row["position_id"],),
                     )
                 conn.commit()
@@ -293,3 +293,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
