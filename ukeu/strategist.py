@@ -175,7 +175,11 @@ def get_shortability(symbol: str) -> dict | None:
     cache = _load_shortability_cache()
     entry = cache.get(symbol)
     if entry:
-        checked_at = datetime.fromisoformat(entry["checked_at"])
+        checked_at_raw = entry.get("checked_at")
+        if checked_at_raw:
+            checked_at = datetime.fromisoformat(checked_at_raw)
+        else:
+            checked_at = datetime.fromtimestamp(SHORTABILITY_CACHE_FILE.stat().st_mtime, tz=timezone.utc)
         if datetime.now(timezone.utc) - checked_at < timedelta(hours=SHORTABILITY_CACHE_TTL_HOURS):
             return entry
 
@@ -584,3 +588,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

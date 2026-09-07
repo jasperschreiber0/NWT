@@ -16,7 +16,7 @@ silently as NO_SIGNAL.
 """
 import json
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,11 +37,11 @@ GENOME = {
 
 NOT_SHORTABLE = {
     "shortable": False, "easy_to_borrow": False, "borrow_status": "hard_to_borrow",
-    "checked_at": "2026-08-27T00:00:00+00:00",
+    "checked_at": datetime.now(timezone.utc).isoformat(),
 }
 SHORTABLE = {
     "shortable": True, "easy_to_borrow": True, "borrow_status": "easy_to_borrow",
-    "checked_at": "2026-08-27T00:00:00+00:00",
+    "checked_at": datetime.now(timezone.utc).isoformat(),
 }
 
 
@@ -241,3 +241,4 @@ def test_api_failure_falls_back_to_stale_cache(tmp_path, monkeypatch):
 
     assert result is not None
     assert result["shortable"] is False
+

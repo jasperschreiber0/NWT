@@ -16,6 +16,7 @@ verifies control flow and classification, not real Postgres/Alpaca
 behavior.
 """
 import json
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,11 +26,11 @@ import engine
 
 NOT_SHORTABLE = {
     "shortable": False, "easy_to_borrow": False, "borrow_status": "hard_to_borrow",
-    "checked_at": "2026-08-27T00:00:00+00:00",
+    "checked_at": datetime.now(timezone.utc).isoformat(),
 }
 SHORTABLE = {
     "shortable": True, "easy_to_borrow": True, "borrow_status": "easy_to_borrow",
-    "checked_at": "2026-08-27T00:00:00+00:00",
+    "checked_at": datetime.now(timezone.utc).isoformat(),
 }
 
 
@@ -202,3 +203,4 @@ def test_missing_cache_calls_alpaca_once_and_persists(tmp_path, monkeypatch):
     mock_alpaca_get.assert_called_once_with("/assets/EWU")
     assert result["shortable"] is False
     assert json.loads(cache_file.read_text())["EWU"]["shortable"] is False
+

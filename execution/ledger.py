@@ -101,6 +101,7 @@ def close_position(
             """
             UPDATE nwt_portfolio_ledger
             SET status = 'closed',
+                lifecycle_state = 'CLOSED',
                 exit_price = %s,
                 exit_time = %s,
                 realized_slippage = %s,
@@ -155,3 +156,4 @@ def log_system_event(
             (level, component, message, json.dumps(payload) if payload is not None else None),
         )
     conn.commit()
+

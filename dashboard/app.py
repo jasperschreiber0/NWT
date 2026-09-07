@@ -192,6 +192,27 @@ def performance(_: None = Depends(require_auth)):
         conn.close()
 
 
+@app.get("/api/edge-scoreboard")
+def edge_scoreboard(_: None = Depends(require_auth)):
+    """Return the opportunity-lane scoreboard; empty until migration is applied."""
+    conn = db_conn()
+    try:
+        rows = q_grace(conn, """
+            SELECT strategy_id, lane,
+                   COUNT(*) AS opportunities,
+                   COUNT(*) FILTER (WHERE closed_at IS NOT NULL) AS completed,
+                   ROUND(AVG(pnl_pct)::numeric, 6) AS expectancy_pct,
+                   ROUND(AVG(cost)::numeric, 6) AS avg_cost,
+                   COUNT(*) FILTER (WHERE decision IS NULL OR outcome IS NULL) AS incomplete
+            FROM nwt_opportunity_outcomes
+            GROUP BY strategy_id, lane
+            ORDER BY strategy_id, lane
+        """)
+        return {"scoreboard": rows}
+    finally:
+        conn.close()
+
+
 @app.get("/api/scorecard")
 def scorecard(_: None = Depends(require_auth)):
     conn = db_conn()
@@ -426,3 +447,4 @@ app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")
 @app.get("/")
 def root():
     return FileResponse(str(Path(__file__).parent / "static" / "index.html"))
+

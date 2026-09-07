@@ -573,6 +573,31 @@ def log_decision_input(
             )
             row = cur.fetchone()
         conn.commit()
+        try:
+            from opportunity_outcomes import opportunity_id_for, upsert_outcome
+            opportunity_id = opportunity_id_for(
+                strategy_id, symbol, run_date, track, genome_version, poll_slot)
+            upsert_outcome(conn, opportunity_id, "RAW_SHADOW", {
+                "strategy_id": strategy_id,
+                "symbol": symbol,
+                "direction": direction,
+                "track": track,
+                "regime": regime,
+                "proposed_qty": None,
+                "entry_price": entry_price_ref,
+                "decision": decision,
+                "decision_reason": rejection_reason or outcome_reason,
+                "source_ticket_id": ticket_id,
+                "source_decision_id": row[0] if row else None,
+            })
+        except Exception:
+            # Canonical logging committed above. Recover the failed analytics
+            # transaction before handing the connection back to the caller.
+            conn.rollback()
+            import logging
+            logging.getLogger(__name__).warning(
+                "Raw opportunity write failed for decision %s; retry required",
+                row[0] if row else None)
         return row[0] if row else None
     except Exception as exc:
         conn.rollback()
@@ -898,3 +923,4 @@ def insert_decision(
             (ticket_id, decision, reasoning, decided_by, sizing_multiplier),
         )
     conn.commit()
+
