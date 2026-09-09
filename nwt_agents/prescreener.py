@@ -1,11 +1,11 @@
 """
 nwt_agents/prescreener.py
-Runs at 13:15 UTC. Uses Claude Haiku to pre-screen layer0_data symbols.
+Runs at 13:15 UTC. Uses OpenAI to pre-screen layer0_data symbols.
 
 Flow:
   1. Load layer0_data.json
   2. Apply hard deterministic filters (no LLM)
-  3. Send survivors to Claude Haiku for conviction scoring
+  3. Send survivors to OpenAI for conviction scoring
   4. Keep only symbols with score >= 5
   5. Write prescreened_symbols.json
 """
@@ -17,7 +17,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
+from openai_client import call_json
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -37,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger("prescreener")
 
 AGENTS_DIR = Path(os.environ.get("NWT_AGENTS_DIR", Path(__file__).parent))
-HAIKU_MODEL = os.environ.get("CLAUDE_HAIKU_MODEL", "claude-haiku-4-5-20251001")
+PRESCREENER_MODEL = os.environ.get("OPENAI_PRESCREENER_MODEL", "gpt-4.1-mini-2025-04-14")
 
 
 # ---------------------------------------------------------------------------
@@ -78,10 +78,10 @@ def apply_hard_filters(symbols_data: dict, vix: float) -> tuple[list, list]:
 
 
 # ---------------------------------------------------------------------------
-# Haiku prescreener
+# OpenAI prescreener
 # ---------------------------------------------------------------------------
 
-def build_haiku_prompt(survivors: list, symbols_data: dict, vix: float, regime: dict) -> str:
+def build_prescreener_prompt(survivors: list, symbols_data: dict, vix: float, regime: dict) -> str:
     symbol_lines = []
     for s in survivors:
         d = symbols_data[s]
@@ -125,24 +125,8 @@ Rules:
 - skip_reason is null if score >= 5"""
 
 
-def call_haiku(prompt: str) -> list:
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    message = client.messages.create(
-        model=HAIKU_MODEL,
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = message.content[0].text.strip()
-    tokens_in = message.usage.input_tokens
-    tokens_out = message.usage.output_tokens
-    logger.info("Haiku call: %d input tokens, %d output tokens", tokens_in, tokens_out)
-
-    # Strip markdown code fences if present
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        raw = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
-
-    return json.loads(raw), tokens_in, tokens_out
+def call_prescreener(prompt: str, conn=None) -> tuple[list, int, int]:
+    return call_json(prompt, PRESCREENER_MODEL, list, conn=conn, component="prescreener")
 
 
 # ---------------------------------------------------------------------------
@@ -204,20 +188,22 @@ def main() -> None:
             conn.close()
             return
 
-        # 2. Claude Haiku scoring
-        prompt = build_haiku_prompt(survivors, symbols_data, vix, regime)
+        # 2. OpenAI scoring
+        prompt = build_prescreener_prompt(survivors, symbols_data, vix, regime)
         try:
-            scored, tokens_in, tokens_out = call_haiku(prompt)
+            scored, tokens_in, tokens_out = call_prescreener(prompt, conn=conn)
         except Exception as exc:
-            logger.error("Haiku call failed: %s", exc)
-            log_system_event(conn, "ERROR", "prescreener", f"Haiku API call failed: {exc}")
+            # A failed provider call must not leave yesterday's candidates active.
+            (AGENTS_DIR / "prescreened_symbols.json").write_text("[]", encoding="utf-8")
+            logger.error("OpenAI call failed: %s", exc)
+            log_system_event(conn, "ERROR", "prescreener", f"OpenAI API call failed: {exc}")
             conn.close()
             sys.exit(1)
 
         # 3. Filter to score >= 5
         passed = [item for item in scored if item.get("score", 0) >= 5]
         logger.info(
-            "Haiku scoring: %d symbols scored, %d passed (score >= 5)",
+            "OpenAI scoring: %d symbols scored, %d passed (score >= 5)",
             len(scored), len(passed),
         )
 
@@ -240,9 +226,8 @@ def main() -> None:
             {
                 "passed": [p["symbol"] for p in passed],
                 "filtered_hard": [f["symbol"] for f in filtered_out],
-                "tokens_haiku_in": tokens_in,
-                "tokens_haiku_out": tokens_out,
-                "tokens_used": {"haiku_in": tokens_in, "haiku_out": tokens_out},
+                "provider": "openai",
+                "model": PRESCREENER_MODEL,
             },
         )
 

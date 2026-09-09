@@ -1,9 +1,9 @@
 """
 nwt_agents/conviction_engine.py
-Runs at 13:30 UTC. Deep conviction analysis via Claude Sonnet.
+Runs at 13:30 UTC. Deep conviction analysis via OpenAI.
 
 For each prescreened symbol:
-  - Call Sonnet for structured options strategy proposal
+  - Call OpenAI for structured options strategy proposal
   - Enforce options strategy rules deterministically in code
   - Write conviction_tickets.json
   - INSERT each approved ticket into nwt_tickets (DB)
@@ -16,7 +16,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
+from openai_client import call_json
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -38,7 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger("conviction_engine")
 
 AGENTS_DIR = Path(os.environ.get("NWT_AGENTS_DIR", Path(__file__).parent))
-SONNET_MODEL = os.environ.get("CLAUDE_SONNET_MODEL", "claude-sonnet-4-6")
+CONVICTION_MODEL = os.environ.get("OPENAI_CONVICTION_MODEL", "gpt-4.1-2025-04-14")
 
 
 # ---------------------------------------------------------------------------
@@ -94,10 +94,10 @@ def enforce_strategy_rules(proposed_type: str, regime: dict, iv: float, symbol: 
 
 
 # ---------------------------------------------------------------------------
-# Sonnet conviction call
+# OpenAI conviction call
 # ---------------------------------------------------------------------------
 
-def build_sonnet_prompt(symbol: str, layer0_sym: dict, vix: float, regime: dict) -> str:
+def build_conviction_prompt(symbol: str, layer0_sym: dict, vix: float, regime: dict) -> str:
     return f"""You are an options strategy conviction engine for a systematic trading system.
 
 Market context:
@@ -139,22 +139,8 @@ regime_alignment must be: aligned, neutral, or misaligned
 strike_preference must be: ATM or 1_OTM"""
 
 
-def call_sonnet(prompt: str) -> tuple[dict, int, int]:
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    message = client.messages.create(
-        model=SONNET_MODEL,
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = message.content[0].text.strip()
-    tokens_in = message.usage.input_tokens
-    tokens_out = message.usage.output_tokens
-
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        raw = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
-
-    return json.loads(raw), tokens_in, tokens_out
+def call_conviction(prompt: str, conn=None) -> tuple[dict, int, int]:
+    return call_json(prompt, CONVICTION_MODEL, dict, conn=conn, component="conviction_engine")
 
 
 # ---------------------------------------------------------------------------
@@ -214,15 +200,15 @@ def main() -> None:
 
             logger.info("Processing conviction for %s", symbol)
 
-            # Call Sonnet
-            prompt = build_sonnet_prompt(symbol, layer0_sym, vix, regime)
+            # Call OpenAI
+            prompt = build_conviction_prompt(symbol, layer0_sym, vix, regime)
             try:
-                proposal, t_in, t_out = call_sonnet(prompt)
+                proposal, t_in, t_out = call_conviction(prompt, conn=conn)
                 total_tokens_in += t_in
                 total_tokens_out += t_out
             except Exception as exc:
-                logger.error("Sonnet call failed for %s: %s", symbol, exc)
-                log_system_event(conn, "ERROR", "conviction_engine", f"Sonnet failed for {symbol}: {exc}")
+                logger.error("OpenAI call failed for %s: %s", symbol, exc)
+                log_system_event(conn, "ERROR", "conviction_engine", f"OpenAI failed for {symbol}: {exc}")
                 continue
 
             # Enforce strategy rules in code
@@ -270,7 +256,8 @@ def main() -> None:
             f"Conviction engine complete: {len(conviction_tickets)} tickets",
             {
                 "tickets": [t["symbol"] for t in conviction_tickets],
-                "tokens_used": {"sonnet_in": total_tokens_in, "sonnet_out": total_tokens_out},
+                "provider": "openai",
+                "model": CONVICTION_MODEL,
             },
         )
 

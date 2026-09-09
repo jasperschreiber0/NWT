@@ -50,6 +50,10 @@ def fetch_token_usage_today(conn) -> dict:
         "haiku_out": 0,
         "sonnet_in": 0,
         "sonnet_out": 0,
+        "openai_in": 0,
+        "openai_out": 0,
+        "openai_cached_in": 0,
+        "openai_cost_usd": 0.0,
     }
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -79,6 +83,8 @@ def fetch_token_usage_today(conn) -> dict:
         totals["haiku_out"] += tokens_used.get("haiku_out", 0)
         totals["sonnet_in"] += tokens_used.get("sonnet_in", 0)
         totals["sonnet_out"] += tokens_used.get("sonnet_out", 0)
+        for key in ("openai_in", "openai_out", "openai_cached_in", "openai_cost_usd"):
+            totals[key] += tokens_used.get(key, 0)
 
     return totals
 
@@ -95,11 +101,13 @@ def compute_costs(totals: dict) -> dict:
         totals["sonnet_in"] / 1_000_000 * SONNET_INPUT_COST_PER_M
         + totals["sonnet_out"] / 1_000_000 * SONNET_OUTPUT_COST_PER_M
     )
-    total_cost = haiku_cost + sonnet_cost
+    openai_cost = totals.get("openai_cost_usd", 0.0)
+    total_cost = haiku_cost + sonnet_cost + openai_cost
 
     return {
         "haiku_cost_usd": round(haiku_cost, 6),
         "sonnet_cost_usd": round(sonnet_cost, 6),
+        "openai_cost_usd": round(openai_cost, 6),
         "total_cost_usd": round(total_cost, 6),
     }
 
@@ -111,6 +119,10 @@ def fetch_cumulative_costs(conn) -> dict:
         "haiku_out": 0,
         "sonnet_in": 0,
         "sonnet_out": 0,
+        "openai_in": 0,
+        "openai_out": 0,
+        "openai_cached_in": 0,
+        "openai_cost_usd": 0.0,
     }
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -133,6 +145,8 @@ def fetch_cumulative_costs(conn) -> dict:
         totals["haiku_out"] += tokens_used.get("haiku_out", 0)
         totals["sonnet_in"] += tokens_used.get("sonnet_in", 0)
         totals["sonnet_out"] += tokens_used.get("sonnet_out", 0)
+        for key in ("openai_in", "openai_out", "openai_cached_in", "openai_cost_usd"):
+            totals[key] += tokens_used.get(key, 0)
 
     return totals
 
@@ -230,6 +244,7 @@ def main() -> None:
                 "estimated_cost_usd": cumulative_costs,
             },
             "cost_rates": {
+                "openai": "Per-request model rates recorded in openai_cost_usd; see openai_client.py",
                 "haiku_input_per_m": HAIKU_INPUT_COST_PER_M,
                 "haiku_output_per_m": HAIKU_OUTPUT_COST_PER_M,
                 "sonnet_input_per_m": SONNET_INPUT_COST_PER_M,
