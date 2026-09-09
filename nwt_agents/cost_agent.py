@@ -20,7 +20,8 @@ from psycopg2.extras import RealDictCursor
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from shared_context import get_db, get_distinct_trade_pnls, log_system_event
+from shared_context import get_db, log_system_event
+from digest_trades import fetch_digest_trades
 
 logging.basicConfig(
     level=logging.INFO,
@@ -151,15 +152,17 @@ def fetch_cumulative_costs(conn) -> dict:
     return totals
 
 
-def fetch_daily_trade_stats(conn) -> dict:
+def fetch_daily_trade_stats(conn, day=None) -> dict:
     """
     Query today's closed trades, PnL, and risk agent decisions from Postgres.
-    trades_closed counts real trades (get_distinct_trade_pnls collapses
-    multi-leg spread outcome rows to one per trade) — a raw row COUNT(*)
+    Includes verified recovered equity closures; ordinary outcome aggregation collapses
+    multi-leg spread outcome rows to one per trade — a raw row COUNT(*)
     would report a 4-leg iron condor as 4 trades closed in the digest.
     """
-    today_start = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
-    trades = get_distinct_trade_pnls(conn, closed_after=today_start)
+    day = day or datetime.now(timezone.utc).date()
+    today_start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+    today_end = today_start + timedelta(days=1)
+    trades = fetch_digest_trades(conn, day)
     trades_closed = len(trades)
     pnl_today = sum(pnl for pnl, _closed_at in trades if pnl is not None)
 
@@ -168,10 +171,10 @@ def fetch_daily_trade_stats(conn) -> dict:
             """
             SELECT decision, COUNT(*) FROM nwt_ticket_decisions
             WHERE decided_by = 'RISK_AGENT'
-              AND created_at >= %s
+              AND created_at >= %s AND created_at < %s
             GROUP BY decision
             """,
-            (today_start,),
+            (today_start, today_end),
         )
         rows = cur.fetchall()
     approved = sum(int(r[1]) for r in rows if r[0] == "APPROVED")
@@ -179,8 +182,8 @@ def fetch_daily_trade_stats(conn) -> dict:
 
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT COUNT(*) FROM nwt_tickets WHERE type = 'inactivity' AND created_at >= %s",
-            (today_start,),
+            "SELECT COUNT(*) FROM nwt_tickets WHERE type = 'inactivity' AND created_at >= %s AND created_at < %s",
+            (today_start, today_end),
         )
         inactivity = int(cur.fetchone()[0] or 0)
 
