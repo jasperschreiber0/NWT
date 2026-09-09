@@ -11,6 +11,7 @@ For each approved proposal:
 """
 
 import json
+import math
 import logging
 import os
 import sys
@@ -181,11 +182,11 @@ def resolve_option_contract(
 
 
 def compute_qty_from_notional(sized_notional: float, option_price: float) -> int:
-    """Compute number of option contracts from notional. Each contract = 100 shares."""
-    if option_price <= 0:
-        return 1
+    """Return zero when a quoted contract cannot fit the approved budget."""
+    if not all(math.isfinite(v) and v > 0 for v in (sized_notional, option_price)):
+        return 0
     contract_cost = option_price * 100
-    qty = max(int(sized_notional / contract_cost), 1)
+    qty = int(sized_notional / contract_cost)
     return qty
 
 
@@ -308,18 +309,37 @@ def resolve_spread_legs(symbol: str, strategy_type: str,
 
 def size_spread_qty(legs: list, sized_notional: float) -> int:
     """
-    Number of spreads from the net debit. Credit structures (net <= 0, e.g.
-    iron condor) and unpriceable legs get 1 spread — never guess a multiple.
+    Size debit spreads by debit and credit spreads by maximum loss.
+    Missing quotes or an unaffordable structure return zero, never one by default.
     """
     net = 0.0
     for leg in legs:
         price = _get_option_price(leg["option_symbol"])
         if not price or price <= 0:
-            return 1
+            return 0
         net += price if leg["side"] == "buy" else -price
     if net <= 0:
-        return 1
-    return max(int(sized_notional / (net * 100)), 1)
+        widths = []
+        for option_type in ("call", "put"):
+            strikes = [float(leg["strike_price"]) for leg in legs
+                       if leg.get("option_type") == option_type]
+            if strikes:
+                if len(strikes) != 2:
+                    return 0
+                widths.append(abs(strikes[0] - strikes[1]))
+        if not widths:
+            return 0
+        net = max(widths) + net
+    return compute_qty_from_notional(sized_notional, net)
+
+
+def _position_exit_thresholds(pos: dict) -> tuple[float, float]:
+    """Use the exit settings persisted at entry; preserve defaults for legacy rows."""
+    stop = abs(float(pos["stop_pct"])) if pos.get("stop_pct") is not None else 0.50
+    target = float(pos["target_pct"]) if pos.get("target_pct") is not None else 0.50
+    if not math.isfinite(stop) or stop <= 0 or not math.isfinite(target) or target <= 0:
+        raise ValueError("Invalid persisted option exit thresholds")
+    return -stop, target
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +427,7 @@ def _spread_exit_reason(legs: list, past_hard_close: bool) -> str | None:
     """
     Value the structure as a unit: V = sum(sign x price), long +, short -.
     PnL per spread = V_now - V_entry, scaled by |V_entry| (premium at risk) —
-    target/stop at +/-50%, works for both debit and credit structures.
+    using the persisted target/stop, for both debit and credit structures.
 
     DTE<=1 gates hard close exactly like single-leg positions: all legs
     share one expiry (resolve_spread_legs), so any leg's DTE represents the
@@ -437,9 +457,14 @@ def _spread_exit_reason(legs: list, past_hard_close: bool) -> str | None:
         return None
 
     pnl_frac = (v_now - v_entry) / premium_at_risk
-    if pnl_frac >= 0.50:
+    thresholds = {_position_exit_thresholds(leg) for leg in legs}
+    if len(thresholds) != 1:
+        logger.error("Spread legs have inconsistent exit thresholds")
+        return None
+    stop, target = thresholds.pop()
+    if pnl_frac >= target:
         return "target"
-    if pnl_frac <= -0.50:
+    if pnl_frac <= stop:
         return "stop"
     return None
 
@@ -447,8 +472,7 @@ def _spread_exit_reason(legs: list, past_hard_close: bool) -> str | None:
 def monitor_options_positions(conn) -> None:
     """
     Check all open options positions:
-    - 50% profit target → submit CLOSE_REQUEST
-    - 50% stop loss → submit CLOSE_REQUEST
+    - Persisted profit target/stop (legacy default 50%) → submit CLOSE_REQUEST
     - Past 15:45 ET hard close AND DTE<=1 → submit CLOSE_REQUEST
     Legs sharing a spread_group_id are valued and closed as ONE unit (short
     legs first, so a partial failure never leaves a naked short outstanding).
@@ -502,9 +526,10 @@ def monitor_options_positions(conn) -> None:
                 pnl_pct = (current_price - entry_price) / entry_price
                 if pos.get("direction") == "short":
                     pnl_pct = -pnl_pct
-                if pnl_pct >= 0.50:
+                stop, target = _position_exit_thresholds(pos)
+                if pnl_pct >= target:
                     exit_reason = "target"
-                elif pnl_pct <= -0.50:
+                elif pnl_pct <= stop:
                     exit_reason = "stop"
 
         if exit_reason:
@@ -672,11 +697,8 @@ def main() -> None:
                 if option_price and option_price > 0:
                     qty = compute_qty_from_notional(sized_notional, option_price)
                 else:
-                    logger.warning(
-                        "Ticket %s: could not fetch live price for %s — falling back to "
-                        "conservative $200/contract estimate", ticket_id, option_symbol,
-                    )
-                    qty = max(int(sized_notional / 200), 1)
+                    logger.warning("Ticket %s: no live option price for %s", ticket_id, option_symbol)
+                    qty = 0
 
                 execution_payload.update({
                     "option_symbol": option_symbol,
@@ -685,6 +707,13 @@ def main() -> None:
                     "expiration_date": contract["expiration_date"],
                     "option_type": contract["option_type"],
                 })
+
+            if execution_payload["qty"] < 1:
+                reason = "No quoted contract/structure fits the approved risk budget"
+                insert_decision(conn, ticket_id, "VETOED", reason, "NWT_EXECUTION_AGENT")
+                log_system_event(conn, "WARNING", "execution_agent", reason, {"ticket_id": ticket_id})
+                failed_count += 1
+                continue
 
             try:
                 exec_ticket_id = insert_ticket(
