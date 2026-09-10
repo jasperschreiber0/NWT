@@ -621,6 +621,51 @@ def place_close_order(symbol: str, qty: int, asset_type: str, side: str = "sell"
 # pnl_adjusted computation
 # ---------------------------------------------------------------------------
 
+def equity_close_order(pos):
+    """Reuse one broker order per ledger position, including after a timeout.
+
+    A canceled/partial order needs reconciliation, never an automatic new ID.
+    Broker client-order uniqueness also protects overlapping engine processes.
+    """
+    position_id = str(uuid.UUID(str(pos['position_id'])))
+    symbol = pos['asset']
+    direction = pos['direction']
+    if direction not in ('long', 'short'):
+        raise ValueError('Invalid equity close direction')
+    qty = float(pos.get('qty') or 0)
+    if qty <= 0 or not qty.is_integer():
+        raise ValueError('Equity close requires exact positive whole-share ledger quantity')
+    side = 'buy' if direction == 'short' else 'sell'
+    client_id = 'nwt-close-' + position_id
+    try:
+        order = alpaca_get('/orders:by_client_order_id?client_order_id=' + client_id)
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 404:
+            raise
+        order = None
+    if order is not None:
+        if (order.get('symbol') != symbol or order.get('side') != side
+                or float(order.get('qty') or 0) != qty):
+            raise ValueError('Existing close order does not match ledger position')
+        return order
+    if pos.get('status') != 'open':
+        raise ValueError('Cannot submit a close for a closed ledger position')
+    clock = alpaca_get('/clock')
+    if not clock.get('is_open'):
+        raise ValueError('Equity close submission requires regular market hours')
+    broker = alpaca_get('/positions/' + symbol)
+    if broker.get('side') != direction or abs(float(broker.get('qty') or 0)) != qty:
+        raise ValueError('Broker direction/quantity differs from ledger; reconcile before closing')
+    if alpaca_get('/orders?status=open&symbols=' + symbol):
+        raise ValueError('Outstanding symbol order requires reconciliation before closing')
+    return alpaca_post('/orders', {
+        'symbol': symbol, 'qty': str(int(qty)), 'side': side,
+        'type': 'market', 'time_in_force': 'day',
+        'client_order_id': client_id,
+        'position_intent': 'buy_to_close' if side == 'buy' else 'sell_to_close',
+    })
+
+
 def compute_pnl_adjusted(asset_type: str, pnl: float, entry_price: float,
                           exit_price: float, qty: int = 1,
                           bid_ask_spread: float = 0.0) -> tuple:
@@ -773,13 +818,17 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
     try:
         direction = pos.get("direction", "long")
         close_side = "buy" if direction == "short" else "sell"
-        qty = compute_qty_from_notional(notional, entry_price)
-        order = place_close_order(symbol, qty, "equity", side=close_side)
+        pos = get_ledger_position(conn, position_id)
+        if not pos or pos.get('status') != 'open':
+            return
+        qty = float(pos.get('qty') or 0)
+        order = equity_close_order(pos)
         filled = poll_order_until_filled(order["id"])
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
 
-        if fill_status != "filled" or fill_price <= 0:
+        if (fill_status != "filled" or fill_price <= 0
+                or float(filled.get('filled_qty') or 0) != qty):
             logger.error("Equity close for %s (position_id=%s) not filled — status=%s",
                         symbol, position_id, fill_status)
             log_system_event(conn, "ERROR", "execution_engine",
@@ -834,12 +883,24 @@ def process_close_ticket(conn, ticket: dict) -> None:
     close_side = "buy" if pos_direction == "short" else "sell"
 
     try:
-        order = place_close_order(symbol, qty, asset_type, side=close_side)
+        if asset_type == 'equity':
+            pos = get_ledger_position(conn, position_id) if position_id else None
+            if not pos:
+                raise ValueError('Equity close requires a ledger position')
+            if pos.get('status') == 'closed':
+                insert_decision(conn, ticket_id, 'SKIPPED', 'Position already closed')
+                return
+            qty = float(pos.get('qty') or 0)
+            symbol = pos['asset']
+            order = equity_close_order(pos)
+        else:
+            order = place_close_order(symbol, qty, asset_type, side=close_side)
         filled = poll_order_until_filled(order["id"])
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
 
-        if fill_status != "filled" or fill_price <= 0:
+        if (fill_status != "filled" or fill_price <= 0
+                or (asset_type == 'equity' and float(filled.get('filled_qty') or 0) != qty)):
             insert_decision(conn, ticket_id, "FAILED",
                             f"Close order not filled — status={fill_status}")
             return
@@ -902,7 +963,8 @@ def process_force_close(conn, ticket: dict) -> None:
     expected_price = (exit_bid + exit_ask) / 2.0 if (exit_bid and exit_ask) else None
 
     try:
-        order = alpaca_delete(f"/positions/{asset}")
+        order = (equity_close_order(position) if asset_type == 'equity'
+                 else alpaca_delete(f"/positions/{asset}"))
     except Exception as exc:
         reason = f"FORCE_CLOSE: liquidation order failed for {asset}: {exc}"
         logger.error("Ticket %s: %s", ticket_id, reason)
@@ -922,7 +984,9 @@ def process_force_close(conn, ticket: dict) -> None:
 
     fill_price_str = filled_order.get("filled_avg_price")
     fill_price = float(fill_price_str) if fill_price_str else None
-    if fill_price is None:
+    if (fill_price is None or filled_order.get('status') != 'filled'
+            or (asset_type == 'equity' and float(filled_order.get('filled_qty') or 0)
+                != float(position.get('qty') or 0))):
         reason = f"FORCE_CLOSE: no fill price — status={filled_order.get('status')}"
         logger.warning("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "FAILED", reason)
