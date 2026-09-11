@@ -1,0 +1,27 @@
+{
+  "version": "20260912-v1",
+  "annual_net_return_target": 0.3,
+  "maximum_drawdown": "awaiting_user_choice",
+  "execution_enabled": false,
+  "aapl_paper_target_weight": 0.3,
+  "rules": [
+    "trend200_v1",
+    "etf_dip_trend_v1",
+    "safx_bounce20_v1"
+  ],
+  "options_research": {
+    "status": "not_promoted",
+    "requires": [
+      "point-in-time contracts",
+      "executable bid/ask",
+      "IV and Greeks",
+      "expiry and assignment handling",
+      "cost-stressed validation"
+    ]
+  },
+  "promotion": {
+    "clean_paper_lifecycles_proposed": 50,
+    "out_of_sample_roundtrips_research_target": 100,
+    "note": "Counts are workflow thresholds, not proof of profitability; existing risk limits remain in force."
+  }
+}

@@ -252,6 +252,15 @@ def synchronous_risk_veto(conn, payload: dict) -> tuple:
     new-entry cutoff, and per-bot permissions. Returns (vetoed: bool, reason: str).
     Closes (FORCE_CLOSE) bypass this — liquidation is always allowed.
     """
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM nwt_system_flags WHERE flag='qa_validation_in_progress'")
+        validation = cur.fetchone()
+    if validation and validation[0] is True and payload.get('strategy_id') != 'QA_PAPER_LIFECYCLE':
+        return True, 'Paper lifecycle validation in progress; new strategy entries paused'
+    if payload.get('strategy_id') == 'QA_PAPER_LIFECYCLE':
+        halted, reason = check_no_trade_mode(conn)
+        if halted:
+            return True, reason
     try:
         directives = load_master_directives()
     except Exception:
@@ -540,6 +549,15 @@ def place_equity_order(payload: dict) -> dict:
     qty = compute_qty_from_notional(sized_notional, price)
     side = "buy" if direction == "long" else "sell"
 
+    qa = payload.get('strategy_id') == 'QA_PAPER_LIFECYCLE'
+    if qa:
+        if (ALPACA_BASE_URL != 'https://paper-api.alpaca.markets'
+                or symbol != 'SPY' or direction != 'long' or payload.get('qty') != 1
+                or not payload.get('client_order_id', '').startswith('nwt-qa-entry-')
+                or not (0 < price <= sized_notional < 1000)):
+            raise ValueError('QA entry requires paper SPY, one share, durable ID and budget below $1000')
+        qty = 1
+
     order_body = {
         "symbol": symbol,
         "qty": str(qty),
@@ -547,6 +565,9 @@ def place_equity_order(payload: dict) -> dict:
         "type": "market",
         "time_in_force": time_in_force,
     }
+    if qa:
+        order_body.update(client_order_id=payload['client_order_id'], type='limit',
+                          limit_price=str(round(sized_notional, 2)))
     logger.info("Placing equity order: %s %s x%d (notional=%.2f)", side, symbol, qty, sized_notional)
     return alpaca_post("/orders", order_body)
 
@@ -735,7 +756,8 @@ def write_trade_outcome(conn, position: dict, fill_price: float,
 def run_equity_position_monitor(conn) -> None:
     positions = get_open_positions(conn)
     equity_positions = [p for p in positions if p.get("asset_type") == "equity"
-                        and p.get("bot_source") != "UNATTRIBUTED"]
+                        and p.get("bot_source") != "UNATTRIBUTED"
+                        and p.get("strategy_id") != 'QA_PAPER_LIFECYCLE']
 
     if not equity_positions:
         return

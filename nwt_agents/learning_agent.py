@@ -80,6 +80,7 @@ def fetch_unprocessed_closed_positions(conn) -> list:
             SELECT pl.*
             FROM nwt_portfolio_ledger pl
             WHERE pl.status = 'closed'
+              AND pl.strategy_id IS DISTINCT FROM 'QA_PAPER_LIFECYCLE'
               AND pl.exit_price IS NOT NULL
               AND pl.alpaca_order_id IS NOT NULL
               AND NOT EXISTS (
