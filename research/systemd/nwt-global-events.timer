@@ -1,0 +1,10 @@
+[Unit]
+Description=Collect NWT official global-event observations every 15 minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/15:00 UTC
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

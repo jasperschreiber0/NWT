@@ -1,0 +1,12 @@
+[Unit]
+Description=NWT official global-event observations (no trading)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/northworld/trading
+ExecStart=/usr/bin/python3 /home/northworld/trading/research/event_pipeline.py
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=12min
+UMask=0077
+NoNewPrivileges=true

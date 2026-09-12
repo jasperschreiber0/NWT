@@ -1,0 +1,13 @@
+[
+ {"id":"fed","region":"us","url":"https://www.federalreserve.gov/feeds/press_all.xml","kind":"rss"},
+ {"id":"ecb","region":"eu","url":"https://www.ecb.europa.eu/rss/press.html","kind":"rss"},
+ {"id":"boe","region":"uk","url":"https://www.bankofengland.co.uk/rss/news","kind":"rss"},
+ {"id":"ons","region":"uk","url":"https://www.ons.gov.uk/releasecalendar?rss","kind":"rss"},
+ {"id":"rba","region":"aus","url":"https://www.rba.gov.au/rss/rss-cb-media-releases.xml","kind":"rss"},
+ {"id":"bls_jobs","region":"us","url":"https://www.bls.gov/feed/empsit.rss","kind":"rss"},
+ {"id":"bls_cpi","region":"us","url":"https://www.bls.gov/feed/cpi.rss","kind":"rss"},
+ {"id":"china_nbs","region":"china","url":"https://www.stats.gov.cn/english/PressRelease/","kind":"links","path_contains":"/english/PressRelease/20"},
+ {"id":"china_policy","region":"china","url":"https://english.www.gov.cn/policies/latestreleases/","kind":"links","path_contains":"/policies/latestreleases/20"},
+ {"id":"abs","region":"aus","url":"https://www.abs.gov.au/media-centre/media-releases","kind":"links","path_contains":"/media-centre/media-releases/"},
+ {"id":"sec_filings","region":"global","url":"https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=&company=&dateb=&owner=exclude&start=0&count=100&output=atom","kind":"rss"}
+]

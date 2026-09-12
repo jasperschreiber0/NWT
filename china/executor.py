@@ -119,6 +119,13 @@ def load_directives() -> dict:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
+    # CHINA-SUPPORTED-OBS-v1 cannot create execution tickets.
+    log.info("China observation mode: execution tickets disabled")
+    return
+
+
+def legacy_main() -> None:
+    """Preserved for comparison; not the scheduled entry point."""
     log.info("China executor starting (event-triggered)")
 
     # Step 1: Directives gate

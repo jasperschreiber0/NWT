@@ -421,6 +421,14 @@ def load_directives() -> dict:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
+    # This revised strategy is observation-only until separately validated.
+    CANDIDATES_FILE.write_text("[]")
+    from observation import main as observe
+    observe()
+
+
+def legacy_main() -> None:
+    """Preserved for comparison; not the scheduled entry point."""
     log.info("China policy/event strategist starting (event-triggered)")
 
     # Step 1: Directives gate
