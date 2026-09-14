@@ -13,6 +13,7 @@ from psycopg2.extras import RealDictCursor
 import requests
 from dotenv import load_dotenv
 from run_job import ROOT, STATE, db
+from report_format import format_report
 sys.path.insert(0, str(ROOT / 'execution'))
 from reliability import reconcile_quantities, separate_legacy_expiries
 
@@ -188,15 +189,7 @@ def main():
         status['alert_delivery_confirmed'] = notify(c, 'recovered:' + day + ':' + oldsignature,
                                                    'NWT recovered: operational checks are healthy. Normal paper risk gates apply.')
     if args.report or args.activation_report:
-        text = (('NWT supervision activated — ' if args.activation_report else 'NWT daily paper report — ') + day + '\n' +
-                ('Healthy' if not status['issues'] else 'Needs attention') + '\n' +
-                'Trial: ' + str(trial['consecutive_passes']) + '/20 consecutive sessions\n' +
-                'Paper positions: ' + str(status.get('broker_positions', '?')) + '\n' +
-                'Decisions: ' + str(status.get('decisions', [])) + '\n' +
-                'Recorded outcomes today: ' + str(status.get('outcomes', {})) + '\n' +
-                'Learning outcome rows: ' + str(status.get('learning_outcome_rows', '?')) +
-                '\nStrategy promotion stays gated by sample size, regimes, shadow evidence and the trial.\n' +
-                ('Action: ' + '; '.join(status['issues']) if status['issues'] else 'No action needed.'))
+        text = format_report(status, trial, day, activation=args.activation_report)
         status['report_delivery_confirmed'] = notify(c, ('activation:' if args.activation_report else 'daily:') + day, text)
         if not status['report_delivery_confirmed']:
             status['issues'].append('Daily report delivery failed'); status['ready_for_entries'] = False
