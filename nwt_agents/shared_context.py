@@ -866,7 +866,7 @@ def log_system_event(
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO nwt_system_log (level, component, message, payload) VALUES (%s, %s, %s, %s)",
-            (level, component, message, json.dumps(payload) if payload is not None else None),
+            (level, component, message, json.dumps(payload, default=str) if payload is not None else None),
         )
     conn.commit()
 
