@@ -682,6 +682,27 @@ async function loadSystem() {
   } catch(e) { if (e.message !== '401') console.error(e); }
 }
 
+async function loadOperations() {
+  let panel = document.getElementById('operations-panel');
+  if (!panel) {
+    panel = document.createElement('section'); panel.id = 'operations-panel';
+    panel.style.cssText = 'margin:20px;padding:20px;border:1px solid #64748b;border-radius:12px;white-space:pre-wrap';
+    document.body.insertBefore(panel, document.body.firstChild);
+  }
+  try {
+    const d = await api('/operations');
+    const r = d.research || {};
+    panel.textContent = 'NWT paper operations — ' + (d.ready_for_entries ? 'Healthy' : 'Needs attention') +
+      '\nChecked: ' + (d.observed_at || 'Unavailable') +
+      '\nUnattended trial: ' + ((d.trial || {}).consecutive_passes || 0) + '/20 consecutive sessions' +
+      '\nResearch collected: ' + ((r.research || {}).observed_at || 'Unavailable') +
+      '\nEvent feed: ' + ((r.events || {}).observed_at || 'Unavailable') +
+      '\nPaper positions: ' + d.broker_positions + ' | Open orders: ' + d.open_orders +
+      '\nLearning outcome rows: ' + d.learning_outcome_rows +
+      '\n' + (d.issues || []).join('\n');
+  } catch(e) { panel.textContent = 'NWT operations report unavailable'; }
+}
+
 async function loadAll() {
   if (!checkAuth()) return;
   try {
@@ -693,6 +714,7 @@ async function loadAll() {
   } catch(e) { document.getElementById('status-dot').className = 'status-dot error'; return; }
 
   document.getElementById('last-refresh').textContent = 'Refreshed ' + new Date().toLocaleTimeString();
+  await loadOperations();
   await Promise.all([loadPortfolio(), loadPerformance(), loadTrackF(), loadTickets(), loadSystem()]);
 }
 

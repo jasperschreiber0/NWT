@@ -27,13 +27,16 @@ def _send(text: str) -> None:
     if not _BOT_TOKEN or not _CHAT_ID:
         return
     try:
-        requests.post(
+        response = requests.post(
             _API_URL,
             json={"chat_id": _CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=_TIMEOUT,
         )
+        response.raise_for_status()
+        if not response.json().get('ok'):
+            raise RuntimeError('Telegram rejected notification')
     except Exception as exc:
-        logger.warning("Telegram send failed (non-fatal): %s", exc)
+        logger.warning("Telegram send failed (non-fatal): %s", type(exc).__name__)
 
 
 def alert_no_trade_mode(reason: str) -> None:
@@ -69,6 +72,7 @@ def send_daily_digest(
     no_trade_mode: bool,
     open_positions: int,
 ) -> None:
+    if os.getenv('NWT_OPS_DIGEST') == '1': return
     status = "🔴 HALTED" if no_trade_mode else "🟢 LIVE"
     cpt = f"${cost_per_trade:.4f}" if cost_per_trade is not None else "n/a"
     msg = (
@@ -86,7 +90,7 @@ def send_daily_digest(
 def send_triage_digest(text: str) -> None:
     """Morning triage digest. Already formatted by triage_agent — sent as-is.
     No-ops silently if Telegram is not configured."""
-    _send(text)
+    if os.getenv('NWT_OPS_DIGEST') != '1': _send(text)
 
 
 def _ts() -> str:

@@ -13,6 +13,7 @@ def test_qa_rejects_outside_bounds(monkeypatch,budget,qty,symbol,base,direction)
     monkeypatch.setattr(engine,'ALPACA_BASE_URL','https://paper-api.alpaca.markets' if base=='paper' else 'https://api.alpaca.markets')
     monkeypatch.setattr(engine,'get_current_price',lambda s:760)
     post=MagicMock();monkeypatch.setattr(engine,'alpaca_post',post)
+    monkeypatch.setattr(engine,'submit_identified_order',lambda body:post('/orders',body))
     with pytest.raises(ValueError):engine.place_equity_order(dict(symbol=symbol,qty=qty,direction=direction,sized_notional=budget,time_in_force='day',strategy_id='QA_PAPER_LIFECYCLE',client_order_id='nwt-qa-entry-test'))
     post.assert_not_called()
 
@@ -20,6 +21,7 @@ def test_qa_exact_share_price_limit(monkeypatch):
     monkeypatch.setattr(engine,'ALPACA_BASE_URL','https://paper-api.alpaca.markets')
     monkeypatch.setattr(engine,'get_current_price',lambda s:760)
     post=MagicMock();monkeypatch.setattr(engine,'alpaca_post',post)
+    monkeypatch.setattr(engine,'submit_identified_order',lambda body:post('/orders',body))
     engine.place_equity_order(dict(symbol='SPY',qty=1,direction='long',sized_notional=765,time_in_force='day',strategy_id='QA_PAPER_LIFECYCLE',client_order_id='nwt-qa-entry-test'))
     body=post.call_args.args[1];assert body['qty']=='1' and body['type']=='limit' and float(body['limit_price'])==765
 

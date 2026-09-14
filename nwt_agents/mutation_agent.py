@@ -287,6 +287,10 @@ def evaluate_promotion(conn, shadow: dict) -> tuple:
     """
     strategy_id = shadow["strategy_id"]
     version = shadow["version"]
+    # Current daily-bar shadows model the underlying, not option premiums.
+    # They cannot authorize promotion of an options genome.
+    if shadow.get('track') in ('C', 'D', 'E'):
+        return 'wait', 'Execution-grade option shadow outcomes required; underlying-return proxies cannot authorize promotion', {'evidence_type': 'underlying_proxy'}
     stats = _sample_stats(conn, strategy_id, version)
     baseline = _sample_stats(conn, strategy_id, None)
     evidence = {"shadow": stats, "baseline": baseline}
@@ -374,8 +378,13 @@ def reject_and_retire(conn, shadow: dict, reasoning: str, evidence: dict) -> Non
 
 def run_promote(conn) -> dict:
     if is_mutation_frozen(conn):
-        logger.warning("mutation_frozen is set — skipping all promotion checks this run")
-        return {"frozen": True, "promoted": 0, "rejected": 0, "waiting": 0}
+        evaluations = []
+        for shadow in fetch_pending_shadows(conn):
+            action, reasoning, evidence = evaluate_promotion(conn, shadow)
+            evaluations.append(dict(strategy_id=shadow['strategy_id'], version=shadow['version'],
+                                    recommendation=action, reason=reasoning, evidence=evidence))
+        logger.info('Mutation frozen; evaluated %d shadow candidates without activation', len(evaluations))
+        return {"frozen": True, "promoted": 0, "rejected": 0, "waiting": len(evaluations), 'evaluations': evaluations}
 
     counts = {"frozen": False, "promoted": 0, "rejected": 0, "waiting": 0}
     for shadow in fetch_pending_shadows(conn):

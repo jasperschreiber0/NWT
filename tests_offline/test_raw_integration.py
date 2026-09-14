@@ -24,11 +24,11 @@ class RawIntegrationTests(unittest.TestCase):
         namespace = {'json': json, 'log_system_event': MagicMock()}
         exec(compile(ast.Module(body=[node], type_ignores=[]), '<isolated function>', 'exec'), namespace)
         conn = MagicMock()
-        conn.cursor.return_value.__enter__.return_value.fetchone.return_value = (42,)
+        conn.cursor.return_value.__enter__.return_value.fetchone.return_value = ('22222222-2222-2222-2222-222222222222',)
         with patch.object(lanes, 'upsert_outcome', side_effect=RuntimeError('DB unavailable')):
             result = namespace['log_decision_input'](
                 conn, '2026-09-06', 'SPY', 'S', 'C', {}, 5, 'A', False, 'CANDIDATE')
-        self.assertEqual(result, 42)
+        self.assertEqual(result, '22222222-2222-2222-2222-222222222222')
         conn.commit.assert_called_once()
         conn.rollback.assert_called_once()
         namespace['log_system_event'].assert_not_called()
@@ -40,13 +40,12 @@ class RawIntegrationTests(unittest.TestCase):
         ns = {'json': json, 'log_system_event': MagicMock()}
         exec(compile(ast.Module(body=[node], type_ignores=[]), '<isolated function>', 'exec'), ns)
         conn = MagicMock()
-        conn.cursor.return_value.__enter__.return_value.fetchone.return_value = (42,)
+        conn.cursor.return_value.__enter__.return_value.fetchone.return_value = ('22222222-2222-2222-2222-222222222222',)
         with patch.object(lanes, 'upsert_outcome') as write:
             ns['log_decision_input'](conn, '2026-09-06', 'SPY', 'S', 'C', {}, 5, 'A', False, 'CANDIDATE')
         self.assertIsNone(write.call_args.args[3]['proposed_qty'])
-        self.assertEqual(write.call_args.args[3]['source_decision_id'], 42)
+        self.assertEqual(write.call_args.args[3]['source_decision_id'], '22222222-2222-2222-2222-222222222222')
 
 
 if __name__ == '__main__':
     unittest.main()
-

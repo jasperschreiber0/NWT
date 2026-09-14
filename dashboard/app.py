@@ -78,6 +78,13 @@ def file_mtime_iso(path: Path):
         return None
 
 
+@app.get('/api/operations')
+def operations(_: None = Depends(require_auth)):
+    data = read_json(Path('/var/lib/nwt-ops/status.json'))
+    if not data: return {'ready_for_entries': False, 'issues': ['Operations report unavailable']}
+    return data
+
+
 @app.get("/api/health")
 def health(_: None = Depends(require_auth)):
     try:
@@ -447,4 +454,3 @@ app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")
 @app.get("/")
 def root():
     return FileResponse(str(Path(__file__).parent / "static" / "index.html"))
-

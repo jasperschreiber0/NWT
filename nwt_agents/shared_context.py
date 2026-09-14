@@ -587,8 +587,8 @@ def log_decision_input(
                 "entry_price": entry_price_ref,
                 "decision": decision,
                 "decision_reason": rejection_reason or outcome_reason,
-                "source_ticket_id": ticket_id,
-                "source_decision_id": row[0] if row else None,
+                "source_ticket_id": str(ticket_id) if ticket_id else None,
+                "source_decision_id": str(row[0]) if row else None,
             })
         except Exception:
             # Canonical logging committed above. Recover the failed analytics
@@ -923,4 +923,3 @@ def insert_decision(
             (ticket_id, decision, reasoning, decided_by, sizing_multiplier),
         )
     conn.commit()
-

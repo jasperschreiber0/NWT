@@ -46,7 +46,7 @@ def _ticket(**payload_overrides) -> dict:
         "time_in_force": "day",
     }
     payload.update(payload_overrides)
-    return {"ticket_id": "11111111-1111-1111-1111-111111111111", "payload": payload}
+    return {"ticket_id": "11111111-1111-1111-1111-111111111111", "payload": payload, "created_at": datetime.now(timezone.utc)}
 
 
 @pytest.fixture(autouse=True)
@@ -57,7 +57,9 @@ def _bypass_upstream_gates():
     the shortability gate specifically.
     """
     with patch.object(engine, "check_directional_cap", return_value=(False, 0.0, 1_000_000.0)), \
-         patch.object(engine, "synchronous_risk_veto", return_value=(False, "")):
+         patch.object(engine, "synchronous_risk_veto", return_value=(False, "")), \
+         patch.object(engine, "require_operations_health"), \
+         patch.object(engine, "reserve", return_value=True):
         yield
 
 
@@ -203,4 +205,3 @@ def test_missing_cache_calls_alpaca_once_and_persists(tmp_path, monkeypatch):
     mock_alpaca_get.assert_called_once_with("/assets/EWU")
     assert result["shortable"] is False
     assert json.loads(cache_file.read_text())["EWU"]["shortable"] is False
-

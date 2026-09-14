@@ -17,6 +17,7 @@ import os
 import sys
 import time
 import uuid
+from reliability import entry_rejection, reserve
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -539,6 +540,28 @@ def compute_qty_from_notional(sized_notional: float, price: float) -> int:
     return max(int(sized_notional / price), 1)
 
 
+def require_operations_health():
+    ops = json.loads(Path('/var/lib/nwt-ops/status.json').read_text())
+    stamp = datetime.fromisoformat(ops['observed_at'])
+    if (datetime.now(timezone.utc) - stamp).total_seconds() > 900 or not ops['ready_for_entries']:
+        raise ValueError('Operations health is stale or degraded')
+
+
+def submit_identified_order(body):
+    client_id = body.get('client_order_id')
+    if not client_id:
+        raise ValueError('Stable client order ID required')
+    try:
+        prior = alpaca_get('/orders:by_client_order_id?client_order_id=' + client_id)
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 404:
+            raise
+    else:
+        # Do not replace a canceled, rejected, partial, or filled order.
+        return prior
+    return alpaca_post('/orders', body)
+
+
 def place_equity_order(payload: dict) -> dict:
     symbol = payload["symbol"]
     sized_notional = float(payload["sized_notional"])
@@ -565,11 +588,12 @@ def place_equity_order(payload: dict) -> dict:
         "type": "market",
         "time_in_force": time_in_force,
     }
+    order_body['client_order_id'] = payload.get('client_order_id')
     if qa:
         order_body.update(client_order_id=payload['client_order_id'], type='limit',
                           limit_price=str(round(sized_notional, 2)))
     logger.info("Placing equity order: %s %s x%d (notional=%.2f)", side, symbol, qty, sized_notional)
-    return alpaca_post("/orders", order_body)
+    return submit_identified_order(order_body)
 
 
 def place_options_order(payload: dict) -> dict:
@@ -602,7 +626,8 @@ def place_options_order(payload: dict) -> dict:
         }
         logger.info("Placing mleg options order: %d legs x%d (%s)",
                     len(legs), qty, ", ".join(f"{l['side']} {l['option_symbol']}" for l in legs))
-        return alpaca_post("/orders", order_body)
+        order_body['client_order_id'] = payload.get('client_order_id')
+        return submit_identified_order(order_body)
 
     option_symbol = payload["option_symbol"]
     order_body = {
@@ -614,7 +639,8 @@ def place_options_order(payload: dict) -> dict:
         "order_class": "simple",
     }
     logger.info("Placing options order: buy %s x%d", option_symbol, qty)
-    return alpaca_post("/orders", order_body)
+    order_body['client_order_id'] = payload.get('client_order_id')
+    return submit_identified_order(order_body)
 
 
 def place_close_order(symbol: str, qty: int, asset_type: str, side: str = "sell") -> dict:
@@ -641,6 +667,31 @@ def place_close_order(symbol: str, qty: int, asset_type: str, side: str = "sell"
 # ---------------------------------------------------------------------------
 # pnl_adjusted computation
 # ---------------------------------------------------------------------------
+
+def option_close_order(pos):
+    if pos.get('status') != 'open' or pos.get('asset_type') != 'option':
+        raise ValueError('Option close requires an open option ledger position')
+    qty = float(pos.get('qty') or 0)
+    if qty <= 0 or qty != int(qty):
+        raise ValueError('Exact whole-contract close quantity required')
+    client_id = 'nwt-close-' + str(pos['position_id'])
+    try:
+        prior = alpaca_get('/orders:by_client_order_id?client_order_id=' + client_id)
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 404: raise
+    else: return prior
+    broker = alpaca_get('/positions/' + pos['asset'])
+    if broker.get('side') != pos['direction'] or abs(float(broker['qty'])) < qty:
+        raise ValueError('Option broker side/quantity mismatch')
+    if alpaca_get('/orders?status=open&symbols=' + pos['asset']):
+        raise ValueError('Conflicting open option order; reconciliation required')
+    if not alpaca_get('/clock').get('is_open'):
+        raise ValueError('Regular session required for option close')
+    side = 'buy' if pos['direction'] == 'short' else 'sell'
+    return submit_identified_order(dict(symbol=pos['asset'], qty=str(int(qty)), side=side,
+        type='market', time_in_force='day', order_class='simple',
+        position_intent=side + '_to_close', client_order_id=client_id))
+
 
 def equity_close_order(pos):
     """Reuse one broker order per ledger position, including after a timeout.
@@ -675,7 +726,7 @@ def equity_close_order(pos):
     if not clock.get('is_open'):
         raise ValueError('Equity close submission requires regular market hours')
     broker = alpaca_get('/positions/' + symbol)
-    if broker.get('side') != direction or abs(float(broker.get('qty') or 0)) != qty:
+    if broker.get('side') != direction or abs(float(broker.get('qty') or 0)) < qty:
         raise ValueError('Broker direction/quantity differs from ledger; reconcile before closing')
     if alpaca_get('/orders?status=open&symbols=' + symbol):
         raise ValueError('Outstanding symbol order requires reconciliation before closing')
@@ -916,13 +967,19 @@ def process_close_ticket(conn, ticket: dict) -> None:
             symbol = pos['asset']
             order = equity_close_order(pos)
         else:
-            order = place_close_order(symbol, qty, asset_type, side=close_side)
+            pos = get_ledger_position(conn, position_id) if position_id else None
+            if not pos: raise ValueError('Option close requires a ledger position')
+            if pos.get('status') == 'closed':
+                insert_decision(conn, ticket_id, 'SKIPPED', 'Position already closed')
+                return
+            qty = float(pos.get('qty') or 0)
+            order = option_close_order(pos)
         filled = poll_order_until_filled(order["id"])
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
 
         if (fill_status != "filled" or fill_price <= 0
-                or (asset_type == 'equity' and float(filled.get('filled_qty') or 0) != qty)):
+                or float(filled.get('filled_qty') or 0) != qty):
             insert_decision(conn, ticket_id, "FAILED",
                             f"Close order not filled — status={fill_status}")
             return
@@ -986,7 +1043,7 @@ def process_force_close(conn, ticket: dict) -> None:
 
     try:
         order = (equity_close_order(position) if asset_type == 'equity'
-                 else alpaca_delete(f"/positions/{asset}"))
+                 else option_close_order(position))
     except Exception as exc:
         reason = f"FORCE_CLOSE: liquidation order failed for {asset}: {exc}"
         logger.error("Ticket %s: %s", ticket_id, reason)
@@ -1007,8 +1064,7 @@ def process_force_close(conn, ticket: dict) -> None:
     fill_price_str = filled_order.get("filled_avg_price")
     fill_price = float(fill_price_str) if fill_price_str else None
     if (fill_price is None or filled_order.get('status') != 'filled'
-            or (asset_type == 'equity' and float(filled_order.get('filled_qty') or 0)
-                != float(position.get('qty') or 0))):
+            or float(filled_order.get('filled_qty') or 0) != float(position.get('qty') or 0)):
         reason = f"FORCE_CLOSE: no fill price — status={filled_order.get('status')}"
         logger.warning("Ticket %s: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "FAILED", reason)
@@ -1128,6 +1184,19 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         insert_decision(conn, ticket_id, "REJECTED", reason)
         return
 
+    rejection = entry_rejection(ticket)
+    if rejection:
+        insert_decision(conn, ticket_id, 'REJECTED', rejection)
+        mark_decision_outcome(conn, decision_ticket_id, rejection)
+        return
+
+    # Server health is an entry gate, independent of exit monitoring.
+    try:
+        require_operations_health()
+    except Exception as exc:
+        insert_decision(conn, ticket_id, 'REJECTED', 'OPS_HEALTH_GATE: ' + str(exc))
+        return
+
     # Synchronous risk gate — re-reads directives fresh at order time
     vetoed, veto_reason = synchronous_risk_veto(conn, payload)
     if vetoed:
@@ -1177,6 +1246,11 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
                              {"ticket_id": ticket_id, "symbol": symbol, "shortability": shortability})
             return
 
+    if not reserve(conn, ticket):
+        insert_decision(conn, ticket_id, 'REJECTED', 'DUPLICATE_OR_UNRESOLVED_ENTRY_INTENT')
+        return
+    payload = dict(payload)
+    payload.setdefault('client_order_id', 'nwt-entry-' + ticket_id)
     try:
         if asset_type == "equity":
             entry_bid, entry_ask = get_latest_quote(symbol, "equity")
@@ -1370,4 +1444,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

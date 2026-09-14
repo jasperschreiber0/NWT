@@ -145,12 +145,10 @@ def run_recon(conn, mode: str) -> bool:
     # at order time) — not row count. A single order can fill more than one
     # contract, so "1 row = 1 contract" does not hold.
     for sym in set(alpaca_map) & set(ledger_map):
-        asset_type = ledger_map[sym][0].get("asset_type", "equity")
-        if asset_type != "option":
-            continue
-        alpaca_qty = alpaca_map[sym]["qty"]
-        ledger_qty = sum(float(row.get("qty") or 0) for row in ledger_map[sym])
-        if abs(alpaca_qty - ledger_qty) > 0.5:
+        alpaca_qty = alpaca_map[sym]["qty"] * (-1 if alpaca_map[sym]["side"] == 'short' else 1)
+        ledger_qty = sum(float(row.get("qty") or 0) * (-1 if row.get('direction') == 'short' else 1)
+                         for row in ledger_map[sym])
+        if abs(alpaca_qty - ledger_qty) > 0.000001:
             entry = {"class": "qty_mismatch", "symbol": sym,
                      "alpaca_qty": alpaca_qty, "ledger_qty": ledger_qty}
             logger.error("CRITICAL qty mismatch: %s alpaca=%.0f ledger=%.0f", sym, alpaca_qty, ledger_qty)
@@ -286,11 +284,10 @@ def main() -> None:
                 logger.error("Recon NOT clean — no_trade_mode left untouched")
                 sys.exit(1)
         else:  # nightly
-            run_recon(conn, "nightly")
+            sys.exit(0 if run_recon(conn, "nightly") else 1)
     finally:
         conn.close()
 
 
 if __name__ == "__main__":
     main()
-

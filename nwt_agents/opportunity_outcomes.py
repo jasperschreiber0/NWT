@@ -43,7 +43,7 @@ def upsert_outcome(conn, opportunity_id: str, lane: str, data: dict[str, Any]) -
         "decision": data.get("decision"),
         "decision_reason": data.get("decision_reason"),
         "source_ticket_id": data.get("source_ticket_id"),
-        "source_decision_id": data.get("source_decision_id"),
+        "source_decision_id": str(data["source_decision_id"]) if data.get("source_decision_id") else None,
         "opened_at": data.get("opened_at"),
         "closed_at": data.get("closed_at"),
     }
@@ -87,4 +87,3 @@ def fetch_scoreboard(conn) -> list[dict[str, Any]]:
         cur.execute(SCOREBOARD_QUERY)
         columns = [desc[0] for desc in cur.description]
         return [dict(zip(columns, row)) for row in cur.fetchall()]
-
