@@ -1,7 +1,7 @@
 {
-  "version": "20260912-v1",
+  "version": "20260915-paper-discovery-v1",
   "annual_net_return_target": 0.3,
-  "maximum_drawdown": "awaiting_user_choice",
+  "maximum_drawdown": "Existing paper runtime limits retained",
   "execution_enabled": false,
   "aapl_paper_target_weight": 0.3,
   "rules": [
@@ -23,5 +23,21 @@
     "clean_paper_lifecycles_proposed": 50,
     "out_of_sample_roundtrips_research_target": 100,
     "note": "Counts are workflow thresholds, not proof of profitability; existing risk limits remain in force."
-  }
+  },
+  "paper_starting_capital_usd": 100000,
+  "paper_research_through": "2026-12-31",
+  "prospective_live_capital_usd": 5000,
+  "live_activation": "Separate readiness review at end December; never automatic",
+  "research_style": "Aggressive breadth and competing prospective hypotheses",
+  "discovery_rules": [
+    "volume_breakout",
+    "failed_breakout",
+    "relative_strength",
+    "dip_recovery"
+  ],
+  "discovery_variants_per_rule": 2,
+  "discovery_horizons_minutes": [
+    30,
+    120
+  ]
 }

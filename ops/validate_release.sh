@@ -9,6 +9,6 @@ trap 'runuser -u postgres -- /usr/lib/postgresql/16/bin/pg_ctl -D "$testroot/dat
 export NWT_TEST_DB_DSN="dbname=postgres user=postgres host=$testroot port=55449"
 unset NWT_DB_DSN
 cd /opt/nwt-reliability-candidate
-python3 -m compileall -q execution ops nwt_agents dashboard
-python3 -m pytest -q tests_offline nwt_agents/tests execution/tests ukeu/tests ops/test_operations.py research/test_event_observation.py
+python3 -m compileall -q execution ops nwt_agents dashboard research
+python3 -m pytest -q tests_offline nwt_agents/tests execution/tests ukeu/tests ops/test_operations.py ops/test_report_format.py research/test_event_observation.py research/test_discovery.py
 git diff --check

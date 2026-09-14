@@ -106,7 +106,7 @@ def inspect(now=None):
         if stale_executed: issues.append('Stale-session entries executed: ' + str(stale_executed))
     conn.close()
     research = {}
-    for label, relative, max_age in [('research', 'research/evidence/latest.json', 900), ('events', 'research/event-evidence/latest.json', 1800)]:
+    for label, relative, max_age in [('research', 'research/evidence/latest.json', 900), ('events', 'research/event-evidence/latest.json', 1800), ('discovery', 'research/discovery-evidence/latest.json', 600)]:
         try:
             data = json.loads((ROOT / relative).read_text()); research[label] = data
             age = (now - datetime.fromisoformat(data['observed_at'])).total_seconds()
@@ -114,6 +114,7 @@ def inspect(now=None):
             if expected and age > max_age: issues.append(label + ' collection overdue')
             if label == 'research' and expected and not data.get('market_data_available'): issues.append('Market data unavailable')
             if label == 'events' and data.get('status') != 'OK': issues.append('Event sources degraded')
+            if label == 'discovery' and expected and data.get('status') != 'OK': issues.append('Discovery data degraded')
         except Exception: issues.append(label + ' collection evidence missing')
     c = db(); c.row_factory = __import__('sqlite3').Row
     jobs = json.loads((STATE / 'jobs.json').read_text())

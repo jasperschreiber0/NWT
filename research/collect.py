@@ -5,7 +5,7 @@ from datetime import datetime,timedelta,timezone
 
 ROOT=Path('/home/northworld/trading')
 OUT=ROOT/'research/evidence'
-SYMBOLS=['SPY','QQQ','GLD','TLT','XLE','VGK','SAFX']
+from universe import SYMBOLS, paged, VERSION
 
 def encode(value):return json.dumps(value,sort_keys=True,default=str,separators=(',',':'))
 
@@ -110,11 +110,11 @@ def main():
         archive('option_snapshots',now.isoformat(),{'feed_requested':'opra','contracts_requested':sorted(contracts)[:100],
                 'truncated':len(contracts)>100,'data':chain,'code_version':version})
     # One full daily dataset per UTC day after the regular close, independent of no_trade_mode.
-    marker=OUT/('daily-'+now.date().isoformat()+'.json')
+    marker=OUT/('daily-'+VERSION+'-'+now.date().isoformat()+'.json')
     if now.hour>=21 and not marker.exists():
         params={'symbols':','.join(SYMBOLS),'timeframe':'1Day','start':(now-timedelta(days=400)).isoformat(),
                 'end':now.isoformat(),'feed':'sip','adjustment':'all','limit':10000}
-        data=get('https://data.alpaca.markets/v2/stocks/bars',params)
+        data=paged(get,'https://data.alpaca.markets/v2/stocks/bars',params,'bars')
         if 'bars' not in data or data.get('next_page_token'):
             raise RuntimeError('Daily history unavailable or incomplete; no new research signal recorded')
         archive('daily_bars',now.date(),dict(parameters=params,data=data))

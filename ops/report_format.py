@@ -31,6 +31,14 @@ def format_report(status, trial, day, activation=False):
             label = str(row.get('decision', 'unknown')).replace('_', ' ').capitalize()
             lines.append(f"• {label}: {row.get('n', 0)}")
     outcomes = status.get('outcomes') or {}
+    discovery = (status.get('research') or {}).get('discovery') or {}
+    if discovery:
+        patterns = discovery.get('patterns') or {}
+        lines += ['', 'Paper research account: $100,000 starting capital',
+                  f"Market coverage: {discovery.get('symbols_received', 0)} symbols; {discovery.get('option_contracts', 0)} option contracts",
+                  f"Minute bars stored: {patterns.get('minute_bars', 0):,}",
+                  f"Pattern signals: {patterns.get('triggered_signals', 0)}; evaluated horizons: {patterns.get('outcomes', 0)}",
+                  'Pattern results are research estimates, separate from broker profit.']
     lines += ['', 'Recorded outcome rows: ' + str(outcomes.get('n', 'unavailable')),
               'Adjusted result for these records: ' + money(outcomes.get('net')),
               'Record counts can include individual option legs; they are not counts of complete trades.',
