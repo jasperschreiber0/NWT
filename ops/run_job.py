@@ -29,11 +29,23 @@ def run(name):
     config = json.loads((STATE / 'jobs.json').read_text())[name]
     STATE.mkdir(parents=True, exist_ok=True)
     # All order/reconciliation jobs share one lock. Other jobs use their own.
-    lock = (STATE / (config.get('lock', name) + '.lock')).open('a')
+    own_lock = (STATE / (name + '.job.lock')).open('a')
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(own_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         return 0
+    lock = (STATE / (config.get('lock', name) + '.lock')).open('a')
+    # Different broker jobs share scheduled minutes. Serialize them rather than
+    # dropping the jobs that arrive second; duplicate instances still skip above.
+    until = time.monotonic() + 180
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= until:
+                return 75
+            time.sleep(1)
     c = db()
     now = time.time()
     log = STATE / 'logs' / (name + '-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S') + '.log')

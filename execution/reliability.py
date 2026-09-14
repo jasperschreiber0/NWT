@@ -53,3 +53,21 @@ def reconcile_quantities(broker, ledger):
     return [{'symbol': s, 'broker': actual.get(s, 0), 'ledger': expected.get(s, 0)}
             for s in sorted(set(actual) | set(expected))
             if abs(actual.get(s, 0) - expected.get(s, 0)) > 0.000001]
+
+
+def separate_legacy_expiries(broker, ledger, cutover):
+    """Retain old unresolved attribution without pretending expired contracts are live."""
+    symbols = {p['symbol'] for p in broker}
+    live, legacy = [], []
+    for row in ledger:
+        expired_before_cutover = False
+        if row.get('asset_type') == 'option':
+            try:
+                expiry = datetime.strptime(row['asset'][-15:-9], '%y%m%d').date().isoformat()
+                expired_before_cutover = expiry < cutover
+            except (ValueError, KeyError): pass
+        if row.get('status') == 'suspect' and expired_before_cutover and row['asset'] not in symbols:
+            legacy.append(row)
+        else:
+            live.append(row)
+    return live, legacy

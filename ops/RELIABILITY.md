@@ -16,6 +16,9 @@ PM2 supervises only the dashboard. Cron is started again if found inactive.
 The watchdog runs every five minutes, checks broker calendar, signed aggregate
 positions, outstanding orders, job deadlines, source freshness, and attribution.
 It holds new entries when its result is missing, older than 15 minutes, or degraded.
+Pretrial expired option records that remain suspect and are absent at the broker
+stay explicitly listed as unresolved historical attribution, excluded from live
+exposure reconciliation. No exit price or learning outcome is manufactured for them.
 An operational hold does not bypass or clear the existing risk/reconciliation flags.
 Safe transient faults recover when fresh checks pass. Uncertain orders and quantity
 mismatches require investigation and are never resolved by guessing fills.

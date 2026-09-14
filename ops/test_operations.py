@@ -39,3 +39,21 @@ def test_safe_job_retries_but_order_job_does_not(monkeypatch,tmp_path):
     c=run_job.db()
     assert c.execute('SELECT job,status,attempts FROM runs ORDER BY id').fetchall()==[
         ('collector','ok',3),('engine','failed',1)]
+
+
+def test_broker_job_waits_for_shared_lock(monkeypatch,tmp_path):
+    monkeypatch.setattr(run_job,'STATE',tmp_path)
+    monkeypatch.setattr(run_job,'ROOT',tmp_path)
+    jobs={'engine':dict(cwd='.',args=['fake.py'],lock='broker',retry_safe=False)}
+    (tmp_path/'jobs.json').write_text(json.dumps(jobs))
+    calls=[]
+    def acquire(file,flags):
+        calls.append(file.name)
+        if len(calls)==2:raise BlockingIOError()
+    monkeypatch.setattr(run_job.fcntl,'flock',acquire)
+    monkeypatch.setattr(run_job.time,'sleep',lambda _:None)
+    process=Mock();process.wait.return_value=0
+    monkeypatch.setattr(run_job.subprocess,'Popen',lambda *a,**k:process)
+    assert run_job.run('engine')==0
+    assert len(calls)==3
+    assert calls[1]==calls[2]

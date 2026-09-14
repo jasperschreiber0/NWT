@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 import requests
 import engine
-from reliability import entry_rejection, intent_key, reconcile_quantities
+from reliability import entry_rejection, intent_key, reconcile_quantities, separate_legacy_expiries
 
 NOW = datetime(2026,9,14,14,tzinfo=timezone.utc)
 
@@ -36,6 +36,13 @@ def test_signed_aggregate_reconciliation_detects_equity_errors():
     assert not reconcile_quantities([dict(symbol='EWA',qty='48')],rows)
     assert reconcile_quantities([dict(symbol='EWA',qty='24')],rows)
     assert reconcile_quantities([dict(symbol='EWA',qty='-48')],rows)
+
+
+def test_only_absent_pretrial_expired_suspects_are_historical():
+    old=dict(asset='AAPL260717C00312500',asset_type='option',status='suspect')
+    current=dict(asset='QQQ260921P00706000',asset_type='option',status='suspect')
+    assert separate_legacy_expiries([], [old,current], '2026-09-15')==([current],[old])
+    assert separate_legacy_expiries([dict(symbol=old['asset'])],[old],'2026-09-15')==([old],[])
 
 
 @pytest.mark.parametrize('status',['new','partially_filled','filled','canceled'])

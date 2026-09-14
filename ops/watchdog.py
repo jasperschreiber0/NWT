@@ -14,7 +14,7 @@ import requests
 from dotenv import load_dotenv
 from run_job import ROOT, STATE, db
 sys.path.insert(0, str(ROOT / 'execution'))
-from reliability import reconcile_quantities
+from reliability import reconcile_quantities, separate_legacy_expiries
 
 
 def atomic(path, data):
@@ -76,6 +76,7 @@ def inspect(now=None):
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM nwt_portfolio_ledger WHERE status IN ('open','suspect')")
         ledger = list(cur.fetchall())
+        ledger, legacy = separate_legacy_expiries(broker, ledger, '2026-09-15')
         mismatch = reconcile_quantities(broker, ledger)
         if mismatch: issues.append('Broker/ledger quantity or direction mismatch')
         if any(p['status'] == 'suspect' for p in ledger): issues.append('Unresolved suspect ledger position')
@@ -135,11 +136,15 @@ def inspect(now=None):
                 issues=sorted(set(issues)), ready_for_entries=not issues, broker_positions=len(broker),
                 open_orders=len(orders), mismatches=mismatch, flags=flags, tickets=tickets,
                 entries=entries, outcomes=outcome, decisions=decisions, learning_outcome_rows=learning_n,
+                legacy_attribution=[dict(asset=p['asset'],position_id=str(p['position_id']),status='unresolved historical attribution; absent at broker') for p in legacy],
                 research=research, jobs=runs)
 
 
 def main():
-    parser = argparse.ArgumentParser(); parser.add_argument('--report', action='store_true'); args = parser.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--report', action='store_true')
+    parser.add_argument('--activation-report', action='store_true')
+    args = parser.parse_args()
     STATE.mkdir(parents=True, exist_ok=True)
     c = db()
     try:
@@ -182,8 +187,8 @@ def main():
     elif oldsignature:
         status['alert_delivery_confirmed'] = notify(c, 'recovered:' + day + ':' + oldsignature,
                                                    'NWT recovered: operational checks are healthy. Normal paper risk gates apply.')
-    if args.report:
-        text = ('NWT daily paper report — ' + day + '\n' +
+    if args.report or args.activation_report:
+        text = (('NWT supervision activated — ' if args.activation_report else 'NWT daily paper report — ') + day + '\n' +
                 ('Healthy' if not status['issues'] else 'Needs attention') + '\n' +
                 'Trial: ' + str(trial['consecutive_passes']) + '/20 consecutive sessions\n' +
                 'Paper positions: ' + str(status.get('broker_positions', '?')) + '\n' +
@@ -192,7 +197,7 @@ def main():
                 'Learning outcome rows: ' + str(status.get('learning_outcome_rows', '?')) +
                 '\nStrategy promotion stays gated by sample size, regimes, shadow evidence and the trial.\n' +
                 ('Action: ' + '; '.join(status['issues']) if status['issues'] else 'No action needed.'))
-        status['report_delivery_confirmed'] = notify(c, 'daily:' + day, text)
+        status['report_delivery_confirmed'] = notify(c, ('activation:' if args.activation_report else 'daily:') + day, text)
         if not status['report_delivery_confirmed']:
             status['issues'].append('Daily report delivery failed'); status['ready_for_entries'] = False
             c.execute('UPDATE sessions SET passed=0 WHERE day=?', (day,)); c.commit()
