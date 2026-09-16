@@ -20,6 +20,19 @@ def get_db():
     return psycopg2.connect(dsn)
 
 
+def equity_drawdown(conn):
+    with conn.cursor() as cur:
+        cur.execute('SELECT date,equity FROM nwt_equity_curve WHERE equity>0 ORDER BY date')
+        rows = cur.fetchall()
+    peak = 0.0
+    worst = 0.0
+    for _, value in rows:
+        equity = float(value)
+        peak = max(peak, equity)
+        worst = max(worst, (peak-equity)/peak)
+    return (round(worst, 4) if len(rows)>1 else None), len(rows)
+
+
 def compute_summary(conn):
     # nwt_trade_outcomes is one row per LEG, not per trade — a multi-leg
     # spread (bull_call_spread/bear_put_spread/iron_condor) writes 2-4 rows
@@ -62,17 +75,9 @@ def compute_summary(conn):
     gross_loss = abs(sum(float(t["pnl"] or 0) for t in losses))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
 
-    # Max drawdown from cumulative PnL curve
-    cumulative = 0.0
-    peak = 0.0
-    max_dd = 0.0
-    for t in trades:
-        cumulative += float(t["pnl"] or 0)
-        if cumulative > peak:
-            peak = cumulative
-        dd = (peak - cumulative) / peak if peak > 0 else 0.0
-        if dd > max_dd:
-            max_dd = dd
+    # Recorded account-equity observations include starting capital and open P&L.
+    # A decline in cumulative realized profit is not account drawdown.
+    max_dd, equity_observations = equity_drawdown(conn)
 
     by_strategy = {}
     for t in trades:
@@ -114,7 +119,9 @@ def compute_summary(conn):
         "total_trades": len(trades),
         "win_rate": round(win_rate, 4),
         "profit_factor": round(profit_factor, 4) if profit_factor is not None else None,
-        "max_drawdown": round(max_dd, 4),
+        "max_drawdown": max_dd,
+        "drawdown_basis": "recorded_account_equity_only_not_full_history_or_intraday",
+        "equity_observations": equity_observations,
         "total_pnl": round(sum(float(t["pnl"] or 0) for t in trades), 2),
         "open_positions_count": len(open_positions),
         "open_positions": open_summary,

@@ -46,3 +46,14 @@ def test_edgar_failure_is_not_scored_as_zero_mentions(monkeypatch):
     monkeypatch.setattr(edgar.requests,'get',Mock(side_effect=requests.Timeout('test')))
     with pytest.raises(RuntimeError,match='missing evidence is not zero hits'):
         edgar.edgar_search(['grid'],'2026-09-01','2026-09-16',['10-K'],'Example')
+
+
+def test_account_drawdown_includes_capital_and_requires_history():
+    from unittest.mock import MagicMock
+    tracker=module('drawdown_tracker',ROOT/'performance/tracker.py')
+    conn=MagicMock()
+    cur=conn.cursor.return_value.__enter__.return_value
+    cur.fetchall.return_value=[('a',100000),('b',110000),('c',99000)]
+    assert tracker.equity_drawdown(conn)==(.1,3)
+    cur.fetchall.return_value=[('a',100000)]
+    assert tracker.equity_drawdown(conn)==(None,1)
