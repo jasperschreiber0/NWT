@@ -199,5 +199,7 @@ def main():
         'status':'DEGRADED' if model_errors or market_errors or any(x['status']!='OK' for x in health.values()) else 'OK'}
     temp=OUT/'latest.tmp';temp.write_text(json.dumps(report,indent=2));temp.replace(OUT/'latest.json')
     c.close();print(json.dumps(report,indent=2))
+    if report['status'] != 'OK':
+        raise RuntimeError('Event collection degraded; recorded runner will retry')
 
 if __name__=='__main__':main()
