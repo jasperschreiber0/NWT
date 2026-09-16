@@ -11,6 +11,7 @@ exercise.
 """
 import os
 import uuid
+from pathlib import Path
 from datetime import date, timedelta
 
 import psycopg2
@@ -124,6 +125,12 @@ CREATE TABLE IF NOT EXISTS nwt_system_log (
 );
 """
 
+
+# Include the production opportunity lane: decision writes now commit both
+# records atomically, so a fixture missing this table is not a valid schema.
+SCHEMA_SQL += '\nDROP TABLE IF EXISTS nwt_opportunity_outcomes CASCADE;\n' + (
+    Path(__file__).resolve().parents[2] / 'db/migrate_2026_09_opportunity_outcomes.sql'
+).read_text().replace('source_decision_id BIGINT', 'source_decision_id UUID')
 
 @pytest.fixture()
 def conn():

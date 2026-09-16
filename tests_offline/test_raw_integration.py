@@ -17,7 +17,7 @@ class RawIntegrationTests(unittest.TestCase):
         self.assertNotEqual(lanes.opportunity_id_for(*args, 1), lanes.opportunity_id_for(*args, 2))
         self.assertNotEqual(lanes.opportunity_id_for(*args, 1, 'a'), lanes.opportunity_id_for(*args, 1, 'b'))
 
-    def test_analytics_failure_recovers_connection_and_returns_canonical_id(self):
+    def test_analytics_failure_rolls_back_both_records(self):
         import json
         tree = ast.parse((ROOT / 'nwt_agents/shared_context.py').read_text())
         node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'log_decision_input')
@@ -25,13 +25,13 @@ class RawIntegrationTests(unittest.TestCase):
         exec(compile(ast.Module(body=[node], type_ignores=[]), '<isolated function>', 'exec'), namespace)
         conn = MagicMock()
         conn.cursor.return_value.__enter__.return_value.fetchone.return_value = ('22222222-2222-2222-2222-222222222222',)
-        with patch.object(lanes, 'upsert_outcome', side_effect=RuntimeError('DB unavailable')):
+        with patch.object(lanes, 'record_decision_outcome', side_effect=RuntimeError('DB unavailable')):
             result = namespace['log_decision_input'](
                 conn, '2026-09-06', 'SPY', 'S', 'C', {}, 5, 'A', False, 'CANDIDATE')
-        self.assertEqual(result, '22222222-2222-2222-2222-222222222222')
-        conn.commit.assert_called_once()
+        self.assertIsNone(result)
+        conn.commit.assert_not_called()
         conn.rollback.assert_called_once()
-        namespace['log_system_event'].assert_not_called()
+        namespace['log_system_event'].assert_called_once()
 
     def test_unknown_quantity_is_not_fabricated(self):
         import json
@@ -40,10 +40,13 @@ class RawIntegrationTests(unittest.TestCase):
         ns = {'json': json, 'log_system_event': MagicMock()}
         exec(compile(ast.Module(body=[node], type_ignores=[]), '<isolated function>', 'exec'), ns)
         conn = MagicMock()
-        conn.cursor.return_value.__enter__.return_value.fetchone.return_value = ('22222222-2222-2222-2222-222222222222',)
+        conn.cursor.return_value.__enter__.return_value.fetchone.side_effect = [
+            ('22222222-2222-2222-2222-222222222222',),
+            dict(id='22222222-2222-2222-2222-222222222222', strategy_id='S', symbol='SPY',
+                 run_date='2026-09-06',track='C',regime={},direction='long')]
         with patch.object(lanes, 'upsert_outcome') as write:
             ns['log_decision_input'](conn, '2026-09-06', 'SPY', 'S', 'C', {}, 5, 'A', False, 'CANDIDATE')
-        self.assertIsNone(write.call_args.args[3]['proposed_qty'])
+        self.assertIsNone(write.call_args.args[3].get('proposed_qty'))
         self.assertEqual(write.call_args.args[3]['source_decision_id'], '22222222-2222-2222-2222-222222222222')
 
 

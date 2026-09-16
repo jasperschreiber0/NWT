@@ -182,6 +182,15 @@ def log_decision_input(
                 ),
             )
             row = cur.fetchone()
+        if row:
+            # Shared analytics only; this module retains its own signal logic.
+            import sys
+            agents = next(parent / 'nwt_agents' for parent in Path(__file__).resolve().parents
+                          if (parent / 'nwt_agents').is_dir())
+            if str(agents) not in sys.path:
+                sys.path.insert(0, str(agents))
+            from opportunity_outcomes import record_decision_outcome
+            record_decision_outcome(conn, row[0], commit=False)
         conn.commit()
         return row[0] if row else None
     except Exception as exc:

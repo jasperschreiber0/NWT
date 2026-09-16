@@ -8,6 +8,18 @@ from reliability import entry_rejection, intent_key, reconcile_quantities, separ
 NOW = datetime(2026,9,14,14,tzinfo=timezone.utc)
 
 
+def test_closed_market_defers_all_orders_without_consuming_tickets(monkeypatch):
+    conn=MagicMock()
+    monkeypatch.setattr(engine,'get_db',lambda:conn)
+    heartbeat=MagicMock();monkeypatch.setattr(engine,'upsert_heartbeat',heartbeat)
+    monkeypatch.setattr(engine,'alpaca_get',lambda path:{'is_open':False})
+    for name in ['run_equity_position_monitor','fetch_force_close_tickets','fetch_pending_tickets']:
+        monkeypatch.setattr(engine,name,MagicMock(side_effect=AssertionError('must remain deferred')))
+    engine.main()
+    heartbeat.assert_called_once_with(conn)
+    conn.close.assert_called_once()
+
+
 def ticket(age=0, sender='NWT_EXECUTION_AGENT'):
     return {'ticket_id':'11111111-1111-1111-1111-111111111111', 'from_agent':sender,
             'created_at':NOW-timedelta(seconds=age), 'payload':dict(strategy_id='C1',symbol='QQQ',direction='short')}

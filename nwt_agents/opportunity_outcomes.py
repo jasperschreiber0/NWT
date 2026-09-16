@@ -17,7 +17,7 @@ def opportunity_id_for(strategy_id: str, symbol: str, run_date: Any, track: str,
     return str(uuid.uuid5(OPPORTUNITY_NAMESPACE, key))
 
 
-def upsert_outcome(conn, opportunity_id: str, lane: str, data: dict[str, Any]) -> None:
+def upsert_outcome(conn, opportunity_id: str, lane: str, data: dict[str, Any], *, commit=True) -> None:
     """Create or update one lane without changing trading decisions."""
     if lane not in LANES:
         raise ValueError(f"invalid outcome lane: {lane}")
@@ -65,7 +65,32 @@ def upsert_outcome(conn, opportunity_id: str, lane: str, data: dict[str, Any]) -
             """,
             values,
         )
-    conn.commit()
+    if commit:
+        conn.commit()
+
+
+def record_decision_outcome(conn, decision_id, *, commit=False):
+    """Mirror the stored canonical row in its caller's transaction.
+
+    Read the existing row on retries rather than overwriting original evidence
+    with new input parameters. Symbol-less abstentions have no outcome lane.
+    """
+    from psycopg2.extras import RealDictCursor
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute('SELECT * FROM nwt_decision_inputs WHERE id=%s', (str(decision_id),))
+        row = cur.fetchone()
+    if row is None:
+        raise ValueError('Canonical decision does not exist')
+    if not row.get('symbol'):
+        return
+    oid = opportunity_id_for(row['strategy_id'], row['symbol'], row['run_date'],
+                             row['track'], row.get('genome_version'), row.get('poll_slot', ''))
+    upsert_outcome(conn, oid, 'RAW_SHADOW', dict(
+        strategy_id=row['strategy_id'], symbol=row['symbol'], direction=row.get('direction'),
+        track=row['track'], regime=row.get('regime'), entry_price=row.get('entry_price_ref'),
+        decision=row.get('decision'), decision_reason=row.get('rejection_reason') or row.get('outcome_reason'),
+        source_ticket_id=str(row['ticket_id']) if row.get('ticket_id') else None,
+        source_decision_id=str(row['id'])), commit=commit)
 
 
 SCOREBOARD_QUERY = """

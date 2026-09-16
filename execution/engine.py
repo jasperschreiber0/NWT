@@ -1383,6 +1383,13 @@ def main() -> None:
     try:
         upsert_heartbeat(conn)
 
+        # The same regular-session policy already guards individual order calls.
+        # Outside the session, preserve pending tickets and positions for the
+        # next run rather than misclassifying a deferred close as a failed job.
+        if not alpaca_get('/clock').get('is_open'):
+            logger.info('Regular market closed; entries and closes deferred to next open')
+            return
+
         halted, halt_reason = check_no_trade_mode(conn)
         if halted:
             logger.warning("no_trade_mode is SET: %s — engine exiting without trading", halt_reason)

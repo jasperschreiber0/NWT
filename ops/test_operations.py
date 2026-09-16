@@ -8,6 +8,15 @@ import pytest
 sys.path.insert(0,str(Path(__file__).parent))
 import run_job
 import watchdog
+from install_opportunity_recovery import updated_cron
+
+
+def test_replay_schedule_is_frequent_and_install_is_idempotent():
+    original='SHELL=/bin/bash\n40 21 * * 1-5 /usr/bin/python3 /home/northworld/trading/ops/run_job.py opportunity-replay >> /var/log/nwt/ops-runner.log 2>&1\n'
+    updated=updated_cron(original)
+    assert '*/5 * * * * /usr/bin/python3' in updated
+    assert updated_cron(updated)==updated
+    with pytest.raises(RuntimeError):updated_cron('')
 
 
 def test_trial_requires_consecutive_sessions():
