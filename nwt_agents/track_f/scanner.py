@@ -179,16 +179,18 @@ def upsert_emerging_theme(conn, theme: str, tickers: list, momentum: float, evid
 
 
 def run_scan(conn) -> dict:
-    counts = {"scored": 0, "candidates_surfaced": 0, "emerging_themes_updated": 0}
+    counts = {"scored": 0, "candidates_surfaced": 0, "emerging_themes_updated": 0, "failed": 0}
     constraint_cache: dict = {}
 
     # --- Confirmed themes: score, surface candidates ---
     for theme, cfg in CONFIRMED_THEMES.items():
         for ticker in cfg["tickers"]:
+            logger.info('Scanning %s / %s', ticker, theme)
             try:
                 score, mentions, evidence = score_ticker(ticker, cfg["terms"], constraint_cache)
             except Exception as exc:
                 logger.warning("Scoring failed for %s / %s: %s", ticker, theme, exc)
+                counts['failed'] += 1
                 continue
 
             baseline = fetch_baseline_score(conn, ticker, theme)
@@ -205,10 +207,12 @@ def run_scan(conn) -> dict:
         theme_scores = []
         theme_evidence = {}
         for ticker in cfg["tickers"]:
+            logger.info('Scanning %s / %s', ticker, theme)
             try:
                 score, mentions, evidence = score_ticker(ticker, cfg["terms"], constraint_cache)
             except Exception as exc:
                 logger.warning("Scoring failed for %s / %s: %s", ticker, theme, exc)
+                counts['failed'] += 1
                 continue
             baseline = fetch_baseline_score(conn, ticker, theme)
             momentum = round(score - baseline, 2) if baseline is not None else None
@@ -240,6 +244,8 @@ def main() -> None:
             logger.info("no_trade_mode SET — scanning anyway (read-only research, no trade authority): %s", halt_reason)
 
         counts = run_scan(conn)
+        if counts['failed'] or not counts['scored']:
+            raise RuntimeError('Incomplete research scan: ' + str(counts))
         log_system_event(conn, "INFO", "track_f_scanner", f"Scan complete: {counts}", counts)
         upsert_agent_state(conn, "track_f_scanner", "ok", counts)
         logger.info("Track F scan done — %s", counts)

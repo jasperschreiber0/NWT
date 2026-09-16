@@ -55,6 +55,8 @@ def main():
     output.append(f'40 21 * * 1-5 /usr/bin/python3 {ROOT}/ops/run_job.py opportunity-replay >> /var/log/nwt/ops-runner.log 2>&1')
     jobs['learning-review']=dict(cwd='.',args=['ops/learning_review.py'],env=['nwt_agents/.env'],retry_safe=True,timeout=240,deadline_utc='22:10')
     output.append(f'50 21 * * 1-5 /usr/bin/python3 {ROOT}/ops/run_job.py learning-review >> /var/log/nwt/ops-runner.log 2>&1')
+    from repair_job_config import repair
+    jobs = repair(jobs)
     (Path('/var/lib/nwt-ops')/'jobs.json').write_text(json.dumps(jobs,indent=2))
     # Validate every entry before installing schedules or removing old PM2 jobs.
     for name,j in jobs.items():

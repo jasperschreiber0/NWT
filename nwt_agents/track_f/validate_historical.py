@@ -226,7 +226,7 @@ def edgar_search(
         except requests.RequestException as exc:
             if attempt == MAX_RETRIES:
                 logger.warning("EDGAR request failed after %d attempts: %s", MAX_RETRIES, exc)
-                return []
+                raise RuntimeError('EDGAR unavailable; missing evidence is not zero hits') from exc
             time.sleep(attempt * 2)
 
     return []

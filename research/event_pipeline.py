@@ -10,6 +10,8 @@ VERSION='GLOBAL-EVENT-OBS-v1'
 
 def main():
     import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
     from bs4 import BeautifulSoup
     from dotenv import dotenv_values
     OUT.mkdir(parents=True,exist_ok=True)
@@ -23,12 +25,15 @@ def main():
     def api(path,params=None,data=False):
         r=requests.get(('https://data.alpaca.markets' if data else base)+path,headers=headers,params=params,timeout=30)
         r.raise_for_status();return r.json()
+    public = requests.Session()
+    public.mount('https://', HTTPAdapter(max_retries=Retry(total=2, backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504], allowed_methods=['GET'], respect_retry_after_header=False)))
     sources=json.loads((ROOT/'research/event_sources.json').read_text());health={};new=0
     for source in sources:
         ident=source['id'];baseline=state(c,'baseline:'+ident) is None
         try:
             # Official public GETs only; no broker or OpenAI credentials sent here.
-            response=requests.get(source['url'],timeout=25,headers={'User-Agent':'NorthWorldTrading research@northworldtrading.com'},allow_redirects=False,stream=True)
+            response=public.get(source['url'],timeout=25,headers={'User-Agent':'NorthWorldTrading research@northworldtrading.com'},allow_redirects=False,stream=True)
             response.raise_for_status()
             if response.status_code!=200:raise RuntimeError('Unexpected redirect')
             started=time.monotonic();chunks=[];size=0

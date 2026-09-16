@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg2
+from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 
 BASE = Path(__file__).parent
@@ -14,6 +15,7 @@ PERF = BASE
 
 
 def get_db():
+    load_dotenv(BASE.parent / 'nwt_agents' / '.env')
     dsn = os.environ["NWT_DB_DSN"]
     return psycopg2.connect(dsn)
 
@@ -146,12 +148,13 @@ def write_equity_curve(conn) -> None:
     """
     import os
     import requests
-    alpaca_base = os.environ.get("ALPACA_BASE_URL", "").rstrip("/")
-    alpaca_key = os.environ.get("ALPACA_API_KEY", "")
-    alpaca_secret = os.environ.get("ALPACA_SECRET_KEY", "")
+    alpaca_base = os.environ.get("NWT_ALPACA_BASE_URL", "").rstrip("/")
+    alpaca_key = os.environ.get("NWT_ALPACA_KEY_ID", "")
+    alpaca_secret = os.environ.get("NWT_ALPACA_SECRET_KEY", "")
     if not alpaca_base:
-        print("[perf-tracker] ALPACA_BASE_URL not set — skipping equity curve write", file=sys.stderr)
-        return
+        raise RuntimeError('NWT_ALPACA_BASE_URL missing; equity curve not updated')
+    if alpaca_base != 'https://paper-api.alpaca.markets':
+        raise RuntimeError('Paper broker endpoint required')
     try:
         resp = requests.get(
             f"{alpaca_base}/v2/account",
@@ -161,7 +164,7 @@ def write_equity_curve(conn) -> None:
         resp.raise_for_status()
         equity = float(resp.json().get("equity", 0))
         if equity <= 0:
-            return
+            raise ValueError('Invalid broker equity')
         today = datetime.now(timezone.utc).date()
         with conn.cursor() as cur:
             cur.execute(
@@ -175,7 +178,8 @@ def write_equity_curve(conn) -> None:
         conn.commit()
         print(f"[perf-tracker] Equity curve: {today} equity={equity:.2f}")
     except Exception as exc:
-        print(f"[perf-tracker] WARNING: equity curve write failed: {exc}", file=sys.stderr)
+        conn.rollback()
+        raise RuntimeError('Equity curve update failed') from exc
 
 
 def main():
@@ -186,8 +190,10 @@ def main():
 
         summary = compute_summary(conn)
         summary_path = PERF / "summary.json"
-        with open(summary_path, "w") as f:
+        temporary = summary_path.with_suffix('.tmp')
+        with open(temporary, "w") as f:
             json.dump(summary, f, indent=2)
+        temporary.replace(summary_path)
         log_event(
             conn,
             "INFO",
