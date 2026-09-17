@@ -17,7 +17,7 @@ def recovery_db():
     conn=psycopg2.connect(os.environ['NWT_TEST_DB_DSN'])
     with conn.cursor() as q:
         q.execute('''
-        CREATE TEMP TABLE nwt_tickets(ticket_id uuid PRIMARY KEY,payload jsonb,created_at timestamptz DEFAULT now());
+        CREATE TEMP TABLE nwt_tickets(ticket_id uuid PRIMARY KEY,type text,payload jsonb,created_at timestamptz DEFAULT now());
         CREATE TEMP TABLE nwt_entry_intents(ticket_id uuid);
         CREATE TEMP TABLE nwt_ticket_decisions(ticket_id uuid,decision text,reasoning text,decided_by text,created_at timestamptz DEFAULT now());
         CREATE UNIQUE INDEX recovery_partial_decision ON nwt_ticket_decisions(ticket_id,decided_by)
@@ -27,7 +27,7 @@ def recovery_db():
         CREATE TEMP TABLE nwt_portfolio_ledger(position_id uuid DEFAULT gen_random_uuid(),bot_source text,strategy_id text,
           asset text,asset_type text,direction text,delta_exposure numeric,notional_risk numeric,qty numeric,entry_price numeric,
           entry_time timestamptz,entry_bid numeric,entry_ask numeric,alpaca_order_id uuid,stop_pct numeric,target_pct numeric,
-          spread_group_id uuid,ticket_id uuid,status text);
+          spread_group_id uuid,ticket_id uuid,status text,lifecycle_state text,exit_price numeric,exit_time timestamptz,realized_slippage numeric,exit_reason text,exit_bid numeric,exit_ask numeric);
         ''')
         q.execute('INSERT INTO nwt_tickets(ticket_id,payload) VALUES(%s,%s)',(TID,json.dumps(PAYLOAD)))
         q.execute('INSERT INTO nwt_entry_intents VALUES(%s)',(TID,))
@@ -85,3 +85,69 @@ def test_unverified_fills_are_rejected(change):
 def test_terminal_partial_fill_uses_actual_filled_quantity():
     data=fill_data({'ticket_id':TID,'payload':PAYLOAD},dict(ORDER,status='canceled',filled_qty='12'))
     assert data['qty']==12
+
+
+@pytest.fixture
+def close_db(recovery_db):
+    recover_entries(recovery_db,lambda _:ORDER)
+    with recovery_db.cursor() as q:
+        q.execute("UPDATE nwt_portfolio_ledger SET status='open' RETURNING position_id")
+        pid=str(q.fetchone()[0])
+    recovery_db.commit()
+    return recovery_db,pid
+
+
+def close_receipt(pid, **changes):
+    return dict(dict(ORDER,client_order_id='nwt-close-'+pid,side='sell',
+                     filled_at='2026-09-17T15:00:00Z'),**changes)
+
+
+def test_delayed_close_receipt_is_atomic_and_idempotent(close_db):
+    from close_recovery import recover_closes
+    conn,pid=close_db
+    with conn.cursor() as q:
+        q.execute("ALTER TABLE nwt_system_log ADD CONSTRAINT fail_close_audit CHECK(component <> 'close_recovery')")
+    conn.commit()
+    with pytest.raises(psycopg2.IntegrityError):recover_closes(conn,lambda _:close_receipt(pid))
+    with conn.cursor() as q:
+        q.execute('SELECT status FROM nwt_portfolio_ledger');assert q.fetchone()[0]=='open'
+        q.execute('ALTER TABLE nwt_system_log DROP CONSTRAINT fail_close_audit')
+    conn.commit()
+    assert recover_closes(conn,lambda _:close_receipt(pid))['recorded']==[pid]
+    assert recover_closes(conn,lambda _:pytest.fail('Already closed'))['recorded']==[]
+    with conn.cursor() as q:
+        q.execute('SELECT status,exit_price,exit_time FROM nwt_portfolio_ledger')
+        row=q.fetchone();assert row[:2]==('closed',Decimal('89.66375'))
+        assert row[2].isoformat()=='2026-09-17T15:00:00+00:00'
+
+
+@pytest.mark.parametrize('change',[{'symbol':'EWA'},{'side':'buy'},{'qty':'33'},{'filled_qty':'31'}, {'filled_avg_price':'NaN'}, {'filled_at':'2026-09-16T15:00:00Z'}])
+def test_close_receipt_conflict_leaves_ledger_open(close_db,change):
+    from close_recovery import recover_closes
+    conn,pid=close_db
+    with pytest.raises(ValueError):recover_closes(conn,lambda _:close_receipt(pid,**change))
+    with conn.cursor() as q:
+        q.execute('SELECT status FROM nwt_portfolio_ledger');assert q.fetchone()[0]=='open'
+
+
+def test_partial_close_is_not_mistaken_for_full_close(close_db):
+    from close_recovery import recover_closes
+    conn,pid=close_db
+    assert recover_closes(conn,lambda _:close_receipt(pid,status='canceled',filled_qty='12'))['pending']==[pid]
+    with conn.cursor() as q:
+        q.execute('SELECT status FROM nwt_portfolio_ledger');assert q.fetchone()[0]=='open'
+
+
+
+def test_short_option_delayed_close_and_ticket_attribution(close_db):
+    from close_recovery import recover_closes
+    conn,pid=close_db
+    with conn.cursor() as q:
+        q.execute("UPDATE nwt_portfolio_ledger SET direction='short',asset_type='option'")
+        q.execute("INSERT INTO nwt_tickets(ticket_id,type,payload) VALUES(%s,'CLOSE_REQUEST',%s)",
+                  (OID,json.dumps({'position_id':pid})))
+    conn.commit()
+    assert recover_closes(conn,lambda _:close_receipt(pid,side='buy'))['recorded']==[pid]
+    with conn.cursor() as q:
+        q.execute('SELECT decision FROM nwt_ticket_decisions WHERE ticket_id=%s',(OID,))
+        assert q.fetchone()[0]=='EXECUTED'

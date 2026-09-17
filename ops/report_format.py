@@ -24,6 +24,8 @@ def format_report(status, trial, day, activation=False):
         'Open paper positions: ' + str(status.get('broker_positions', 'unavailable')),
         'Pending broker orders: ' + str(status.get('open_orders', 'unavailable')),
     ]
+    if status.get('session_incidents'):
+        lines.append('This session had incidents; recovery does not count it as a clean trial day.')
     decisions = status.get('decisions') or []
     if decisions:
         lines += ['', 'Decision records:']
@@ -39,6 +41,17 @@ def format_report(status, trial, day, activation=False):
                   f"Minute bars stored: {patterns.get('minute_bars', 0):,}",
                   f"Pattern signals: {patterns.get('triggered_signals', 0)}; evaluated horizons: {patterns.get('outcomes', 0)}",
                   'Pattern results are research estimates, separate from broker profit.']
+        board = patterns.get('scoreboard') or []
+        lines.append(f"Research sessions observed: {patterns.get('observed_sessions', 'unavailable')}")
+        if board:
+            positive = sum(float(r['mean_after_30bps']) > 0 for r in board)
+            lines.append(f'Positive average after 30-basis-point cost stress: {positive}/{len(board)} rule/horizon combinations.')
+            best = max(board, key=lambda r: float(r['mean_after_30bps']))
+            lines.append(f"Highest stressed average: {best['rule']} / {best['horizon_minutes']} min: {float(best['mean_after_30bps']):+.3%} ({best['samples']} overlapping observations).")
+        else:
+            lines.append('No evaluated research results available yet.')
+        lines += ['Overlapping observations are not independent trades.',
+                  'These exploratory results do not establish a profitable strategy or live readiness.']
     lines += ['', 'Recorded outcome rows: ' + str(outcomes.get('n', 'unavailable')),
               'Adjusted result for these records: ' + money(outcomes.get('net')),
               'Record counts can include individual option legs; they are not counts of complete trades.',

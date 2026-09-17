@@ -91,6 +91,7 @@ def close_position(
     exit_reason: str = "unknown",
     exit_bid: Optional[float] = None,
     exit_ask: Optional[float] = None,
+    *, exit_time=None, commit=True,
 ) -> None:
     """
     UPDATE nwt_portfolio_ledger: set status='closed', exit_price, exit_time,
@@ -111,11 +112,12 @@ def close_position(
                 exit_ask = %s
             WHERE position_id = %s
             """,
-            (exit_price, datetime.now(timezone.utc), slippage, exit_reason, exit_bid, exit_ask, position_id),
+            (exit_price, exit_time or datetime.now(timezone.utc), slippage, exit_reason, exit_bid, exit_ask, position_id),
         )
         if cur.rowcount == 0:
             logger.warning("close_position: no rows updated for position_id=%s", position_id)
-    conn.commit()
+    if commit:
+        conn.commit()
     logger.info("Closed position %s at %.4f slippage=%.4f reason=%s",
                 position_id, exit_price, slippage, exit_reason)
 

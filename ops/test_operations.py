@@ -66,3 +66,28 @@ def test_broker_job_waits_for_shared_lock(monkeypatch,tmp_path):
     assert run_job.run('engine')==0
     assert len(calls)==3
     assert calls[1]==calls[2]
+
+
+
+def test_intraday_failure_cannot_be_replaced_by_healthy_report(monkeypatch,tmp_path):
+    from trial_evidence import update_sessions, unresolved_job_failure
+    monkeypatch.setattr(run_job,'STATE',tmp_path)
+    c=run_job.db();trial={'start_date':'2026-09-15'}
+    update_sessions(c,{'issues':['mismatch'],'trading_day':True},trial,'2026-09-17')
+    update_sessions(c,{'issues':[],'trading_day':True},trial,'2026-09-17',report=True)
+    assert c.execute('SELECT passed FROM sessions').fetchone()[0]==0
+    c.execute("INSERT INTO runs(job,started,status) VALUES ('engine',1789680000,'failed')")
+    c.execute("INSERT INTO runs(job,started,status) VALUES ('engine',1789680001,'running')")
+    assert unresolved_job_failure(c,'engine')
+    c.execute("INSERT INTO runs(job,started,status) VALUES ('engine',1789680002,'ok')")
+    assert not unresolved_job_failure(c,'engine')
+
+
+def test_historical_fault_receipts_correct_false_trial_credit(monkeypatch,tmp_path):
+    from trial_evidence import update_sessions
+    monkeypatch.setattr(run_job,'STATE',tmp_path)
+    c=run_job.db()
+    c.execute("INSERT INTO sessions VALUES ('2026-09-16',1,'{}',0)")
+    c.execute("INSERT INTO notifications VALUES ('fault:2026-09-16:engine job failed',0,'receipt')")
+    update_sessions(c,{'issues':[],'trading_day':True},{'start_date':'2026-09-15'},'2026-09-17',report=True)
+    assert c.execute('SELECT day,passed FROM sessions ORDER BY day').fetchall()==[('2026-09-16',0),('2026-09-17',1)]

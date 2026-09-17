@@ -14,6 +14,7 @@ import requests
 from dotenv import load_dotenv
 from run_job import ROOT, STATE, db
 from report_format import format_report
+from trial_evidence import update_sessions, unresolved_job_failure
 sys.path.insert(0, str(ROOT / 'execution'))
 from reliability import reconcile_quantities, separate_legacy_expiries
 
@@ -124,7 +125,7 @@ def inspect(now=None):
         runs[name] = dict(row) if row else None
         if row and row['status'] == 'running' and time.time() - row['started'] > config.get('timeout', 240) + 60:
             issues.append(name + ' job interrupted or stuck')
-        if row and row['status'] == 'failed': issues.append(name + ' job failed')
+        if unresolved_job_failure(c, name): issues.append(name + ' job failed')
         # Explicit deadlines are only enforced on broker-confirmed trading dates.
         deadline = config.get('deadline_utc')
         if trading_day and deadline and now.strftime('%H:%M') >= deadline:
@@ -165,13 +166,7 @@ def main():
     if not trial.get('failure_drills_passed'):
         status['issues'].append('Failure-recovery drills not verified')
         status['ready_for_entries'] = False
-    if args.report and status.get('trading_day') and day >= trial['start_date']:
-        passed = not status['issues']
-        # A failed session can never be overwritten into a pass by a later retry.
-        c.execute('INSERT INTO sessions VALUES (?,?,?,?) ON CONFLICT(day) DO UPDATE SET '
-                  'passed=MIN(sessions.passed,excluded.passed),evidence=excluded.evidence,checked=excluded.checked',
-                  (day, int(passed), json.dumps(status, default=str), time.time()))
-        c.commit()
+    status['session_incidents'] = update_sessions(c, status, trial, day, report=args.report)
     rows = c.execute('SELECT day,passed FROM sessions ORDER BY day').fetchall()
     trial['consecutive_passes'] = trial_streak(rows)
     trial['sessions_recorded'] = len(rows)

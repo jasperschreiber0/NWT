@@ -673,7 +673,10 @@ def option_close_order(pos):
         prior = alpaca_get('/orders:by_client_order_id?client_order_id=' + client_id)
     except requests.HTTPError as exc:
         if exc.response is None or exc.response.status_code != 404: raise
-    else: return prior
+    else:
+        from close_recovery import validate_close_identity
+        validate_close_identity(pos, prior)
+        return prior
     broker = alpaca_get('/positions/' + pos['asset'])
     if broker.get('side') != pos['direction'] or abs(float(broker['qty'])) < qty:
         raise ValueError('Option broker side/quantity mismatch')
@@ -1381,6 +1384,12 @@ def main() -> None:
         upsert_heartbeat(conn)
         from fill_recovery import recover_entries
         recovery = recover_entries(conn, alpaca_get)
+        from close_recovery import recover_closes
+        close_recovery = recover_closes(conn, alpaca_get)
+        if close_recovery['recorded']:
+            logger.info('Recovered delayed closes: %s', close_recovery['recorded'])
+        if close_recovery['pending']:
+            logger.warning('Unresolved existing close orders: %s', close_recovery['pending'])
         if recovery['recorded']:
             logger.info('Recovered delayed entry fills: %s', recovery['recorded'])
 
@@ -1424,7 +1433,7 @@ def main() -> None:
                     logger.error("Unhandled error in close ticket %s: %s",
                                  ticket.get("ticket_id"), exc)
 
-        if recovery['pending']:
+        if recovery['pending'] or close_recovery['pending']:
             logger.info('Prior orders still settling; new entries deferred')
             return
         pending = fetch_pending_tickets(conn)

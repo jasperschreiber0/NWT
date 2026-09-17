@@ -96,7 +96,9 @@ def ingest(c, data, now):
 
 
 def summary(c):
-    return {'observations': c.execute('SELECT COUNT(*) FROM observations').fetchone()[0],
+    return {'observed_sessions': c.execute('SELECT COUNT(DISTINCT substr(t,1,10)) FROM observations').fetchone()[0],
+            'outcome_sessions': c.execute('SELECT COUNT(DISTINCT substr(t,1,10)) FROM outcomes').fetchone()[0],
+            'observations': c.execute('SELECT COUNT(*) FROM observations').fetchone()[0],
             'triggered_signals': c.execute('SELECT COUNT(*) FROM observations WHERE direction<>0').fetchone()[0],
             'minute_bars': c.execute('SELECT COUNT(*) FROM bars').fetchone()[0],
             'outcomes': c.execute('SELECT COUNT(*) FROM outcomes').fetchone()[0],

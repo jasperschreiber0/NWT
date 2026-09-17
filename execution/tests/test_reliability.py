@@ -74,7 +74,8 @@ def test_uncertain_lookup_never_submits(monkeypatch):
 
 
 def test_option_close_uses_previous_identity(monkeypatch):
-    order=dict(id='original',status='partially_filled')
+    order=dict(id='original',status='partially_filled',client_order_id='nwt-close-id',
+               symbol='QQQ260921P00706000',side='sell',qty='3')
     monkeypatch.setattr(engine,'alpaca_get',lambda _:order)
     post=MagicMock();monkeypatch.setattr(engine,'alpaca_post',post)
     pos=dict(status='open',asset_type='option',qty=3,position_id='id',asset='QQQ260921P00706000',direction='long')

@@ -16,3 +16,15 @@ def test_missing_or_nonfinite_results_are_not_reported_as_zero():
     assert money(None) == 'unavailable'
     assert money('NaN') == 'unavailable'
     assert money('0') == '$0.00'
+
+
+
+def test_research_cost_results_and_overlap_are_disclosed():
+    text=format_report({'issues':[], 'session_incidents':1, 'research':{'discovery':{'patterns':{
+        'observed_sessions':3,'scoreboard':[{'rule':'test','horizon_minutes':30,'samples':1,
+        'mean_after_10bps':.001,'mean_after_30bps':-.001}]}}}}, {},'2026-09-17')
+    assert '0/1 rule/horizon combinations' in text
+    assert '-0.100%' in text
+    assert 'not independent trades' in text
+    assert 'Research sessions observed: 3' in text
+    assert 'does not count it as a clean trial day' in text
