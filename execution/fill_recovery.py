@@ -61,7 +61,7 @@ def recover_entries(conn, get, *, apply=True):
         if Decimal(str(order.get('filled_qty') or 0))==0:
             if apply:
                 with conn.cursor() as q:
-                    q.execute("INSERT INTO nwt_ticket_decisions(ticket_id,decision,reasoning,decided_by) VALUES (%s,'FAILED','BROKER_TERMINAL_NO_FILL','EXECUTION_ENGINE')",(tid,))
+                    q.execute("INSERT INTO nwt_ticket_decisions(ticket_id,decision,reasoning,decided_by) VALUES (%s,'FAILED','BROKER_TERMINAL_NO_FILL','EXECUTION_ENGINE') ON CONFLICT(ticket_id,decided_by) DO UPDATE SET decision=EXCLUDED.decision,reasoning=EXCLUDED.reasoning",(tid,))
                 conn.commit()
             continue
         data=fill_data(ticket,order)
@@ -76,12 +76,14 @@ def recover_entries(conn, get, *, apply=True):
                             raise ValueError('Existing ledger attribution conflicts with fill')
                     else:
                         insert_position(conn,data,commit=False)
-                    q.execute("INSERT INTO nwt_ticket_decisions(ticket_id,decision,reasoning,decided_by) SELECT %s,'EXECUTED',%s,'EXECUTION_ENGINE' WHERE NOT EXISTS(SELECT 1 FROM nwt_ticket_decisions WHERE ticket_id=%s AND decision='EXECUTED' AND decided_by='EXECUTION_ENGINE')",
-                              (tid,'Verified delayed broker fill '+order['id'],tid))
+                    q.execute("SELECT decision,reasoning FROM nwt_ticket_decisions WHERE ticket_id=%s AND decided_by='EXECUTION_ENGINE'",(tid,))
+                    previous=q.fetchone()
+                    q.execute("INSERT INTO nwt_ticket_decisions(ticket_id,decision,reasoning,decided_by) VALUES (%s,'EXECUTED',%s,'EXECUTION_ENGINE') ON CONFLICT(ticket_id,decided_by) DO UPDATE SET decision=EXCLUDED.decision,reasoning=EXCLUDED.reasoning",
+                              (tid,'Verified delayed broker fill '+order['id']))
                     origin=ticket['payload'].get('source_proposal_ticket_id') or tid
                     q.execute("UPDATE nwt_decision_inputs SET outcome_reason='EXECUTED',stage_reached='EXECUTION' WHERE ticket_id=%s AND (outcome_reason IS NULL OR outcome_reason='EXECUTION_FAILED')",(str(origin),))
                     q.execute("INSERT INTO nwt_system_log(level,component,message,payload) VALUES ('INFO','fill_recovery','Recorded verified delayed fill',%s)",
-                              (json.dumps({'ticket_id':tid,'order_id':order['id'],'qty':str(data['qty']),'price':str(data['entry_price']),'filled_at':order['filled_at']}),))
+                              (json.dumps({'ticket_id':tid,'order_id':order['id'],'qty':str(data['qty']),'price':str(data['entry_price']),'filled_at':order['filled_at'],'previous_decision':dict(previous) if previous else None}),))
                 conn.commit()
             except Exception:
                 conn.rollback();raise

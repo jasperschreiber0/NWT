@@ -19,7 +19,7 @@ def recovery_db():
         q.execute('''
         CREATE TEMP TABLE nwt_tickets(ticket_id uuid PRIMARY KEY,payload jsonb,created_at timestamptz DEFAULT now());
         CREATE TEMP TABLE nwt_entry_intents(ticket_id uuid);
-        CREATE TEMP TABLE nwt_ticket_decisions(ticket_id uuid,decision text,reasoning text,decided_by text);
+        CREATE TEMP TABLE nwt_ticket_decisions(ticket_id uuid,decision text,reasoning text,decided_by text,UNIQUE(ticket_id,decided_by));
         CREATE TEMP TABLE nwt_decision_inputs(ticket_id uuid,outcome_reason text,stage_reached text);
         CREATE TEMP TABLE nwt_system_log(level text,component text,message text,payload jsonb);
         CREATE TEMP TABLE nwt_portfolio_ledger(position_id uuid DEFAULT gen_random_uuid(),bot_source text,strategy_id text,
@@ -37,6 +37,9 @@ def recovery_db():
 
 def test_late_fill_recovers_once_with_exact_broker_evidence(recovery_db):
     conn=recovery_db
+    with conn.cursor() as q:
+        q.execute("INSERT INTO nwt_ticket_decisions VALUES(%s,'FAILED','Order did not fill','EXECUTION_ENGINE')",(TID,))
+    conn.commit()
     assert len(recover_entries(conn,lambda _:deepcopy(ORDER))['recorded'])==1
     assert recover_entries(conn,lambda _:pytest.fail('must not fetch completed order'))['recorded']==[]
     with conn.cursor() as q:
@@ -44,6 +47,17 @@ def test_late_fill_recovers_once_with_exact_broker_evidence(recovery_db):
         assert q.fetchall()==[(Decimal(32),Decimal('89.66375'),Decimal('2869.24000'),Decimal('-.015'),Decimal('.03'))]
         q.execute('SELECT outcome_reason FROM nwt_decision_inputs')
         assert q.fetchone()[0]=='EXECUTED'
+        q.execute("SELECT payload->'previous_decision'->>'decision' FROM nwt_system_log")
+        assert q.fetchone()[0]=='FAILED'
+
+
+def test_submitted_decision_can_transition_to_executed(recovery_db):
+    import engine
+    engine.insert_decision(recovery_db,TID,'SUBMITTED','Accepted')
+    engine.insert_decision(recovery_db,TID,'EXECUTED','Filled')
+    with recovery_db.cursor() as q:
+        q.execute('SELECT decision FROM nwt_ticket_decisions')
+        assert q.fetchall()==[('EXECUTED',)]
 
 
 def test_pending_order_is_followed_until_filled(recovery_db):

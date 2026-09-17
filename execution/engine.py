@@ -310,6 +310,8 @@ def insert_decision(conn, ticket_id: str, decision: str, reasoning: str) -> None
             """
             INSERT INTO nwt_ticket_decisions (ticket_id, decision, reasoning, decided_by)
             VALUES (%s, %s, %s, 'EXECUTION_ENGINE')
+            ON CONFLICT (ticket_id, decided_by) DO UPDATE
+            SET decision=EXCLUDED.decision, reasoning=EXCLUDED.reasoning
             """,
             (ticket_id, decision, reasoning),
         )
