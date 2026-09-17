@@ -15,7 +15,7 @@ from psycopg2.extras import RealDictCursor
 logger = logging.getLogger(__name__)
 
 
-def insert_position(conn, data: dict) -> str:
+def insert_position(conn, data: dict, *, commit=True) -> str:
     """
     INSERT a new position into nwt_portfolio_ledger.
     Returns the new position_id (UUID as string).
@@ -77,7 +77,8 @@ def insert_position(conn, data: dict) -> str:
             ),
         )
         position_id = cur.fetchone()[0]
-    conn.commit()
+    if commit:
+        conn.commit()
     logger.info("Inserted position %s for %s (%s)", position_id, data["asset"], data["bot_source"])
     return str(position_id)
 
@@ -156,4 +157,3 @@ def log_system_event(
             (level, component, message, json.dumps(payload) if payload is not None else None),
         )
     conn.commit()
-

@@ -1277,13 +1277,13 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         return
 
     alpaca_order_id = order["id"]
+    insert_decision(conn, ticket_id, 'SUBMITTED', 'Broker accepted order '+alpaca_order_id)
 
     try:
         filled_order = poll_order_until_filled(alpaca_order_id)
     except Exception as exc:
         reason = f"Order poll failed: {exc}"
-        insert_decision(conn, ticket_id, "FAILED", reason)
-        mark_decision_outcome(conn, decision_ticket_id, "EXECUTION_FAILED")
+        insert_decision(conn, ticket_id, "SUBMITTED", reason + '; fill recovery will recheck')
         log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
         return
 
@@ -1294,6 +1294,9 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
     # mleg orders report per-leg fills; the top-level price is the net debit/
     # credit and may legitimately be absent — status alone decides for spreads
     if fill_status != "filled" or (fill_price is None and not legs):
+        if fill_status not in ('canceled','expired','rejected') or float(filled_order.get('filled_qty') or 0)>0:
+            logger.info('Order %s remains under fill recovery: %s',alpaca_order_id,fill_status)
+            return
         reason = f"Order did not fill — final status={fill_status}"
         insert_decision(conn, ticket_id, "FAILED", reason)
         mark_decision_outcome(conn, decision_ticket_id, "EXECUTION_FAILED")
@@ -1382,6 +1385,10 @@ def main() -> None:
     conn = get_db()
     try:
         upsert_heartbeat(conn)
+        from fill_recovery import recover_entries
+        recovery = recover_entries(conn, alpaca_get)
+        if recovery['recorded']:
+            logger.info('Recovered delayed entry fills: %s', recovery['recorded'])
 
         # The same regular-session policy already guards individual order calls.
         # Outside the session, preserve pending tickets and positions for the
@@ -1423,6 +1430,9 @@ def main() -> None:
                     logger.error("Unhandled error in close ticket %s: %s",
                                  ticket.get("ticket_id"), exc)
 
+        if recovery['pending']:
+            logger.info('Prior orders still settling; new entries deferred')
+            return
         pending = fetch_pending_tickets(conn)
         logger.info("Found %d pending TRADE_REQUEST tickets", len(pending))
 
