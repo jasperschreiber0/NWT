@@ -19,7 +19,9 @@ def recovery_db():
         q.execute('''
         CREATE TEMP TABLE nwt_tickets(ticket_id uuid PRIMARY KEY,payload jsonb,created_at timestamptz DEFAULT now());
         CREATE TEMP TABLE nwt_entry_intents(ticket_id uuid);
-        CREATE TEMP TABLE nwt_ticket_decisions(ticket_id uuid,decision text,reasoning text,decided_by text,UNIQUE(ticket_id,decided_by));
+        CREATE TEMP TABLE nwt_ticket_decisions(ticket_id uuid,decision text,reasoning text,decided_by text,created_at timestamptz DEFAULT now());
+        CREATE UNIQUE INDEX recovery_partial_decision ON nwt_ticket_decisions(ticket_id,decided_by)
+          WHERE created_at >= TIMESTAMPTZ '2026-07-24 00:00:00+00';
         CREATE TEMP TABLE nwt_decision_inputs(ticket_id uuid,outcome_reason text,stage_reached text);
         CREATE TEMP TABLE nwt_system_log(level text,component text,message text,payload jsonb);
         CREATE TEMP TABLE nwt_portfolio_ledger(position_id uuid DEFAULT gen_random_uuid(),bot_source text,strategy_id text,
@@ -38,7 +40,7 @@ def recovery_db():
 def test_late_fill_recovers_once_with_exact_broker_evidence(recovery_db):
     conn=recovery_db
     with conn.cursor() as q:
-        q.execute("INSERT INTO nwt_ticket_decisions VALUES(%s,'FAILED','Order did not fill','EXECUTION_ENGINE')",(TID,))
+        q.execute("INSERT INTO nwt_ticket_decisions(ticket_id,decision,reasoning,decided_by) VALUES(%s,'FAILED','Order did not fill','EXECUTION_ENGINE')",(TID,))
     conn.commit()
     assert len(recover_entries(conn,lambda _:deepcopy(ORDER))['recorded'])==1
     assert recover_entries(conn,lambda _:pytest.fail('must not fetch completed order'))['recorded']==[]
