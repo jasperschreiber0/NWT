@@ -26,10 +26,10 @@ release does not enable live trading or claim the research has found an edge.
 | Accepted entry, delayed full fill, restart | Existing client ID; verified receipt recovery; no repost |
 | Entry ledger succeeds, decision write fails | Recovery checks existing attribution before decision repair |
 | Terminal partial single-leg entry | Exact filled quantity only when a broker fill timestamp exists |
-| Nonterminal partial entry | Pending, new entries deferred; full incremental fill attribution remains open |
-| Delayed multi-leg entry | Recovery explicitly rejects unsupported per-leg attribution; remains open |
+| Nonterminal partial entry | Cumulative broker quantities and prices update the same ledger row; actions deferred while settling |
+| Delayed multi-leg entry | Every leg validated and committed atomically using actual broker fills |
 | Delayed full close, restart | Receipt recovery added; audit-write failure rolls back ledger and decisions |
-| Partial or canceled close | Deferred, never inferred as a full close or automatically resubmitted; residual-quantity handling remains open |
+| Partial or canceled close | Incremental closed segments and remaining quantity recorded atomically; canceled/expired remainder uses deterministic replacement identity, maximum three retries |
 | Broker/ledger conflict | Trading hold remains; this release does not bypass reconciliation |
 | Synchronous close accounting | Existing paths still need consolidation around the same atomic receipt writer |
 | Hold and risk-reducing exits | Existing hold policy still blocks new broker actions; receipt recording continues |

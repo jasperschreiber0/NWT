@@ -668,7 +668,8 @@ def option_close_order(pos):
     qty = float(pos.get('qty') or 0)
     if qty <= 0 or qty != int(qty):
         raise ValueError('Exact whole-contract close quantity required')
-    client_id = 'nwt-close-' + str(pos['position_id'])
+    from close_recovery import close_client_id
+    client_id = close_client_id(pos)
     try:
         prior = alpaca_get('/orders:by_client_order_id?client_order_id=' + client_id)
     except requests.HTTPError as exc:
@@ -705,7 +706,8 @@ def equity_close_order(pos):
     if qty <= 0 or not qty.is_integer():
         raise ValueError('Equity close requires exact positive whole-share ledger quantity')
     side = 'buy' if direction == 'short' else 'sell'
-    client_id = 'nwt-close-' + position_id
+    from close_recovery import close_client_id
+    client_id = close_client_id(pos)
     try:
         order = alpaca_get('/orders:by_client_order_id?client_order_id=' + client_id)
     except requests.HTTPError as exc:
@@ -811,6 +813,8 @@ def run_equity_position_monitor(conn) -> None:
         return
 
     for pos in equity_positions:
+        if pos.get('close_requested'):
+            continue  # Existing close intent is resumed separately.
         symbol = pos.get("asset", "")
         position_id = str(pos.get("position_id", ""))
         entry_price = float(pos.get("entry_price") or 0)
@@ -1098,63 +1102,17 @@ def insert_spread_ledger_rows(conn, ticket_id: str, payload: dict,
     rows; the monitor values/closes the structure as a unit via the group id.
     Returns the spread_group_id.
     """
-    qty = int(payload.get("qty", 1))
-    spread_group_id = str(uuid.uuid4())
-    filled_legs = {l.get("symbol"): l for l in (filled_order.get("legs") or [])}
-    position_ids = []
-
-    for leg in payload["legs"]:
-        leg_symbol = leg["option_symbol"]
-        fl = filled_legs.get(leg_symbol, {})
-        leg_fill = fl.get("filled_avg_price")
-        leg_fill = float(leg_fill) if leg_fill else None
-
-        leg_bid, leg_ask = get_latest_quote(leg_symbol, "option")
-        if leg_fill is None:
-            # Leg fill missing from the order response — fall back to quote mid
-            if leg_bid and leg_ask:
-                leg_fill = (leg_bid + leg_ask) / 2.0
-            else:
-                leg_fill = 0.0
-
-        side = leg["side"]
-        leg_direction = "long" if side == "buy" else "short"
-        base_delta = 0.5 if leg.get("option_type", "call") == "call" else -0.5
-        delta_exposure = base_delta if leg_direction == "long" else -base_delta
-
-        ledger_data = {
-            "bot_source": payload["bot_source"],
-            "strategy_id": payload.get("strategy_id"),
-            "ticket_id": ticket_id,
-            "asset": leg_symbol,
-            "asset_type": "option",
-            "direction": leg_direction,
-            "delta_exposure": delta_exposure,
-            "notional_risk": abs(leg_fill) * 100 * qty,
-            "qty": qty,
-            "entry_price": leg_fill,
-            "entry_time": datetime.now(timezone.utc),
-            "entry_bid": leg_bid,
-            "entry_ask": leg_ask,
-            "alpaca_order_id": alpaca_order_id,
-            "stop_pct": payload.get("stop_pct"),
-            "target_pct": payload.get("target_pct"),
-            "spread_group_id": spread_group_id,
-        }
-        position_ids.append(insert_position(conn, ledger_data))
-
-    reasoning = (f"mleg filled — {len(position_ids)} legs, "
-                 f"spread_group_id={spread_group_id}, alpaca_order_id={alpaca_order_id}")
-    insert_decision(conn, ticket_id, "EXECUTED", reasoning)
-    mark_decision_outcome(conn, payload.get("source_proposal_ticket_id") or ticket_id, "EXECUTED")
-    log_system_event(conn, "INFO", "execution_engine",
-                     f"Executed spread {payload.get('strategy_type', '')} on {payload.get('symbol', '')}",
-                     {"ticket_id": ticket_id, "spread_group_id": spread_group_id,
-                      "position_ids": position_ids, "alpaca_order_id": alpaca_order_id,
-                      "strategy_id": payload.get("strategy_id")})
-    logger.info("Ticket %s EXECUTED (spread): group=%s legs=%d",
-                ticket_id, spread_group_id, len(position_ids))
-    return spread_group_id
+    from fill_recovery import recover_entries
+    # Synchronous and delayed spreads share the same atomic receipt writer.
+    # The stored intent exists before submission; no quote-derived fills.
+    def receipt(path):
+        if 'nwt-entry-' + str(ticket_id) in path:
+            return filled_order
+        return alpaca_get(path)
+    result = recover_entries(conn, receipt)
+    if not any(x['ticket_id']==str(ticket_id) for x in result['recorded']):
+        raise ValueError('Spread receipt was not recorded')
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, 'nwt-spread:'+str(ticket_id)))
 
 
 def process_ticket(conn, ticket: dict, directives: dict) -> None:
@@ -1386,6 +1344,8 @@ def main() -> None:
         recovery = recover_entries(conn, alpaca_get)
         from close_recovery import recover_closes
         close_recovery = recover_closes(conn, alpaca_get)
+        if close_recovery.get('blocked'):
+            raise RuntimeError('Close recovery needs diagnosis: '+ '; '.join(close_recovery['blocked']))
         if close_recovery['recorded']:
             logger.info('Recovered delayed closes: %s', close_recovery['recorded'])
         if close_recovery['pending']:
@@ -1412,6 +1372,24 @@ def main() -> None:
         except Exception as exc:
             logger.error("Cannot load master-directives.json: %s", exc)
             sys.exit(1)
+
+        if recovery['pending']:
+            logger.warning('Entry fills still settling; broker actions deferred until quantities stabilize')
+            return
+
+        # Resume residual close intents after canceled/expired broker orders.
+        # Existing order IDs are reused until their terminal receipt is recorded.
+        for pos in get_open_positions(conn):
+            if not pos.get('close_requested'):
+                continue
+            with conn.cursor() as q:
+                q.execute('SELECT 1 FROM nwt_close_progress WHERE position_id=%s AND generation=%s',
+                          (str(pos['position_id']),int(pos.get('close_generation') or 0)))
+                current_receipt=q.fetchone()
+            if current_receipt:
+                continue
+            if pos['asset_type']=='equity':equity_close_order(pos)
+            else:option_close_order(pos)
 
         try:
             run_equity_position_monitor(conn)

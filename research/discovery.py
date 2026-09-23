@@ -87,6 +87,9 @@ def main():
                   missing_symbols=missing, stale_quote_symbols=stale, stock_feed='sip', option_feed='opra',
                   option_underlyings=len(chains), option_contracts=sum(chains.values()),
                   chains_observed_at=progress.get('chains_at'), patterns=summary(c))
+    from experiment_lab import run as run_experiments
+    result['experiments'] = run_experiments(c, snapshots, datetime.now(timezone.utc))
+    atomic(OUT / 'experiments.json', result['experiments'])
     c.close()
     # Thinly traded watchlist names may have old quotes; retain that fact without
     # confusing an inactive instrument with a failed market feed.

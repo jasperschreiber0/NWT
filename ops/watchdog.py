@@ -117,6 +117,8 @@ def inspect(now=None):
             if label == 'events' and data.get('status') != 'OK': issues.append('Event sources degraded')
             if label == 'discovery' and expected and data.get('status') != 'OK': issues.append('Discovery data degraded')
         except Exception: issues.append(label + ' collection evidence missing')
+    learning_path = STATE / 'learning.json'
+    research['learning_review'] = json.loads(learning_path.read_text()) if learning_path.exists() else {}
     c = db(); c.row_factory = __import__('sqlite3').Row
     jobs = json.loads((STATE / 'jobs.json').read_text())
     runs = {}

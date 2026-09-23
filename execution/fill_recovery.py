@@ -55,38 +55,66 @@ def recover_entries(conn, get, *, apply=True):
             if exc.response is not None and exc.response.status_code==404:
                 result['absent']+=1;continue
             raise
+        if ticket['payload'].get('legs') and not order.get('legs'):
+            order=get('/orders/'+order['id']+'?nested=true')
         if order.get('client_order_id') != 'nwt-entry-'+tid:
             raise ValueError('Broker client order identity mismatch')
-        if order.get('status') not in TERMINAL:
-            result['pending'].append(tid);continue
-        if Decimal(str(order.get('filled_qty') or 0))==0:
+        terminal = order.get('status') in TERMINAL
+        if not terminal:
+            result['pending'].append(tid)
+            if not any(Decimal(str(x.get('filled_qty') or 0)) > 0 for x in (order.get('legs') or [order])):
+                continue
+        if not any(Decimal(str(x.get('filled_qty') or 0)) > 0 for x in (order.get('legs') or [order])):
             if apply:
                 write_execution_decision(conn,tid,'FAILED','BROKER_TERMINAL_NO_FILL')
                 conn.commit()
             continue
-        data=fill_data(ticket,order)
+        from fill_evidence import with_fill_timestamp
+        if order.get('legs'):
+            order=dict(order,legs=[with_fill_timestamp(x,get) for x in order['legs']])
+        else:
+            order=with_fill_timestamp(order,get)
+        from verified_fills import entry_rows
+        records=entry_rows(ticket,order)
         if apply:
             try:
                 with conn.cursor(cursor_factory=RealDictCursor) as q:
                     q.execute('SELECT pg_advisory_xact_lock(hashtext(%s))',(tid,))
                     q.execute('SELECT * FROM nwt_portfolio_ledger WHERE ticket_id=%s OR alpaca_order_id=%s',(tid,order['id']))
                     existing=q.fetchall()
-                    if existing:
-                        if len(existing)!=1 or str(existing[0]['ticket_id'])!=tid or str(existing[0]['alpaca_order_id'])!=order['id'] or Decimal(str(existing[0]['qty']))!=data['qty']:
-                            raise ValueError('Existing ledger attribution conflicts with fill')
-                    else:
-                        insert_position(conn,data,commit=False)
+                    groups={str(x['spread_group_id']) for x in existing if x.get('spread_group_id')}
+                    if len(groups)>1:raise ValueError('Conflicting spread group attribution')
+                    if groups:
+                        for data in records:data['spread_group_id']=next(iter(groups))
+                    for data in records:
+                        matched=[x for x in existing if x['asset']==data['asset']]
+                        if len(matched)>1:
+                            raise ValueError('Duplicate existing leg attribution')
+                        if matched:
+                            old=matched[0]
+                            if str(old['ticket_id'])!=tid or str(old['alpaca_order_id'])!=order['id'] or old['direction']!=data['direction']:
+                                raise ValueError('Existing ledger attribution conflicts with fill')
+                            if Decimal(str(old['qty']))==data['qty'] and Decimal(str(old['entry_price']))==data['entry_price']:
+                                continue
+                            if old['status']!='open' or Decimal(str(old['qty']))>data['qty']:
+                                raise ValueError('Cannot overwrite closed or reduced entry quantity')
+                            q.execute('UPDATE nwt_portfolio_ledger SET qty=%s,entry_price=%s,notional_risk=%s WHERE position_id=%s',
+                                      (data['qty'],data['entry_price'],data['notional_risk'],old['position_id']))
+                        else:
+                            insert_position(conn,data,commit=False)
+                    if set(x['asset'] for x in existing)-set(x['asset'] for x in records):
+                        raise ValueError('Existing ledger has unverified legs')
                     q.execute("SELECT decision,reasoning FROM nwt_ticket_decisions WHERE ticket_id=%s AND decided_by='EXECUTION_ENGINE'",(tid,))
                     previous=q.fetchone()
-                    write_execution_decision(conn,tid,'EXECUTED','Verified delayed broker fill '+order['id'])
+                    write_execution_decision(conn,tid,'EXECUTED' if terminal else 'SUBMITTED','Verified cumulative broker fill '+order['id'])
                     origin=ticket['payload'].get('source_proposal_ticket_id') or tid
-                    q.execute("UPDATE nwt_decision_inputs SET outcome_reason='EXECUTED',stage_reached='EXECUTION' WHERE ticket_id=%s AND (outcome_reason IS NULL OR outcome_reason='EXECUTION_FAILED')",(str(origin),))
+                    if terminal: q.execute("UPDATE nwt_decision_inputs SET outcome_reason='EXECUTED',stage_reached='EXECUTION' WHERE ticket_id=%s AND (outcome_reason IS NULL OR outcome_reason='EXECUTION_FAILED')",(str(origin),))
                     q.execute("INSERT INTO nwt_system_log(level,component,message,payload) VALUES ('INFO','fill_recovery','Recorded verified delayed fill',%s)",
-                              (json.dumps({'ticket_id':tid,'order_id':order['id'],'qty':str(data['qty']),'price':str(data['entry_price']),'filled_at':order['filled_at'],'previous_decision':dict(previous) if previous else None}),))
+                              (json.dumps({'ticket_id':tid,'order_id':order['id'],'qty':str(data['qty']),'price':str(data['entry_price']),'filled_at':order.get('filled_at'),'legs':[{'asset':x['asset'],'qty':str(x['qty']),'price':str(x['entry_price'])} for x in records],'previous_decision':dict(previous) if previous else None}),))
                 conn.commit()
             except Exception:
                 conn.rollback();raise
-        result['recorded'].append({'ticket_id':tid,'order_id':order['id'],'symbol':data['asset'],'qty':str(data['qty']),'price':str(data['entry_price'])})
+        result['recorded'].extend({'ticket_id':tid,'order_id':order['id'],'symbol':data['asset'],'qty':str(data['qty']),'price':str(data['entry_price'])} for data in records)
     return result
 
 

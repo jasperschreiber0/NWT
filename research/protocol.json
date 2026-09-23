@@ -39,5 +39,19 @@
   "discovery_horizons_minutes": [
     30,
     120
-  ]
+  ],
+  "experiment_cycle": {
+    "version": "20260924-v1",
+    "rules": [
+      "opening_gap_follow",
+      "opening_gap_fade",
+      "sector_relative_strength",
+      "three_day_trend_confirmation"
+    ],
+    "discovery_sessions": 20,
+    "validation_sessions": 20,
+    "minimum_validation_observations": 100,
+    "review_only": true,
+    "events": "Existing prospective delayed reaction, reversal and persistent repricing experiments continue separately."
+  }
 }

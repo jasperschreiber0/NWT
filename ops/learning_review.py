@@ -25,7 +25,17 @@ def main():
             shadow=[dict(x) for x in q.fetchall()]
             q.execute("SELECT strategy_id,version,parent_version FROM nwt_strategy_genome WHERE shadow_mode AND NOT active")
             candidates=[dict(x) for x in q.fetchall()]
-        data=dict(observed_at=datetime.now(timezone.utc).isoformat(),realized=realized,
+        from profit_attribution import build
+        import os, requests
+        base=os.environ['NWT_ALPACA_BASE_URL'].rstrip('/')
+        if base!='https://paper-api.alpaca.markets':raise RuntimeError('Paper endpoint required')
+        session=requests.Session()
+        def get(path):
+            response=session.get(base+'/v2'+path,headers={'APCA-API-KEY-ID':os.environ['NWT_ALPACA_KEY_ID'],
+                'APCA-API-SECRET-KEY':os.environ['NWT_ALPACA_SECRET_KEY']},timeout=15)
+            response.raise_for_status();return response.json()
+        attribution = build(c,get)
+        data=dict(attribution=attribution, observed_at=datetime.now(timezone.utc).isoformat(),realized=realized,
                   underlying_proxy_observations=shadow,pending_candidates=candidates,
                   promotion_policy='No option promotion from underlying proxies; require execution-grade shadow evidence, existing sample/regime gates and completed reliability trial.',
                   outcome='learning_report_complete')

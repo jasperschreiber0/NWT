@@ -50,8 +50,17 @@ def format_report(status, trial, day, activation=False):
             lines.append(f"Highest stressed average: {best['rule']} / {best['horizon_minutes']} min: {float(best['mean_after_30bps']):+.3%} ({best['samples']} overlapping observations).")
         else:
             lines.append('No evaluated research results available yet.')
+        experiments = discovery.get('experiments') or {}
+        if experiments:
+            lines.append(f"New experiment cycle: {experiments.get('sessions', 0)} sessions; review candidates: {sum(x.get('state') == 'REVIEW_CANDIDATE' for x in experiments.get('rules', []))}.")
         lines += ['Overlapping observations are not independent trades.',
                   'These exploratory results do not establish a profitable strategy or live readiness.']
+    attribution = ((status.get('research') or {}).get('learning_review') or {}).get('attribution') or {}
+    if attribution:
+        lines += ['', 'Complete-trade attribution since 15 Sep:']
+        for row in attribution.get('strategies', [])[:8]:
+            lines.append(f"{row['strategy']}: {row['complete_trades']} complete trades; adjusted {money(row['net'])}")
+        lines.append('Open/incomplete groups excluded: ' + str(len(attribution.get('excluded_groups', []))))
     lines += ['', 'Recorded outcome rows: ' + str(outcomes.get('n', 'unavailable')),
               'Adjusted result for these records: ' + money(outcomes.get('net')),
               'Record counts can include individual option legs; they are not counts of complete trades.',

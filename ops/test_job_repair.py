@@ -57,3 +57,27 @@ def test_account_drawdown_includes_capital_and_requires_history():
     assert tracker.equity_drawdown(conn)==(.1,3)
     cur.fetchall.return_value=[('a',100000)]
     assert tracker.equity_drawdown(conn)==(None,1)
+
+
+
+def test_complete_trade_attribution_excludes_open_spread_legs():
+    from profit_attribution import aggregate
+    from datetime import datetime,timezone,timedelta
+    now=datetime.now(timezone.utc)
+    row=dict(position_id='a',spread_group_id='g',strategy_id='s',status='closed',pnl=10,pnl_adjusted=9,entry_time=now-timedelta(hours=2),exit_time=now,entry_price=1,exit_price=2,qty=1,asset_type='option',exit_reason='target')
+    assert aggregate([row,dict(row,position_id='b',status='open')])['strategies']==[]
+    result=aggregate([row,dict(row,position_id='b',pnl=-2,pnl_adjusted=-3)])
+    assert result['strategies'][0]['complete_trades']==1
+    assert result['strategies'][0]['net']==6
+    assert result['strategies'][0]['cost_adjustment']==2
+
+
+
+def test_scanner_retries_read_only_scoring_before_writing(monkeypatch):
+    scanner=module('retry_scanner',ROOT/'nwt_agents/track_f/scanner.py')
+    import time
+    monkeypatch.setattr(time,'sleep',lambda _:None)
+    call=Mock(side_effect=[RuntimeError('SEC unavailable'),(10,2,{})])
+    monkeypatch.setattr(scanner,'score_ticker',call)
+    assert scanner.score_with_recovery('ETN',['grid'],{})==(10,2,{})
+    assert call.call_count==2

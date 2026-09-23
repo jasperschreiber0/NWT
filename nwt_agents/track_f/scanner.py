@@ -178,6 +178,20 @@ def upsert_emerging_theme(conn, theme: str, tickers: list, momentum: float, evid
     logger.info("Emerging theme updated: %s (momentum=%.1f)", theme, momentum)
 
 
+def score_with_recovery(ticker, terms, cache):
+    # Retry only the read-only scoring operation. Database writes happen once
+    # after success; retrying the entire scan would duplicate historical scores.
+    import time
+    for attempt in range(3):
+        try:
+            return score_ticker(ticker, terms, cache)
+        except Exception:
+            if attempt == 2:
+                raise
+            logger.warning('Retrying incomplete evidence for %s (attempt %s)', ticker, attempt + 2)
+            time.sleep(15 * (attempt + 1))
+
+
 def run_scan(conn) -> dict:
     counts = {"scored": 0, "candidates_surfaced": 0, "emerging_themes_updated": 0, "failed": 0}
     constraint_cache: dict = {}
@@ -187,7 +201,7 @@ def run_scan(conn) -> dict:
         for ticker in cfg["tickers"]:
             logger.info('Scanning %s / %s', ticker, theme)
             try:
-                score, mentions, evidence = score_ticker(ticker, cfg["terms"], constraint_cache)
+                score, mentions, evidence = score_with_recovery(ticker, cfg["terms"], constraint_cache)
             except Exception as exc:
                 logger.warning("Scoring failed for %s / %s: %s", ticker, theme, exc)
                 counts['failed'] += 1
@@ -209,7 +223,7 @@ def run_scan(conn) -> dict:
         for ticker in cfg["tickers"]:
             logger.info('Scanning %s / %s', ticker, theme)
             try:
-                score, mentions, evidence = score_ticker(ticker, cfg["terms"], constraint_cache)
+                score, mentions, evidence = score_with_recovery(ticker, cfg["terms"], constraint_cache)
             except Exception as exc:
                 logger.warning("Scoring failed for %s / %s: %s", ticker, theme, exc)
                 counts['failed'] += 1
