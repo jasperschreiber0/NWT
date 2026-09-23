@@ -24,7 +24,9 @@ The first 20 observed sessions are discovery. Later observations form a
 separate validation period. At least 20 validation days, 100 observations and
 two regimes are required before review eligibility. A positive conservative
 day-level stressed-return bound is required. Weak completed candidates leave
-the shortlist; their records and future observations remain available. Rules
+the shortlist; their records and future observations remain available. Verdicts
+use completed days only and are frozen once the sample requirements are met;
+a losing cohort cannot turn into a winner through repeated checking. Rules
 and policy are hashed and versioned. Changes require a new cohort rather than
 rewriting past predictions. Review status never grants order authority.
 

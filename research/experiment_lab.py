@@ -25,6 +25,7 @@ def initialize(c):
       horizon INTEGER,regime TEXT,spread REAL,entry_t TEXT,exit_t TEXT,
       gross REAL,net REAL,stressed REAL,benchmark REAL,entry_price REAL,
       PRIMARY KEY(version,rule,symbol,t));
+    CREATE TABLE IF NOT EXISTS experiment_verdicts(version TEXT,rule TEXT,day TEXT,state TEXT,evidence TEXT,PRIMARY KEY(version,rule));
     CREATE TABLE IF NOT EXISTS experiment_reviews(version TEXT,day TEXT,payload TEXT,
       PRIMARY KEY(version,day));
     ''')
@@ -120,7 +121,7 @@ def review(c,day):
     results=[]
     for rule, in c.execute('SELECT DISTINCT rule FROM experiment_observations WHERE version=?',(VERSION,)):
         rows=c.execute('SELECT substr(t,1,10),regime,stressed,net,benchmark,entry_price,direction FROM experiment_observations WHERE version=? AND rule=? AND gross IS NOT NULL',(VERSION,rule)).fetchall()
-        validation=[r for r in rows if r[0]>=boundary]
+        validation=[r for r in rows if boundary<=r[0]<day]
         vd=len(set(r[0] for r in validation));regimes=len(set(r[1] for r in validation))
         means={d:statistics.mean(r[2] for r in validation if r[0]==d) for d in sorted(set(r[0] for r in validation))}
         daily=list(means.values());avg=statistics.mean(daily) if daily else None
@@ -128,7 +129,12 @@ def review(c,day):
         lower=avg-3*statistics.stdev(daily)/math.sqrt(len(daily)) if len(daily)>1 else None
         enough=vd>=POLICY['validation_sessions'] and len(validation)>=POLICY['minimum_validation_observations'] and regimes>=POLICY['minimum_regimes']
         state='DISCOVERY' if boundary=='9999' else 'VALIDATING'
-        if enough:state='REVIEW_CANDIDATE' if lower is not None and lower>0 else 'RETIRED_FROM_SHORTLIST'
+        if enough:
+            state='REVIEW_CANDIDATE' if lower is not None and lower>0 else 'RETIRED_FROM_SHORTLIST'
+            c.execute('INSERT OR IGNORE INTO experiment_verdicts VALUES (?,?,?,?,?)',
+                      (VERSION,rule,day,state,json.dumps({'days':vd,'observations':len(validation),'daily_bound':lower})))
+        verdict=c.execute('SELECT state FROM experiment_verdicts WHERE version=? AND rule=?',(VERSION,rule)).fetchone()
+        if verdict:state=verdict[0]
         results.append({'rule':rule,'state':state,'observations':len(rows),'validation_observations':len(validation),
           'validation_days':vd,'validation_regimes':regimes,'validation_daily_mean_stressed':avg,
           'conservative_daily_bound':lower,'mean_stressed':statistics.mean(r[2] for r in rows) if rows else None,

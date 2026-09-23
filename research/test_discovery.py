@@ -137,3 +137,21 @@ def test_small_account_distinguishes_debit_spread_and_naked_call():
     assert result['minimum_structure_expiry_loss']==50 and result['eligible']
     assert not assess([short])['eligible']
     assert not assess([dict(long,entry_price=10)])['eligible']
+
+
+
+def test_validation_verdict_is_frozen_and_excludes_incomplete_day(monkeypatch):
+    import experiment_lab as lab
+    c=sqlite3.connect(':memory:');lab.initialize(c)
+    monkeypatch.setitem(lab.POLICY,'discovery_sessions',1)
+    monkeypatch.setitem(lab.POLICY,'validation_sessions',2)
+    monkeypatch.setitem(lab.POLICY,'minimum_validation_observations',2)
+    monkeypatch.setitem(lab.POLICY,'minimum_regimes',1)
+    def add(day,value):
+        c.execute('INSERT INTO experiment_observations(version,rule,symbol,t,observed_at,direction,horizon,regime,spread,gross,net,stressed,benchmark,entry_price) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                  (lab.VERSION,'test','SPY',day+'T14:00:00Z',day+'T14:01:00Z',1,30,'range',.001,value,value,value,0,100))
+    add('2026-09-01',0);add('2026-09-02',-.01);add('2026-09-03',-.01)
+    assert lab.review(c,'2026-09-03')['rules'][0]['state']=='VALIDATING'
+    assert lab.review(c,'2026-09-04')['rules'][0]['state']=='RETIRED_FROM_SHORTLIST'
+    for day in range(4,25):add(f'2026-09-{day:02d}',1)
+    assert lab.review(c,'2026-09-25')['rules'][0]['state']=='RETIRED_FROM_SHORTLIST'
