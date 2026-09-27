@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from run_job import ROOT, STATE, db
 from report_format import format_report
 from trial_evidence import update_sessions, unresolved_job_failure
+from research_health import policy_active, observation_job, persistent_warnings
 sys.path.insert(0, str(ROOT / 'execution'))
 from reliability import reconcile_quantities, separate_legacy_expiries
 
@@ -56,7 +57,10 @@ def inspect(now=None):
     def get(path):
         r = requests.get(base + '/v2/' + path, headers=h, timeout=15)
         r.raise_for_status(); return r.json()
-    issues = []
+    issues = []; research_warnings = []
+    policy_path = STATE / 'research-policy.json'
+    policy = json.loads(policy_path.read_text()) if policy_path.exists() else {}
+    isolated = policy_active(policy, now)
     if subprocess.run(['systemctl','is-active','--quiet','cron']).returncode:
         subprocess.run(['systemctl','start','cron'],check=True,timeout=20)
     calendar = get('calendar?start=' + now.date().isoformat() + '&end=' + now.date().isoformat())
@@ -68,6 +72,9 @@ def inspect(now=None):
     if response.status_code != 200 or response.json().get('status') != 'ok':
         issues.append('Dashboard health failed')
     broker = get('positions')
+    account = get('account')
+    if account.get('trading_blocked') or account.get('account_blocked'):
+        issues.append('Broker account blocks trading')
     orders = get('orders?status=open&limit=500')
     for order in orders:
         stamp = datetime.fromisoformat(order['created_at'].replace('Z', '+00:00'))
@@ -108,41 +115,57 @@ def inspect(now=None):
     conn.close()
     research = {}
     for label, relative, max_age in [('research', 'research/evidence/latest.json', 900), ('events', 'research/event-evidence/latest.json', 1800), ('discovery', 'research/discovery-evidence/latest.json', 600)]:
+        findings = research_warnings if label == 'events' and isolated else issues
         try:
             data = json.loads((ROOT / relative).read_text()); research[label] = data
             age = (now - datetime.fromisoformat(data['observed_at'])).total_seconds()
             expected = label == 'events' or (trading_day and 12 <= now.hour <= 22)
-            if expected and age > max_age: issues.append(label + ' collection overdue')
+            if expected and age > max_age: findings.append(label + ' collection overdue')
             if label == 'research' and expected and not data.get('market_data_available'): issues.append('Market data unavailable')
-            if label == 'events' and data.get('status') != 'OK': issues.append('Event sources degraded')
+            if label == 'events':
+                if data.get('execution_enabled') is not False:
+                    issues.append('Event research execution isolation not verified')
+                if data.get('status') != 'OK': findings.append('Event sources degraded')
             if label == 'discovery' and expected and data.get('status') != 'OK': issues.append('Discovery data degraded')
-        except Exception: issues.append(label + ' collection evidence missing')
+        except Exception: findings.append(label + ' collection evidence missing')
     learning_path = STATE / 'learning.json'
+    try:
+        daily = json.loads((ROOT/'research/daily-comparison/latest.json').read_text())
+        research['daily_comparison'] = daily
+        if daily.get('execution_enabled') is not False:
+            issues.append('Daily comparison execution isolation not verified')
+        if daily.get('status') != 'OK': research_warnings.append('Daily equity comparison degraded')
+        if trading_day and now.hour >= 22 and (now-datetime.fromisoformat(daily['observed_at'])).total_seconds() > 30*3600:
+            research_warnings.append('Daily equity comparison overdue')
+    except Exception: research_warnings.append('Daily equity comparison evidence missing')
     research['learning_review'] = json.loads(learning_path.read_text()) if learning_path.exists() else {}
     c = db(); c.row_factory = __import__('sqlite3').Row
     jobs = json.loads((STATE / 'jobs.json').read_text())
     runs = {}
     for name, config in jobs.items():
+        findings = research_warnings if isolated and observation_job(name, config) else issues
         row = c.execute('SELECT * FROM runs WHERE job=? ORDER BY id DESC LIMIT 1', (name,)).fetchone()
         runs[name] = dict(row) if row else None
         if row and row['status'] == 'running' and time.time() - row['started'] > config.get('timeout', 240) + 60:
-            issues.append(name + ' job interrupted or stuck')
-        if unresolved_job_failure(c, name): issues.append(name + ' job failed')
+            findings.append(name + ' job interrupted or stuck')
+        if unresolved_job_failure(c, name): findings.append(name + ' job failed')
         # Explicit deadlines are only enforced on broker-confirmed trading dates.
         deadline = config.get('deadline_utc')
         if trading_day and deadline and now.strftime('%H:%M') >= deadline:
             midnight = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-            if not row or row['started'] < midnight: issues.append(name + ' daily run missing')
+            if not row or row['started'] < midnight: findings.append(name + ' daily run missing')
         if config.get('market_interval') and clock.get('is_open'):
             if not row or time.time() - row['started'] > config['market_interval']:
-                issues.append(name + ' heartbeat overdue')
+                findings.append(name + ' heartbeat overdue')
     c.close()
     return dict(observed_at=now.isoformat(), trading_day=trading_day, market_open=clock.get('is_open'),
                 issues=sorted(set(issues)), ready_for_entries=not issues, broker_positions=len(broker),
                 open_orders=len(orders), mismatches=mismatch, flags=flags, tickets=tickets,
+                broker_equity=account.get('equity'), broker_cash=account.get('cash'),
                 entries=entries, outcomes=outcome, decisions=decisions, learning_outcome_rows=learning_n,
                 legacy_attribution=[dict(asset=p['asset'],position_id=str(p['position_id']),status='unresolved historical attribution; absent at broker') for p in legacy],
-                research=research, jobs=runs)
+                research=research, jobs=runs, research_warnings=sorted(set(research_warnings)),
+                research_policy=policy if isolated else {})
 
 
 def main():
@@ -176,6 +199,12 @@ def main():
     status['trial'] = trial
     previous_path = STATE / 'status.json'
     previous = json.loads(previous_path.read_text()) if previous_path.exists() else {}
+    warning_since, persistent = persistent_warnings(previous.get('research_warning_since', {}),
+        status.get('research_warnings', []), datetime.now(timezone.utc))
+    status['research_warning_since'] = warning_since
+    if persistent:
+        status['research_alert_delivery_confirmed'] = notify(c, 'research:' + day + ':' + '|'.join(persistent),
+            'NWT research needs attention. Unrelated paper entries remain subject to normal trading checks.\n' + '\n'.join(persistent))
     signature = '|'.join(status['issues'])
     oldsignature = '|'.join(previous.get('issues', []))
     if signature:

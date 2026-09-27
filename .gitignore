@@ -16,3 +16,4 @@ shared/*.json
 !shared/master-directives.json.example
 performance/trades.json
 performance/summary.json
+research/daily-comparison/

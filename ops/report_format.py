@@ -14,18 +14,22 @@ def money(value):
 
 def format_report(status, trial, day, activation=False):
     issues = status.get('issues', [])
+    warnings = status.get('research_warnings', [])
     lines = [
         'NWT supervision activated' if activation else 'NWT daily paper report',
         'Reporting date: ' + date.fromisoformat(day).strftime('%d %b %Y') + ' (UTC)',
-        'Status: ' + ('Needs attention' if issues else 'Healthy'),
+        'Status: ' + ('Needs attention' if issues else 'Trading checks healthy; research needs attention' if warnings else 'Healthy'),
         'US market: ' + ('open' if status.get('market_open') else 'closed'),
         '',
         f"Trial: {trial.get('consecutive_passes', 0)}/{trial.get('required_sessions', 20)} consecutive sessions",
         'Open paper positions: ' + str(status.get('broker_positions', 'unavailable')),
         'Pending broker orders: ' + str(status.get('open_orders', 'unavailable')),
+        'Broker paper equity (including open positions): ' + money(status.get('broker_equity')),
     ]
     if status.get('session_incidents'):
         lines.append('This session had incidents; recovery does not count it as a clean trial day.')
+    if warnings:
+        lines += ['Research warnings (unrelated paper entries not held): ' + '; '.join(warnings)]
     decisions = status.get('decisions') or []
     if decisions:
         lines += ['', 'Decision records:']
@@ -56,6 +60,15 @@ def format_report(status, trial, day, activation=False):
         lines += ['Overlapping observations are not independent trades.',
                   'These exploratory results do not establish a profitable strategy or live readiness.']
     attribution = ((status.get('research') or {}).get('learning_review') or {}).get('attribution') or {}
+    daily = (status.get('research') or {}).get('daily_comparison') or {}
+    if daily:
+        lines += ['', 'Daily equity comparison (modeled, not broker profit; 30bps round-trip costs):']
+        portfolios = daily.get('portfolios') or []
+        benchmarks = {p['symbol']: p['equity'] for p in portfolios if p['rule'] == 'buy_hold'}
+        for p in portfolios:
+            excess = p['equity']-benchmarks.get(p['symbol'], p['equity'])
+            lines.append(f"{p['symbol']} {p['rule']}: {p['equity']-1:+.2%}; vs hold {excess:+.2%} points; drawdown {p['drawdown']:.2%}; {p['sessions']} sessions.")
+        lines.append('Prospective only; no automatic strategy promotion.')
     if attribution:
         lines += ['', 'Complete-trade attribution since 15 Sep:']
         for row in attribution.get('strategies', [])[:8]:
@@ -66,5 +79,5 @@ def format_report(status, trial, day, activation=False):
               'Record counts can include individual option legs; they are not counts of complete trades.',
               '', 'Learning records available: ' + str(status.get('learning_outcome_rows', 'unavailable')),
               'Strategy changes remain frozen pending qualifying evidence.', '',
-              'Action needed: ' + '; '.join(issues) if issues else 'No action needed.']
+              'Action needed: ' + '; '.join(issues) if issues else 'Research recovery is being monitored; trading checks are healthy.' if warnings else 'No operational action needed; profitability remains under evaluation.']
     return '\n'.join(lines)

@@ -2,6 +2,7 @@
 import json
 import time
 from datetime import datetime, timezone
+from research_health import research_run_after_policy
 
 
 def update_sessions(c, status, trial, day, report=False):
@@ -14,6 +15,9 @@ def update_sessions(c, status, trial, day, report=False):
             c.execute('INSERT OR IGNORE INTO session_incidents VALUES (?,?,?)',
                       (incident_day, key, json.dumps({'notification': key, 'sent': sent})))
     for rid, job, started in c.execute("SELECT id,job,started FROM runs WHERE status='failed'").fetchall():
+        # Only new observation-lane failures are advisory. Existing incidents and
+        # all pre-policy failures retain their original trial consequences.
+        if research_run_after_policy(job, started, status.get('research_policy', {})): continue
         incident_day = datetime.fromtimestamp(started, timezone.utc).date().isoformat()
         if incident_day >= trial['start_date']:
             c.execute('INSERT OR IGNORE INTO session_incidents VALUES (?,?,?)',

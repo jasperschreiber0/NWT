@@ -118,6 +118,20 @@ def main():
         if 'bars' not in data or data.get('next_page_token'):
             raise RuntimeError('Daily history unavailable or incomplete; no new research signal recorded')
         archive('daily_bars',now.date(),dict(parameters=params,data=data))
+        # An isolated shadow comparison cannot interrupt the evidence collector.
+        # Its failure is persisted and surfaced separately by the watchdog.
+        daily_folder=ROOT/'research/daily-comparison'
+        try:
+            from daily_comparison import update
+            calendar=get(broker_base+'/v2/calendar',{'start':(now-timedelta(days=400)).date().isoformat(),
+                'end':(now+timedelta(days=14)).date().isoformat()})
+            update(daily_folder,data['bars'],calendar,now)
+        except Exception as exc:
+            daily_folder.mkdir(parents=True,exist_ok=True)
+            temp=daily_folder/'latest.tmp'
+            temp.write_text(json.dumps(dict(observed_at=now.isoformat(),status='DEGRADED',
+                execution_enabled=False,errors=[type(exc).__name__])))
+            temp.replace(daily_folder/'latest.json')
         evaluate_observed_signals(data)
         signals={}
         for symbol in SYMBOLS:

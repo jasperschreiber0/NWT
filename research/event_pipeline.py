@@ -109,6 +109,7 @@ def main():
     processed=0;model_errors=[]
     for row in pending:
         e=json.loads(row['payload'])
+        if health.get(e['source'],{}).get('status')!='OK':continue
         # One labelled historical sample proves integration; it never creates predictions.
         historical_sample=state(c,'historical_sample') is None
         if not e['prospective_eligible'] and not historical_sample:continue
@@ -145,6 +146,7 @@ def main():
             classification=json.loads(row['payload'])
             if classification['historical_context_only'] or state(c,'frozen:'+row['key']):continue
             event=json.loads(c.execute("SELECT payload FROM records WHERE kind='event' AND key=?",(row['key'],)).fetchone()[0])
+            if health.get(event['source'],{}).get('status')!='OK':continue
             if now-dt(event['first_seen_at'])>timedelta(days=1):
                 put(c,'no_prediction',row['key'],{'reason':'CLASSIFICATION_TOO_LATE'});setstate(c,'frozen:'+row['key'],'late');continue
             if len(future)<7:raise RuntimeError('Calendar horizon too short')
@@ -168,6 +170,8 @@ def main():
         for row in c.execute("SELECT * FROM records WHERE kind='event_watch'").fetchall():
             if state(c,'activated:'+row['key']):continue
             watch=json.loads(row['payload']);first=watch['first_session'];symbol=watch['symbol']
+            event_row=c.execute("SELECT payload FROM records WHERE kind='event' AND key=?",(watch['event_id'],)).fetchone()
+            if not event_row or health.get(json.loads(event_row[0])['source'],{}).get('status')!='OK':continue
             if dt(first['close'])+timedelta(minutes=15)>now:continue
             dates=sorted(bars[symbol]);day=first['date'];b=bars[symbol].get(day)
             if not b:continue
