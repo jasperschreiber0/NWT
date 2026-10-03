@@ -74,6 +74,16 @@ def format_report(status, trial, day, activation=False):
         for row in attribution.get('strategies', [])[:8]:
             lines.append(f"{row['strategy']}: {row['complete_trades']} complete trades; adjusted {money(row['net'])}")
         lines.append('Open/incomplete groups excluded: ' + str(len(attribution.get('excluded_groups', []))))
+        feasible=attribution.get('small_account_feasibility',[])
+        if feasible: lines.append(f"$5,000 minimum-unit feasibility: {sum(x.get('eligible') is True for x in feasible)}/{len(feasible)} assessed groups; illustrative, not live approval.")
+    review=((status.get('research') or {}).get('learning_review') or {}).get('strategy_review') or {}
+    if review:
+        lines += ['', 'Strategy experiment controls:']
+        for row in review.get('strategies',[]):
+            if row['state']!='UNCHANGED_UNPROVEN':
+                lines.append(f"{row['strategy']}: {row['state']}; recent adjusted {money(row['adjusted_net'])} / {row['completed_groups']} groups.")
+        lines.append('Limited experiments: $500/entry, $1,000 open entry cost per strategy. Existing exits continue.')
+        lines.append('$5,000 feasibility remains illustrative; operating costs await confirmed monthly bills.')
     lines += ['', 'Recorded outcome rows: ' + str(outcomes.get('n', 'unavailable')),
               'Adjusted result for these records: ' + money(outcomes.get('net')),
               'Record counts can include individual option legs; they are not counts of complete trades.',

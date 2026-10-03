@@ -57,6 +57,7 @@ def _bypass_upstream_gates():
     the shortability gate specifically.
     """
     with patch.object(engine, "check_directional_cap", return_value=(False, 0.0, 1_000_000.0)), \
+         patch('strategy_review.entry_gate',return_value=None), \
          patch.object(engine, "synchronous_risk_veto", return_value=(False, "")), \
          patch.object(engine, "require_operations_health"), \
          patch.object(engine, "reserve", return_value=True):

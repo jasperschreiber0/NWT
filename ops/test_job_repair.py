@@ -64,7 +64,7 @@ def test_complete_trade_attribution_excludes_open_spread_legs():
     from profit_attribution import aggregate
     from datetime import datetime,timezone,timedelta
     now=datetime.now(timezone.utc)
-    row=dict(position_id='a',spread_group_id='g',strategy_id='s',status='closed',pnl=10,pnl_adjusted=9,entry_time=now-timedelta(hours=2),exit_time=now,entry_price=1,exit_price=2,qty=1,asset_type='option',exit_reason='target')
+    row=dict(position_id='a',spread_group_id='g',strategy_id='s',status='closed',pnl=10,pnl_adjusted=9,entry_time=now-timedelta(hours=2),exit_time=now,entry_price=1,exit_price=2,qty=1,asset_type='option',asset='TEST',direction='long',exit_reason='target')
     assert aggregate([row,dict(row,position_id='b',status='open')])['strategies']==[]
     result=aggregate([row,dict(row,position_id='b',pnl=-2,pnl_adjusted=-3)])
     assert result['strategies'][0]['complete_trades']==1

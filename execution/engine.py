@@ -583,6 +583,11 @@ def place_equity_order(payload: dict) -> dict:
         "time_in_force": time_in_force,
     }
     order_body['client_order_id'] = payload.get('client_order_id')
+    if payload.get('_experiment_budget') is not None:
+        import math
+        budget=float(payload['_experiment_budget'])
+        if qty*price>budget:raise ValueError('One share exceeds the experiment budget')
+        order_body.update(type='limit',limit_price=str(math.floor(budget/qty*100)/100))
     if qa:
         order_body.update(client_order_id=payload['client_order_id'], type='limit',
                           limit_price=str(round(sized_notional, 2)))
@@ -1162,6 +1167,19 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         return
 
     # Directional cap check
+    # This gate runs only for new entries, never for close/recovery paths.
+    try:
+        sys.path.insert(0,str(_here.parent/'ops'))
+        from strategy_review import entry_gate
+        budget_reason=entry_gate(conn,payload,lambda:alpaca_get('/orders?status=open&limit=1'))
+    except Exception as exc:
+        conn.rollback()
+        budget_reason='BUDGET_EVIDENCE_UNAVAILABLE: '+type(exc).__name__
+    if budget_reason:
+        insert_decision(conn,ticket_id,'REJECTED','STRATEGY_BUDGET: '+budget_reason)
+        mark_decision_outcome(conn,decision_ticket_id,'STRATEGY_BUDGET: '+budget_reason)
+        return
+
     direction = payload.get("direction", "long")
     sized_notional = float(payload.get("sized_notional", 0))
     cap_exceeded, total_exposure, cap = check_directional_cap(conn, direction, sized_notional)

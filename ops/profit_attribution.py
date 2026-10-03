@@ -23,6 +23,9 @@ def aggregate(rows):
         entry=min(x['entry_time'] for x in legs);end=max(x['exit_time'] for x in legs)
         gross=sum(float(x['pnl']) for x in legs);net=sum(float(x['pnl_adjusted']) for x in legs)
         by_strategy[strategy].append({'group':key,'gross':gross,'net':net,'cost_adjustment':gross-net,
+            'strategy':strategy,'entry_time':entry.isoformat(),'exit_time':end.isoformat(),
+            'ledger_price_pnl':sum((float(x['exit_price'])-float(x['entry_price']))*float(x['qty'])*(100 if x['asset_type']=='option' else 1)*(1 if x['direction']=='long' else -1) for x in legs),
+            'assets':sorted(set(x['asset'] for x in legs)),
             'hours_held':(end-entry).total_seconds()/3600,'exit_reason':','.join(sorted(set(x.get('exit_reason') or 'unknown' for x in legs))),
             'entry_hour_et':entry.astimezone(ZoneInfo('America/New_York')).hour,
             'long_buy_hold_same_interval_gross':sum((float(x['exit_price'])-float(x['entry_price']))*float(x['qty'])*(100 if x['asset_type']=='option' else 1) for x in legs if x['asset_type']=='equity'),
@@ -40,6 +43,7 @@ def aggregate(rows):
             'by_exit_reason':dict(exits),'by_entry_hour_et':dict(hours),
             'equity_buy_hold_same_intervals_gross':sum(x['long_buy_hold_same_interval_gross'] for x in trades if x['equity_only'])})
     return {'strategies':sorted(results,key=lambda x:x['net']),'excluded_groups':excluded,
+            'complete_groups':[t for trades in by_strategy.values() for t in trades],
             'benchmark_note':'Same-asset long buy-and-hold over each executed equity holding interval only; not a passive whole-period portfolio comparison.',
             'timing_note':'Descriptive buckets, not causal proof that changing an entry hour or exit rule improves returns.'}
 

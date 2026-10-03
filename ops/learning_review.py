@@ -35,11 +35,18 @@ def main():
                 'APCA-API-SECRET-KEY':os.environ['NWT_ALPACA_SECRET_KEY']},timeout=15)
             response.raise_for_status();return response.json()
         attribution = build(c,get)
+        from strategy_review import load_rows, review, latch
+        strategy_review = review(load_rows(c))
+        strategy_review['strategies']=latch(c,strategy_review['strategies'])
         data=dict(attribution=attribution, observed_at=datetime.now(timezone.utc).isoformat(),realized=realized,
+                  strategy_review=strategy_review,
                   underlying_proxy_observations=shadow,pending_candidates=candidates,
                   promotion_policy='No option promotion from underlying proxies; require execution-grade shadow evidence, existing sample/regime gates and completed reliability trial.',
                   outcome='learning_report_complete')
         p=Path('/var/lib/nwt-ops/learning.json');tmp=p.with_suffix('.tmp')
+        archive=p.parent/'strategy-reviews';archive.mkdir(exist_ok=True)
+        snapshot=archive/(datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')+'.json')
+        with snapshot.open('x') as f:json.dump(strategy_review,f,default=str,indent=2)
         tmp.write_text(json.dumps(data,default=str,indent=2));tmp.replace(p)
         print(json.dumps(data,default=str))
     finally:c.close()
