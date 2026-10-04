@@ -17,3 +17,4 @@ shared/*.json
 performance/trades.json
 performance/summary.json
 research/daily-comparison/
+research/hub-evidence/

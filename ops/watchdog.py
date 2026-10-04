@@ -130,6 +130,14 @@ def inspect(now=None):
         except Exception: findings.append(label + ' collection evidence missing')
     learning_path = STATE / 'learning.json'
     try:
+        hub=json.loads((ROOT/'research/hub-evidence/latest.json').read_text())
+        research['hub']=hub
+        if hub.get('execution_enabled') is not False:issues.append('Research hub execution isolation not verified')
+        if hub.get('status')!='OK':research_warnings.append('Research hub degraded')
+        if trading_day and now.hour>=23 and (now-datetime.fromisoformat(hub['observed_at'])).total_seconds()>30*3600:
+            research_warnings.append('Research hub overdue')
+    except Exception:research_warnings.append('Research hub evidence missing')
+    try:
         daily = json.loads((ROOT/'research/daily-comparison/latest.json').read_text())
         research['daily_comparison'] = daily
         if daily.get('execution_enabled') is not False:

@@ -60,6 +60,16 @@ def format_report(status, trial, day, activation=False):
         lines += ['Overlapping observations are not independent trades.',
                   'These exploratory results do not establish a profitable strategy or live readiness.']
     attribution = ((status.get('research') or {}).get('learning_review') or {}).get('attribution') or {}
+    hub=(status.get('research') or {}).get('hub') or {}
+    if hub:
+        lines += ['', 'Research verdict: '+hub.get('verdict','unavailable').replace('_',' ').lower(),
+            'Equity history: '+hub.get('equities',{}).get('verdict','unavailable').replace('_',' ').lower(),
+            f"Bull put archive: {len(hub.get('bull_put',{}).get('completed',[]))} completed models; {hub.get('bull_put',{}).get('prospective_completed',0)} prospective.",
+            f"AI comparison: {hub.get('ai',{}).get('pairs',0)} paired outcomes; added value not established."]
+        for assessment in hub.get('assessments',[]):
+            if assessment.get('verdict')!='INSUFFICIENT_FRESH_EVIDENCE':
+                lines.append(assessment['name']+': '+assessment['verdict'].replace('_',' ').lower())
+        if date.fromisoformat(day).weekday()==4:lines.append('Weekly research verdict recorded; historical tests are exploratory, not proof of live profitability.')
     daily = (status.get('research') or {}).get('daily_comparison') or {}
     if daily:
         lines += ['', 'Daily equity comparison (modeled, not broker profit; 30bps round-trip costs):']
