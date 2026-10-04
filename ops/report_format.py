@@ -62,6 +62,12 @@ def format_report(status, trial, day, activation=False):
     attribution = ((status.get('research') or {}).get('learning_review') or {}).get('attribution') or {}
     hub=(status.get('research') or {}).get('hub') or {}
     if hub:
+        lab=hub.get('strategy_lab') or {}
+        if lab:
+            states=lab.get('states',{})
+            lines += ['', f"Strategy discovery: {lab.get('experiment_count',0)} experiments; {lab.get('completed_cohorts',0)} fresh cohorts.",
+                f"Collecting: {states.get('COLLECTING',0)}; retired: {states.get('RETIRED',0)}; virtual-paper qualified: {states.get('PAPER_QUALIFIED',0)}; demoted: {states.get('DEMOTED',0)}.",
+                f"Discovery model account: {money(lab.get('virtual_equity'))}; separate from Alpaca broker profit."]
         lines += ['', 'Research verdict: '+hub.get('verdict','unavailable').replace('_',' ').lower(),
             'Equity history: '+hub.get('equities',{}).get('verdict','unavailable').replace('_',' ').lower(),
             f"Bull put archive: {len(hub.get('bull_put',{}).get('completed',[]))} completed models; {hub.get('bull_put',{}).get('prospective_completed',0)} prospective.",

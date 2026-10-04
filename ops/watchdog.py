@@ -134,6 +134,7 @@ def inspect(now=None):
         research['hub']=hub
         if hub.get('execution_enabled') is not False:issues.append('Research hub execution isolation not verified')
         if hub.get('status')!='OK':research_warnings.append('Research hub degraded')
+        if hub.get('strategy_lab',{}).get('status')!='OK':research_warnings.append('Strategy discovery evidence missing or degraded')
         if trading_day and now.hour>=23 and (now-datetime.fromisoformat(hub['observed_at'])).total_seconds()>30*3600:
             research_warnings.append('Research hub overdue')
     except Exception:research_warnings.append('Research hub evidence missing')
