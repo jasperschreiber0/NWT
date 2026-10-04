@@ -249,11 +249,17 @@ def main():
     forward=forward_equities(c,data,calendar,now)
     from strategy_lab import run as run_lab
     lab=run_lab(out/'strategy-lab',data,calendar,now)
+    from broader_research import run as run_broader
+    broader=run_broader(out/'broader',get,calendar,now,last_complete)
+    from rehearsal import update as rehearse
+    broader_bars=json.loads((out/'broader'/('bars-'+day+'.json')).read_text())
+    rehearsal=rehearse(out/'rehearsal',[out/'strategy-lab',out/'broader/stocks',out/'broader/macro'],dict(data,**broader_bars),calendar,now)
     assessments=[assess(c,'bull_put',[(t['entry_day'],t['capital_risk_return']) for t in options['completed'] if t['prospective']],30,15)]
     assessments.extend(assess(c,r,[(t['entry'],t['net']-t['benchmark']) for t in forward['completed'] if t['rule']==r],12,12) for r in RULES if r!='passive_spy')
     assessments.append(assess(c,'ai_increment',[(t['event_id'],t['incremental_return']) for t in ai.get('observations',[]) if not t['short_borrow_missing']],30,30))
     report=dict(observed_at=now.isoformat(),version=POLICY['version'],status='OK',execution_enabled=False,assessments=assessments,
-        inventory=inventory,equities=equities,bull_put=options,ai=ai,forward_equities=forward,strategy_lab=lab,verdict='NO_STRATEGY_APPROVED_FOR_CAPITAL',
+        inventory=inventory,equities=equities,bull_put=options,ai=ai,forward_equities=forward,strategy_lab=lab,
+        broader=broader,rehearsal=rehearsal,verdict='NO_STRATEGY_APPROVED_FOR_LIVE_CAPITAL',
         prospective_start=c.execute("SELECT observed FROM records WHERE kind='policy' AND key=?",(POLICY['version'],)).fetchone()[0],policy=POLICY,data_sha256=hashlib.sha256(cache.read_bytes()).hexdigest(),
         code_sha256=hashlib.sha256((ROOT/'research/research_engine.py').read_bytes()).hexdigest())
     archive(c,'review',now.isoformat(),report);atomic(out/'latest.json',report)

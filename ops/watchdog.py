@@ -129,12 +129,19 @@ def inspect(now=None):
             if label == 'discovery' and expected and data.get('status') != 'OK': issues.append('Discovery data degraded')
         except Exception: findings.append(label + ' collection evidence missing')
     learning_path = STATE / 'learning.json'
+    for label,filename in [('unified_performance','unified-performance.json'),('paper_bridge','paper-bridge.json'),('recovery','recovery.json')]:
+        try:
+            value=json.loads((STATE/filename).read_text());research[label]=value
+            if label=='recovery' and value.get('blocked'):research_warnings.extend(value['blocked'])
+        except (OSError,ValueError):research_warnings.append(label+' evidence missing')
     try:
         hub=json.loads((ROOT/'research/hub-evidence/latest.json').read_text())
         research['hub']=hub
         if hub.get('execution_enabled') is not False:issues.append('Research hub execution isolation not verified')
         if hub.get('status')!='OK':research_warnings.append('Research hub degraded')
         if hub.get('strategy_lab',{}).get('status')!='OK':research_warnings.append('Strategy discovery evidence missing or degraded')
+        if hub.get('broader',{}).get('status')!='OK':research_warnings.append('Broader research evidence missing or degraded')
+        if hub.get('rehearsal',{}).get('status')!='OK':research_warnings.append('Small-account rehearsal missing or degraded')
         if trading_day and now.hour>=23 and (now-datetime.fromisoformat(hub['observed_at'])).total_seconds()>30*3600:
             research_warnings.append('Research hub overdue')
     except Exception:research_warnings.append('Research hub evidence missing')
@@ -155,7 +162,8 @@ def inspect(now=None):
         findings = research_warnings if isolated and observation_job(name, config) else issues
         row = c.execute('SELECT * FROM runs WHERE job=? ORDER BY id DESC LIMIT 1', (name,)).fetchone()
         runs[name] = dict(row) if row else None
-        if row and row['status'] == 'running' and time.time() - row['started'] > config.get('timeout', 240) + 60:
+        runtime_budget=config.get('timeout',240)*(3 if config.get('retry_safe') else 1)+60
+        if row and row['status'] == 'running' and time.time() - row['started'] > runtime_budget:
             findings.append(name + ' job interrupted or stuck')
         if unresolved_job_failure(c, name): findings.append(name + ' job failed')
         # Explicit deadlines are only enforced on broker-confirmed trading dates.

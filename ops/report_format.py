@@ -68,6 +68,10 @@ def format_report(status, trial, day, activation=False):
             lines += ['', f"Strategy discovery: {lab.get('experiment_count',0)} experiments; {lab.get('completed_cohorts',0)} fresh cohorts.",
                 f"Collecting: {states.get('COLLECTING',0)}; retired: {states.get('RETIRED',0)}; virtual-paper qualified: {states.get('PAPER_QUALIFIED',0)}; demoted: {states.get('DEMOTED',0)}.",
                 f"Discovery model account: {money(lab.get('virtual_equity'))}; separate from Alpaca broker profit."]
+        broader=hub.get('broader',{}).get('studies',{})
+        if broader:lines.append('Additional stock/macro experiments: '+str(sum(x.get('experiment_count',0) for x in broader.values()))+'.')
+        rehearsal=hub.get('rehearsal',{})
+        if rehearsal:lines.append('$5,000 whole-share rehearsal: '+money(rehearsal.get('equity'))+'; '+str(rehearsal.get('completed_cohorts',0))+' completed cohorts.')
         lines += ['', 'Research verdict: '+hub.get('verdict','unavailable').replace('_',' ').lower(),
             'Equity history: '+hub.get('equities',{}).get('verdict','unavailable').replace('_',' ').lower(),
             f"Bull put archive: {len(hub.get('bull_put',{}).get('completed',[]))} completed models; {hub.get('bull_put',{}).get('prospective_completed',0)} prospective.",
@@ -100,6 +104,13 @@ def format_report(status, trial, day, activation=False):
                 lines.append(f"{row['strategy']}: {row['state']}; recent adjusted {money(row['adjusted_net'])} / {row['completed_groups']} groups.")
         lines.append('Limited experiments: $500/entry, $1,000 open entry cost per strategy. Existing exits continue.')
         lines.append('$5,000 feasibility remains illustrative; operating costs await confirmed monthly bills.')
+    performance=(status.get('research') or {}).get('unified_performance') or {}
+    if performance:
+        lines += ['', 'Broker equity: '+money(performance.get('equity'))+'; open P&L: '+money(performance.get('unrealized_broker')),
+            'Measured trading P&L since '+str(performance.get('measured_since',''))[:10]+': '+money(performance.get('measured_trading_profit')),
+            'After operating costs: '+money(performance.get('measured_after_operating_costs'))]
+    bridge=(status.get('research') or {}).get('paper_bridge') or {}
+    if bridge:lines.append('Research-to-Alpaca paper connection: '+str(bridge.get('qualified',0))+' qualified candidates; operational trial and execution checks apply.')
     lines += ['', 'Recorded outcome rows: ' + str(outcomes.get('n', 'unavailable')),
               'Adjusted result for these records: ' + money(outcomes.get('net')),
               'Record counts can include individual option legs; they are not counts of complete trades.',

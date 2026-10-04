@@ -347,7 +347,7 @@ def fetch_pending_tickets(conn) -> list:
             WHERE t.to_agent = 'EXECUTION_ENGINE'
               AND t.type = 'TRADE_REQUEST'
               AND t.from_agent IN (
-                  'EU_EXECUTOR', 'AUS_EXECUTOR', 'CHINA_EXECUTOR', 'NWT_EXECUTION_AGENT'
+                  'EU_EXECUTOR', 'AUS_EXECUTOR', 'CHINA_EXECUTOR', 'NWT_EXECUTION_AGENT', 'NWT_RESEARCH_BRIDGE'
               )
               AND NOT EXISTS (
                   SELECT 1 FROM nwt_ticket_decisions d
@@ -583,11 +583,25 @@ def place_equity_order(payload: dict) -> dict:
         "time_in_force": time_in_force,
     }
     order_body['client_order_id'] = payload.get('client_order_id')
+    if payload.get('bot_source')=='RESEARCH_LAB':
+        if not payload.get('_research_verified') or ALPACA_BASE_URL!='https://paper-api.alpaca.markets':
+            raise ValueError('Research order requires independent paper qualification gate')
+        sys.path.insert(0,str(_here.parent/'research'))
+        from paper_bridge import quote_order
+        response=requests.get(ALPACA_DATA_URL+'/v2/stocks/'+symbol+'/quotes/latest',
+            params={'feed':'sip'},headers=ALPACA_HEADERS,timeout=15)
+        response.raise_for_status()
+        qty,limit=quote_order(response.json()['quote'],sized_notional,datetime.now(timezone.utc))
+        account=alpaca_get('/account')
+        if account.get('trading_blocked') or account.get('account_blocked') or float(account['cash'])<qty*limit:
+            raise ValueError('Research paper cash or account unavailable')
+        order_body.update(qty=str(qty),type='limit',limit_price=str(limit))
     if payload.get('_experiment_budget') is not None:
         import math
         budget=float(payload['_experiment_budget'])
         if qty*price>budget:raise ValueError('One share exceeds the experiment budget')
-        order_body.update(type='limit',limit_price=str(math.floor(budget/qty*100)/100))
+        maximum=math.floor(budget/qty*100)/100
+        order_body.update(type='limit',limit_price=str(min(float(order_body.get('limit_price',maximum)),maximum)))
     if qa:
         order_body.update(client_order_id=payload['client_order_id'], type='limit',
                           limit_price=str(round(sized_notional, 2)))
@@ -829,6 +843,16 @@ def run_equity_position_monitor(conn) -> None:
 
         if entry_price <= 0 or not symbol:
             continue
+
+        if pos.get('bot_source')=='RESEARCH_LAB':
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('SELECT payload FROM nwt_tickets WHERE ticket_id=%s',(str(pos['ticket_id']),))
+                source=cur.fetchone()
+            expiry=(source or {}).get('payload',{}).get('research',{}).get('exit')
+            if not expiry:raise ValueError('Research position missing scheduled exit')
+            if datetime.now(ET_TZ).date().isoformat()>=expiry:
+                _close_equity_position(conn,pos,entry_price,position_id,symbol,notional,entry_price,'lab_time_exit')
+                continue
 
         try:
             current_price = get_current_price(symbol)
@@ -1158,6 +1182,19 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         return
 
     # Synchronous risk gate — re-reads directives fresh at order time
+    if payload.get('bot_source')=='RESEARCH_LAB' or str(payload.get('strategy_id','')).startswith('LAB-'):
+        try:
+            sys.path.insert(0,str(_here.parent/'research'))
+            from paper_bridge import gate as research_gate, ticket_id as research_id, SOURCE
+            meta=payload['research']
+            if ticket.get('from_agent')!=SOURCE or ticket_id!=research_id(meta['study']+':'+meta['experiment'],meta['entry'],payload['symbol']):
+                raise ValueError('Research ticket identity mismatch')
+            research_gate(conn,payload,ALPACA_BASE_URL)
+            payload['_research_verified']=True
+        except Exception as exc:
+            conn.rollback()
+            insert_decision(conn,ticket_id,'REJECTED','RESEARCH_GATE: '+str(exc))
+            return
     vetoed, veto_reason = synchronous_risk_veto(conn, payload)
     if vetoed:
         logger.warning("Ticket %s rejected: %s", ticket_id, veto_reason)
