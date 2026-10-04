@@ -70,6 +70,10 @@ def format_report(status, trial, day, activation=False):
                 f"Discovery model account: {money(lab.get('virtual_equity'))}; separate from Alpaca broker profit."]
         broader=hub.get('broader',{}).get('studies',{})
         if broader:lines.append('Additional stock/macro experiments: '+str(sum(x.get('experiment_count',0) for x in broader.values()))+'.')
+        theories=hub.get('theories',{})
+        if theories:lines.append('All-universe tests: '+str(theories.get('experiment_count',0))+' including controls; '+str(theories.get('completed_cohorts',0))+' fresh cohorts.')
+        option_tests=hub.get('option_theories',{})
+        if option_tests:lines.append('$100-risk option research: '+str(option_tests.get('registered',0))+' registered; '+str(option_tests.get('completed',0))+' completed BBO models, not fills.')
         rehearsal=hub.get('rehearsal',{})
         if rehearsal:lines.append('$5,000 whole-share rehearsal: '+money(rehearsal.get('equity'))+'; '+str(rehearsal.get('completed_cohorts',0))+' completed cohorts.')
         lines += ['', 'Research verdict: '+hub.get('verdict','unavailable').replace('_',' ').lower(),

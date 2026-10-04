@@ -12,3 +12,4 @@ cd /opt/nwt-reliability-candidate
 python3 -m compileall -q execution ops nwt_agents dashboard research
 python3 -m pytest -q tests_offline nwt_agents/tests execution/tests ukeu/tests ops/test_operations.py ops/test_report_format.py ops/test_job_repair.py ops/test_research_health.py ops/test_strategy_review.py research/test_event_observation.py research/test_discovery.py research/test_daily_comparison.py research/test_research_hub.py research/test_strategy_lab.py research/test_autonomous_paper.py
 git diff --check
+python3 -m pytest -q research/test_data_atlas.py

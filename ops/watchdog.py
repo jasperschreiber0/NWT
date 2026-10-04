@@ -141,6 +141,9 @@ def inspect(now=None):
         if hub.get('status')!='OK':research_warnings.append('Research hub degraded')
         if hub.get('strategy_lab',{}).get('status')!='OK':research_warnings.append('Strategy discovery evidence missing or degraded')
         if hub.get('broader',{}).get('status')!='OK':research_warnings.append('Broader research evidence missing or degraded')
+        if hub.get('data_atlas',{}).get('status')!='OK':research_warnings.append('Expanded data coverage missing or degraded')
+        if hub.get('theories',{}).get('status')!='OK':research_warnings.append('All-universe theory evidence missing or degraded')
+        if hub.get('option_theories',{}).get('status')!='OK':research_warnings.append('Small-account option evidence missing or degraded')
         if hub.get('rehearsal',{}).get('status')!='OK':research_warnings.append('Small-account rehearsal missing or degraded')
         if trading_day and now.hour>=23 and (now-datetime.fromisoformat(hub['observed_at'])).total_seconds()>30*3600:
             research_warnings.append('Research hub overdue')

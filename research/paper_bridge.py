@@ -15,6 +15,7 @@ from paper_io import Paper, STATE, atomic, stamp
 
 LAB=ROOT/'research/hub-evidence/strategy-lab'
 LABS={'core':LAB,'stocks':ROOT/'research/hub-evidence/broader/stocks','macro':ROOT/'research/hub-evidence/broader/macro'}
+LABS['theories']=ROOT/'research/hub-evidence/theories'
 SOURCE='NWT_RESEARCH_BRIDGE'
 POLICY=dict(version='paper-bridge-20261005-v1',entry_cap=500.,strategy_cap=1000.,total_cap=3000.,
     loss_budget=100.,stop=.03,entry_window_minutes=30,max_quote_age=90,max_spread=.005,
