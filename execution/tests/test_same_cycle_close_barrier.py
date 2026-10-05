@@ -9,7 +9,8 @@ import engine
 
 
 @pytest.mark.parametrize('orders,allowed', [([], True), ([{'id': 'close', 'status': 'new'}], False),
-                                         (None, False), ({}, False)])
+                                         (None, False), ({}, False),
+                                         (requests.Timeout('offline simulated timeout'), False)])
 def test_new_entries_wait_for_broker_orders_after_close_processing(monkeypatch, orders, allowed):
     conn = Mock()
     monkeypatch.setattr(engine, 'get_db', lambda: conn)
@@ -38,7 +39,10 @@ def test_new_entries_wait_for_broker_orders_after_close_processing(monkeypatch, 
         return orders
 
     monkeypatch.setattr(engine, 'alpaca_get', broker)
-    if not isinstance(orders, (list, Exception)):
+    if isinstance(orders, requests.Timeout):
+        with pytest.raises(requests.Timeout, match='offline simulated timeout'):
+            engine.main()
+    elif not isinstance(orders, list):
         with pytest.raises(ValueError, match='Invalid broker open-order response'):
             engine.main()
     else:
@@ -47,10 +51,3 @@ def test_new_entries_wait_for_broker_orders_after_close_processing(monkeypatch, 
     assert process.call_count == int(allowed)
     assert fetch.call_count == int(allowed)
     conn.close.assert_called_once()
-
-
-def test_failed_fresh_broker_check_cannot_reach_new_entries(monkeypatch):
-    # Reuse the exact main-loop setup, allowing the failed GET to propagate.
-    with pytest.raises(requests.Timeout):
-        test_new_entries_wait_for_broker_orders_after_close_processing(
-            monkeypatch, requests.Timeout('offline simulated timeout'), False)
