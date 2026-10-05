@@ -8,7 +8,8 @@ import requests
 import engine
 
 
-@pytest.mark.parametrize('orders,allowed', [([], True), ([{'id': 'close', 'status': 'new'}], False)])
+@pytest.mark.parametrize('orders,allowed', [([], True), ([{'id': 'close', 'status': 'new'}], False),
+                                         (None, False), ({}, False)])
 def test_new_entries_wait_for_broker_orders_after_close_processing(monkeypatch, orders, allowed):
     conn = Mock()
     monkeypatch.setattr(engine, 'get_db', lambda: conn)
@@ -37,7 +38,11 @@ def test_new_entries_wait_for_broker_orders_after_close_processing(monkeypatch, 
         return orders
 
     monkeypatch.setattr(engine, 'alpaca_get', broker)
-    engine.main()
+    if not isinstance(orders, (list, Exception)):
+        with pytest.raises(ValueError, match='Invalid broker open-order response'):
+            engine.main()
+    else:
+        engine.main()
     assert events == ['close_phase', 'fresh_broker_check']
     assert process.call_count == int(allowed)
     assert fetch.call_count == int(allowed)
