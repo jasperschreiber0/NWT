@@ -45,10 +45,17 @@ jobs:
       - name: Compile production Python
         run: |
           python -m compileall -q \
-            asx china dashboard execution master nwt_agents performance ukeu us
+            asx china dashboard execution master nwt_agents performance ukeu us ops research
+
+      - name: Verify focused execution tests collect independently
+        run: >-
+          python -m pytest -q
+          execution/tests/test_engine_shortability_gate.py
+          execution/tests/test_experiment_budget.py
+          execution/tests/test_paper_workflow.py
 
       - name: Run offline and unit tests
-        run: python -m pytest -q tests_offline nwt_agents/tests execution/tests ukeu/tests
+        run: python -m pytest -q tests_offline nwt_agents/tests execution/tests ukeu/tests ops research
 
       - name: Validate migrations are present
         run: |

@@ -16,6 +16,7 @@ from run_job import ROOT, STATE, db
 from report_format import format_report
 from trial_evidence import update_sessions, unresolved_job_failure
 from research_health import policy_active, observation_job, persistent_warnings
+from health_checks import HealthCheckError, health_operation
 sys.path.insert(0, str(ROOT / 'execution'))
 from reliability import reconcile_quantities, separate_legacy_expiries
 
@@ -55,8 +56,9 @@ def inspect(now=None):
     if base != 'https://paper-api.alpaca.markets': raise RuntimeError('Paper endpoint required')
     h = {'APCA-API-KEY-ID': os.environ['NWT_ALPACA_KEY_ID'], 'APCA-API-SECRET-KEY': os.environ['NWT_ALPACA_SECRET_KEY']}
     def get(path):
-        r = requests.get(base + '/v2/' + path, headers=h, timeout=15)
-        r.raise_for_status(); return r.json()
+        with health_operation('broker.' + path.split('?', 1)[0]):
+            r = requests.get(base + '/v2/' + path, headers=h, timeout=15)
+            r.raise_for_status(); return r.json()
     issues = []; research_warnings = []
     policy_path = STATE / 'research-policy.json'
     policy = json.loads(policy_path.read_text()) if policy_path.exists() else {}
@@ -67,10 +69,11 @@ def inspect(now=None):
     trading_day = bool(calendar)
     clock = get('clock')
     # PM2 already restarts the web process; independently verify authenticated health.
-    response = requests.get('http://127.0.0.1:8080/api/health',
-                            headers={'Authorization':'Bearer '+os.environ['NWT_DASHBOARD_TOKEN']},timeout=10)
-    if response.status_code != 200 or response.json().get('status') != 'ok':
-        issues.append('Dashboard health failed')
+    with health_operation('dashboard.health'):
+        response = requests.get('http://127.0.0.1:8080/api/health',
+                                headers={'Authorization':'Bearer '+os.environ['NWT_DASHBOARD_TOKEN']},timeout=10)
+        if response.status_code != 200 or response.json().get('status') != 'ok':
+            issues.append('Dashboard health failed')
     broker = get('positions')
     account = get('account')
     if account.get('trading_blocked') or account.get('account_blocked'):
@@ -80,7 +83,8 @@ def inspect(now=None):
         stamp = datetime.fromisoformat(order['created_at'].replace('Z', '+00:00'))
         if (now - stamp).total_seconds() > 900:
             issues.append('Unresolved broker order ' + order['id'])
-    conn = psycopg2.connect(os.environ['NWT_DB_DSN'], connect_timeout=10)
+    with health_operation('ledger.connect'):
+        conn = psycopg2.connect(os.environ['NWT_DB_DSN'], connect_timeout=10)
     conn.set_session(readonly=True, autocommit=True)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM nwt_portfolio_ledger WHERE status IN ('open','suspect')")
@@ -199,7 +203,10 @@ def main():
         status = inspect()
     except Exception as exc:
         status = dict(observed_at=datetime.now(timezone.utc).isoformat(), ready_for_entries=False,
-                      issues=['Health inspection failed: ' + type(exc).__name__])
+                      issues=['Health inspection failed: ' +
+                              (str(exc) if isinstance(exc, HealthCheckError) else type(exc).__name__)])
+        if isinstance(exc, HealthCheckError):
+            status['health_failure'] = exc.details()
     # A bootstrapping grace only suppresses historical job deadlines, never broker checks.
     trial_path = STATE / 'trial.json'
     trial = json.loads(trial_path.read_text()) if trial_path.exists() else {'start_date': '2026-09-15', 'required_sessions': 20}
