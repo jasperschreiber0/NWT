@@ -1469,6 +1469,12 @@ def main() -> None:
         if recovery['pending'] or close_recovery['pending']:
             logger.info('Prior orders still settling; new entries deferred')
             return
+        # Recovery above predates the close phase. Newly submitted closes may
+        # still be open and conflict with an opposite-side entry in this run.
+        # A failed broker read must propagate, never permit an unverified entry.
+        if alpaca_get('/orders?status=open&limit=1'):
+            logger.info('Broker orders still open after close processing; new entries deferred')
+            return
         pending = fetch_pending_tickets(conn)
         logger.info("Found %d pending TRADE_REQUEST tickets", len(pending))
 
