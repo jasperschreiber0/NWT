@@ -2,6 +2,7 @@ import json
 import os
 from copy import deepcopy
 from decimal import Decimal
+from datetime import timezone
 import psycopg2
 import pytest
 from fill_recovery import recover_entries, fill_data
@@ -161,7 +162,7 @@ def test_delayed_close_receipt_is_atomic_and_idempotent(close_db):
     with conn.cursor() as q:
         q.execute('SELECT status,exit_price,exit_time FROM nwt_portfolio_ledger')
         row=q.fetchone();assert row[:2]==('closed',Decimal('89.66375'))
-        assert row[2].isoformat()=='2026-09-17T15:00:00+00:00'
+        assert row[2].astimezone(timezone.utc).isoformat()=='2026-09-17T15:00:00+00:00'
 
 
 @pytest.mark.parametrize('change',[{'symbol':'EWA'},{'side':'buy'},{'qty':'33'},{'filled_qty':'31'}, {'filled_avg_price':'NaN'}, {'filled_at':'2026-09-16T15:00:00Z'}])
