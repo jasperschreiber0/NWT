@@ -2,22 +2,22 @@
 master/allocator.py — Learning Layer D: Portfolio Allocator.
 
 Answers "where should capital go?" — never "what should we trade?". This is
-not a separate service: master/strategist.py calls compute_dynamic_weights()
-as the starting point for its own compute_bot_permissions(), replacing the
-hardcoded BASELINE_WEIGHTS dict with a starting point that tilts toward
-whichever bot has actually been working, conditioned on today's regime where
-there's enough sample to trust that conditioning.
+not a separate service: master/strategist.py calls compute_dynamic_weights().
+Effective weights remain pinned to BASELINE_WEIGHTS during controlled paper
+evaluation. Repaired performance-based candidates are recorded as shadow
+evidence only; enabling them requires a separately reviewed code change.
 
 Cold start (no trade history yet) produces baseline_weights back, unchanged
 — explicit, not an error, matching the rest of this codebase's convention.
 
-A bot only gets tilted away from its baseline once it clears
+A shadow candidate only gets tilted away from its baseline once it clears
 MIN_SAMPLE_FOR_TILT closed trades; below that, its multiplier is exactly 1.0.
 The tilt itself is a bounded z-score across bots (not an unbounded chase of
 whichever bot got lucky), capped at +/-25% of baseline weight per run.
 """
 
 import logging
+import json
 import statistics
 from datetime import datetime, timezone
 from typing import Optional
@@ -49,7 +49,7 @@ def _fetch_bot_trades(conn, bot_key: str, limit: int = LOOKBACK_TRADES) -> list:
             SELECT COALESCE(to_.pnl_adjusted, to_.pnl) AS pnl,
                    to_.regime_at_entry->>'primary_regime' AS primary_regime
             FROM nwt_trade_outcomes to_
-            JOIN nwt_portfolio_ledger pl ON pl.position_id::text = to_.position_id
+            JOIN nwt_portfolio_ledger pl ON pl.position_id = to_.position_id
             WHERE pl.bot_source = %s AND to_.closed_at IS NOT NULL
               AND COALESCE(to_.pnl_adjusted, to_.pnl) IS NOT NULL
             ORDER BY to_.closed_at DESC
@@ -102,11 +102,10 @@ def compute_dynamic_weights(
     conn, regime: dict, baseline_weights: dict
 ) -> tuple[dict, list[str]]:
     """
-    Returns (dynamic_weights, notes). dynamic_weights has the same keys as
-    baseline_weights and sums to the same total — this redistributes share,
-    it does not change how much total capital is deployed (that's
-    compute_bot_permissions' job via kill switch / confidence / transition
-    risk multipliers, applied afterward in strategist.py).
+    Returns (unchanged baseline_weights, notes). Performance-based candidates
+    are shadow evidence only. There is deliberately no activation parameter:
+    neither a thawed mutation flag nor sufficient samples can change sizing.
+    Existing downstream risk reductions remain strategist.py's responsibility.
     """
     notes: list[str] = []
     current_regime = (regime or {}).get("primary_regime", "neutral")
@@ -116,9 +115,9 @@ def compute_dynamic_weights(
         try:
             scores[bot] = _bot_score(conn, bot, current_regime)
         except Exception as exc:
-            logger.warning("Allocator: score computation failed for %s: %s", bot, exc)
-            scores[bot] = {"bot": bot, "sample": 0, "total_sample": 0,
-                           "expectancy": None, "sharpe_proxy": None, "basis": "error"}
+            conn.rollback()
+            logger.error("Allocator: score computation failed for %s: %s", bot, exc)
+            raise RuntimeError(f"Allocator score unavailable for {bot}") from exc
 
     tiltable = {b: s for b, s in scores.items()
                 if s["total_sample"] >= MIN_SAMPLE_FOR_TILT and s["expectancy"] is not None}
@@ -155,13 +154,14 @@ def compute_dynamic_weights(
     for bot in BOT_KEYS:
         if bot in tiltable:
             notes.append(
-                f"Allocator: {bot} weight {baseline_weights.get(bot, 0):.4f} -> "
+            f"Allocator SHADOW_ONLY: {bot} candidate {baseline_weights.get(bot, 0):.4f} -> "
                 f"{dynamic_weights[bot]:.4f} (basis={tiltable[bot]['basis']}, "
                 f"n={tiltable[bot]['sample']}, expectancy={tiltable[bot]['expectancy']:.2f})"
             )
 
     _record_history(conn, scores, baseline_weights, dynamic_weights, current_regime, notes)
-    return dynamic_weights, notes
+    notes.append("Allocator SHADOW_ONLY: effective weights remain pinned to baseline")
+    return dict(baseline_weights), notes
 
 
 def _record_history(conn, scores: dict, baseline_weights: dict, dynamic_weights: dict,
@@ -178,11 +178,15 @@ def _record_history(conn, scores: dict, baseline_weights: dict, dynamic_weights:
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
-                        bot, current_regime, baseline_weights.get(bot), dynamic_weights.get(bot),
+                        bot, current_regime, baseline_weights.get(bot), baseline_weights.get(bot),
                         s.get("sample"), s.get("expectancy"), s.get("sharpe_proxy"),
-                        s.get("basis"),
+                        json.dumps({"mode": "shadow_only", "basis": s.get("basis"),
+                                    "candidate_weight": dynamic_weights.get(bot),
+                                    "effective_weight": baseline_weights.get(bot)}),
                     ),
                 )
         conn.commit()
     except Exception as exc:
-        logger.warning("Allocator: failed to write nwt_allocator_history: %s", exc)
+        conn.rollback()
+        logger.error("Allocator: failed to write nwt_allocator_history: %s", exc)
+        raise RuntimeError("Allocator shadow history unavailable") from exc

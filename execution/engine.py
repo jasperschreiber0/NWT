@@ -334,7 +334,7 @@ def mark_decision_outcome(conn, ticket_id: str, outcome_reason: str) -> None:
         conn.commit()
     except Exception as exc:
         conn.rollback()
-        logger.warning("mark_decision_outcome failed for ticket %s: %s", ticket_id, exc)
+        logger.error("mark_decision_outcome failed for ticket %s: %s", ticket_id, exc)
 
 
 def fetch_pending_tickets(conn) -> list:
@@ -1161,17 +1161,19 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         logger.warning("Ticket %s rejected: %s", ticket_id, reason)
         insert_decision(conn, ticket_id, "REJECTED", reason)
         log_system_event(conn, "WARNING", "execution_engine", reason, {"ticket_id": ticket_id})
+        mark_decision_outcome(conn, decision_ticket_id, "STRUCTURALLY_IMPOSSIBLE")
         return
 
     if not payload.get("approved", False):
         reason = payload.get("reasoning", "approved=False in payload")
         insert_decision(conn, ticket_id, "REJECTED", reason)
+        mark_decision_outcome(conn, decision_ticket_id, "RISK_VETOED")
         return
 
     rejection = entry_rejection(ticket)
     if rejection:
         insert_decision(conn, ticket_id, 'REJECTED', rejection)
-        mark_decision_outcome(conn, decision_ticket_id, rejection)
+        mark_decision_outcome(conn, decision_ticket_id, "RISK_VETOED")
         return
 
     # Server health is an entry gate, independent of exit monitoring.
@@ -1179,6 +1181,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         require_operations_health()
     except Exception as exc:
         insert_decision(conn, ticket_id, 'REJECTED', 'OPS_HEALTH_GATE: ' + str(exc))
+        mark_decision_outcome(conn, decision_ticket_id, "RISK_VETOED")
         return
 
     # Synchronous risk gate — re-reads directives fresh at order time
@@ -1194,6 +1197,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         except Exception as exc:
             conn.rollback()
             insert_decision(conn,ticket_id,'REJECTED','RESEARCH_GATE: '+str(exc))
+            mark_decision_outcome(conn, decision_ticket_id, "RISK_VETOED")
             return
     vetoed, veto_reason = synchronous_risk_veto(conn, payload)
     if vetoed:
@@ -1214,7 +1218,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
         budget_reason='BUDGET_EVIDENCE_UNAVAILABLE: '+type(exc).__name__
     if budget_reason:
         insert_decision(conn,ticket_id,'REJECTED','STRATEGY_BUDGET: '+budget_reason)
-        mark_decision_outcome(conn,decision_ticket_id,'STRATEGY_BUDGET: '+budget_reason)
+        mark_decision_outcome(conn,decision_ticket_id,'RISK_VETOED')
         return
 
     direction = payload.get("direction", "long")
