@@ -2,6 +2,7 @@ import json
 import os
 from copy import deepcopy
 from decimal import Decimal
+from datetime import timezone
 import psycopg2
 import pytest
 from fill_recovery import recover_entries, fill_data
@@ -104,6 +105,47 @@ def close_receipt(pid, **changes):
                      filled_at='2026-09-17T15:00:00Z'),**changes)
 
 
+def test_pending_close_blocks_entries_then_recovers_exactly_once(close_db, monkeypatch):
+    import engine
+    import fill_recovery
+    from unittest.mock import Mock
+    conn,pid=close_db
+    with conn.cursor() as q:
+        q.execute("INSERT INTO nwt_tickets(ticket_id,type,payload) VALUES(%s,'CLOSE_REQUEST',%s)",
+                  (OID,json.dumps({'position_id':pid})))
+    conn.commit()
+    class KeepTestConnection:
+        def __getattr__(self,key):return getattr(conn,key)
+        def close(self):pass
+    monkeypatch.setattr(engine,'get_db',lambda:KeepTestConnection())
+    monkeypatch.setattr(engine,'upsert_heartbeat',lambda _:None)
+    monkeypatch.setattr(fill_recovery,'recover_entries',lambda *a:dict(recorded=[],pending=[]))
+    monkeypatch.setattr(engine,'check_no_trade_mode',lambda _:(False,''))
+    monkeypatch.setattr(engine,'load_master_directives',lambda:{})
+    monkeypatch.setattr(engine,'get_open_positions',lambda _:[])
+    monkeypatch.setattr(engine,'run_equity_position_monitor',lambda _:None)
+    monkeypatch.setattr(engine,'fetch_force_close_tickets',lambda _:[])
+    entries=Mock(return_value=[]);post=Mock()
+    monkeypatch.setattr(engine,'fetch_pending_tickets',entries);monkeypatch.setattr(engine,'alpaca_post',post)
+    receipt=close_receipt(pid,status='new',filled_qty='0',filled_avg_price=None,filled_at=None)
+    def broker(path):
+        if path=='/clock':return {'is_open':True}
+        if path=='/orders?status=open&limit=1':return []
+        assert path.startswith('/orders:by_client_order_id?')
+        return receipt
+    monkeypatch.setattr(engine,'alpaca_get',broker)
+    engine.main();entries.assert_not_called();post.assert_not_called()
+    receipt=close_receipt(pid)
+    engine.main();engine.main()
+    assert entries.call_count==2
+    post.assert_not_called()
+    with conn.cursor() as q:
+        q.execute("SELECT count(*) FROM nwt_portfolio_ledger WHERE status='closed'");assert q.fetchone()==(1,)
+        q.execute("SELECT count(*) FROM nwt_system_log WHERE component='close_recovery'");assert q.fetchone()==(1,)
+        q.execute('SELECT recorded_qty FROM nwt_close_progress');assert q.fetchone()==(Decimal(32),)
+        q.execute('SELECT count(*) FROM nwt_ticket_decisions WHERE ticket_id=%s AND decision=%s',(OID,'EXECUTED'));assert q.fetchone()==(1,)
+
+
 def test_delayed_close_receipt_is_atomic_and_idempotent(close_db):
     from close_recovery import recover_closes
     conn,pid=close_db
@@ -120,7 +162,7 @@ def test_delayed_close_receipt_is_atomic_and_idempotent(close_db):
     with conn.cursor() as q:
         q.execute('SELECT status,exit_price,exit_time FROM nwt_portfolio_ledger')
         row=q.fetchone();assert row[:2]==('closed',Decimal('89.66375'))
-        assert row[2].isoformat()=='2026-09-17T15:00:00+00:00'
+        assert row[2].astimezone(timezone.utc).isoformat()=='2026-09-17T15:00:00+00:00'
 
 
 @pytest.mark.parametrize('change',[{'symbol':'EWA'},{'side':'buy'},{'qty':'33'},{'filled_qty':'31'}, {'filled_avg_price':'NaN'}, {'filled_at':'2026-09-16T15:00:00Z'}])

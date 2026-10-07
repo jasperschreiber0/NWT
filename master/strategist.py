@@ -781,10 +781,13 @@ def main() -> int:
 
         # --- Portfolio Allocator (Learning Layer D) ---
         logger.info("Computing dynamic capital weights...")
+        allocator_status = "ok"
         try:
             dynamic_weights, allocator_notes = compute_dynamic_weights(conn, regime, BASELINE_WEIGHTS)
         except Exception as exc:
-            logger.warning("Allocator failed — falling back to baseline weights: %s", exc)
+            conn.rollback()
+            allocator_status = "failed"
+            logger.error("Allocator shadow evaluation failed - weights remain pinned: %s", exc)
             dynamic_weights, allocator_notes = dict(BASELINE_WEIGHTS), [f"Allocator error (using baseline): {exc}"]
 
         # --- Bot permissions ---
@@ -819,6 +822,8 @@ def main() -> int:
             "net_delta_estimate": exposure["net_delta_estimate"],
             "net_vega_estimate": exposure["net_vega_estimate"],
             "bot_permissions": permissions,
+            "allocator_mode": "shadow_only",
+            "allocator_status": allocator_status,
             "conflict_notes": "; ".join(conflict_notes) if conflict_notes else "",
             "reasoning": reasoning,
         }
@@ -851,14 +856,15 @@ def main() -> int:
             },
         )
 
-        upsert_agent_state(conn, "master-strategist", "ok", {
+        upsert_agent_state(conn, "master-strategist", "ok" if allocator_status == "ok" else "degraded", {
             "regime": regime["primary_regime"], "kill_switch": kill_switch,
             "dynamic_weights": dynamic_weights,
+            "allocator_mode": "shadow_only", "allocator_status": allocator_status,
         })
 
         logger.info("=== master-strategist complete ===")
         logger.info(summary)
-        return 0
+        return 0 if allocator_status == "ok" else 3
 
     except Exception as exc:
         logger.critical("Unexpected error in master-strategist: %s", exc)
