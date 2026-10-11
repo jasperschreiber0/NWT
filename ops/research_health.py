@@ -13,7 +13,8 @@ def policy_active(policy, now):
 
 
 def observation_job(name, config):
-    commands={'global-events':'research/event_pipeline.py','research-hub':'research/research_hub.py'}
+    commands={'global-events':'research/event_pipeline.py','research-hub':'research/research_hub.py',
+              'investor-research':'research/investor_pipeline.py'}
     return (name in commands and config.get('cwd') == '.' and
             config.get('args') == [commands[name]])
 
@@ -27,7 +28,7 @@ def persistent_warnings(previous, warnings, now, delay=1800):
 
 def research_run_after_policy(job, started, policy):
     try:
-        return (job in ('global-events','research-hub') and policy['version'] == VERSION and
+        return (job in ('global-events','research-hub','investor-research') and policy['version'] == VERSION and
                 started >= datetime.fromisoformat(policy['effective_at']).timestamp())
     except (KeyError, TypeError, ValueError):
         return False

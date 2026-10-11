@@ -133,6 +133,13 @@ def inspect(now=None):
             if label == 'discovery' and expected and data.get('status') != 'OK': issues.append('Discovery data degraded')
         except Exception: findings.append(label + ' collection evidence missing')
     learning_path = STATE / 'learning.json'
+    try:
+        investor=json.loads((ROOT/'research/investor-evidence/latest.json').read_text())
+        research['investors']=investor
+        if investor.get('execution_enabled') is not False:issues.append('Investor research execution isolation not verified')
+        if investor.get('status')!='OK':research_warnings.append('Investor sources or evaluation degraded')
+        if (now-datetime.fromisoformat(investor['observed_at'])).total_seconds()>1200:research_warnings.append('Investor collection overdue')
+    except (OSError,ValueError,KeyError):research_warnings.append('Investor research evidence missing')
     for label,filename in [('unified_performance','unified-performance.json'),('paper_bridge','paper-bridge.json'),('recovery','recovery.json')]:
         try:
             value=json.loads((STATE/filename).read_text());research[label]=value

@@ -60,6 +60,11 @@ def format_report(status, trial, day, activation=False):
         lines += ['Overlapping observations are not independent trades.',
                   'These exploratory results do not establish a profitable strategy or live readiness.']
     attribution = ((status.get('research') or {}).get('learning_review') or {}).get('attribution') or {}
+    investors=(status.get('research') or {}).get('investors') or {}
+    if investors:
+        counts=investors.get('counts',{})
+        lines.append('Investor research: '+str(counts.get('forecast',0))+' forecasts; '+str(counts.get('outcome',0))+' scored. '+investors.get('status','unknown')+'; observation only.')
+        if investors.get('coverage_notes'):lines.append('Investor coverage: '+str(len(investors['coverage_notes']))+' delayed source(s) excluded from new signals.')
     hub=(status.get('research') or {}).get('hub') or {}
     if hub:
         lab=hub.get('strategy_lab') or {}

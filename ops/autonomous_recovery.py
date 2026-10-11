@@ -9,6 +9,7 @@ from paper_io import Paper,STATE,ROOT,atomic
 
 # Exact commands prevent a changed job configuration inheriting replay permission.
 SAFE={'research-hub':('.', ['research/research_hub.py']),
+      'investor-research':('.', ['research/investor_pipeline.py']),
       'unified-performance':('.', ['ops/unified_performance.py']),
       'perf-tracker':('performance',['tracker.py']),
       'opportunity-replay':('.',['ops/replay_opportunities.py']),
