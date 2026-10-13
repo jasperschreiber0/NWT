@@ -31,6 +31,27 @@ def state(c,key,value=None):
     r=c.execute('SELECT value FROM state WHERE key=?',(key,)).fetchone()
     return json.loads(r[0]) if r else None
 
+def register_version(c,policy,now):
+    """Append a boundary; never rewrite prior policies, evidence or forecasts."""
+    prior=rows(c,'policy')
+    if any(p['version'] not in [core.LEGACY_VERSION,core.VERSION] for p in prior):
+        raise ValueError('Unknown investor evidence version')
+    previous=one(c,'policy',core.VERSION)
+    if previous and previous!=policy:
+        raise ValueError('Frozen investor policy changed: start new evidence version')
+    boundary=dict(version=core.VERSION,effective_at=now.isoformat(),
+        prior_versions=sorted(p['version'] for p in prior if p['version']!=core.VERSION),
+        policy=policy,history='Prior records unchanged; pending forecasts retain their original policy')
+    # One transaction so interruption cannot leave a policy without its boundary.
+    with c:
+        for kind,value in [('version_boundary',boundary),('policy',policy)]:
+            c.execute('INSERT OR IGNORE INTO evidence VALUES (?,?,?)',
+                (kind,core.VERSION,json.dumps(value,sort_keys=True,allow_nan=False)))
+
+def ark_date_valid(day,now):
+    age=(now.astimezone(timezone.utc).date()-datetime.fromisoformat(day).date()).days
+    return 0<=age<=5
+
 class Public:
     def __init__(self,out):
         self.out=out;self.last=0.;self.started=time.monotonic();self.count=0
@@ -157,17 +178,20 @@ def collect_managers(c,public,now):
 def collect_ark(c,public,now):
     result={}
     for fund,filename in ARK.items():
-        previous=state(c,'ark-check:'+fund)
-        if previous and (now-core.stamp(previous['checked_at'])).total_seconds()<3600:
-            result[fund]=previous;continue
+        previous=state(c,'ark-check:'+fund) or {}
+        if previous.get('next_at') and now<core.stamp(previous['next_at']):
+            if previous['status']!='OK' or ark_date_valid(previous['date'],now):
+                result[fund]=previous;continue
+        source=None;value=None
         try:
             url='https://assets.ark-funds.com/fund-documents/funds-etf-csv/'+filename.replace('&','%26')+'_HOLDINGS.csv'
             blob,source=public.get(url);value=core.ark_csv(blob,fund)
-            age=(now.date()-datetime.fromisoformat(value['date']).date()).days
-            if not 0<=age<=5:raise ValueError('ARK snapshot stale or future')
+            if not ark_date_valid(value['date'],now):raise ValueError('ARK snapshot stale or future')
             key=fund+':'+value['date'];old=one(c,'ark',key)
             if old and old['source']['sha256']!=source['sha256']:
                 put(c,'ark_revision',key+':'+source['sha256'],dict(value,source=source))
+                raise ValueError('Same-date ARK revision quarantined')
+            if any(r['fund']==fund and r['date']==value['date'] for r in rows(c,'ark_revision')):
                 raise ValueError('Same-date ARK revision quarantined')
             before=sorted([r for r in rows(c,'ark') if r['fund']==fund and r['date']<value['date']],key=lambda r:r['date'])
             if put(c,'ark',key,dict(value,source=source,first_seen_at=source['observed_at'])) and before:
@@ -176,10 +200,41 @@ def collect_ark(c,public,now):
                     for change in core.ark_changes(before[-1],value):
                         put(c,'ark_change',key+':'+change['symbol'],dict(change,fund=fund,date=value['date'],
                             actor='ARK',first_seen_at=source['observed_at'],source=source))
-            result[fund]=dict(status='OK',checked_at=now.isoformat(),date=value['date'],holdings=len(value['holdings']))
+            result[fund]=dict(status='OK',checked_at=now.isoformat(),date=value['date'],holdings=len(value['holdings']),
+                source=source,failures=0,next_at=(now+timedelta(hours=1)).isoformat())
             state(c,'ark-check:'+fund,result[fund])
-        except Exception as e:result[fund]=dict(status='DEGRADED',error=str(e)[:150])
+        except sqlite3.Error:
+            raise  # Storage failures are job failures, not cached source failures.
+        except Exception as e:
+            failures=int(previous.get('failures',0))+1
+            hours=min(6,2**min(failures-1,3))
+            result[fund]=dict(status='DEGRADED',checked_at=now.isoformat(),
+                date=value['date'] if value else None,source=source,error=str(e)[:150],
+                failures=failures,next_at=(now+timedelta(hours=hours)).isoformat())
+            state(c,'ark-check:'+fund,result[fund])
     return result
+
+def eligible_ark(c,health,calendar,now):
+    """Recheck session eligibility on every cycle, including cached responses."""
+    complete=[s['date'] for s in sessions(calendar) if dt(s['close'])+timedelta(minutes=15)<=now]
+    fresh=[];notes=[]
+    for fund in ARK:
+        value=health.get(fund,{})
+        if (complete and value.get('status')=='OK' and value.get('date')==complete[-1]
+                and ark_date_valid(value['date'],now)):
+            fresh.append(fund)
+        elif value.get('status')=='OK':
+            health[fund]=dict(value,status='DELAYED_CONTEXT_ONLY')
+            notes.append(fund+' dated '+str(value.get('date'))+'; latest completed session '+
+                str(complete[-1] if complete else None)+'; excluded from new signals')
+    state(c,'fresh-ark-funds',fresh)
+    return notes
+
+def finish_report(c,out,report,retryable):
+    """A completed, source-degraded cycle is visible but needs no whole-job retry."""
+    report['retryable']=retryable
+    atomic(out/'latest.json',report);c.close();print(json.dumps(report))
+    if retryable:raise SystemExit(1)
 
 def classify_activists(c,now):
     sys.path.insert(0,str(ROOT/'nwt_agents'))
@@ -262,7 +317,7 @@ def propose(c,now,calendar,allowed,context):
             created+=put(c,'forecast',key,dict(p,key=key,horizon=hold,entry=first['date'],exit=cal[i+hold]['date'],
                 entry_at=first['open'],exit_at=cal[i+hold]['open'],frozen_at=now.isoformat(),execution_enabled=False,
                 baseline='SPY; same-date/symbol single-source controls where available; no-trade return zero',evidence_hash=eventkey,
-                market_context=prices))
+                market_context=prices,policy_version=core.VERSION))
     return created
 
 def market_context(c,paper,calendar,now,allowed):
@@ -307,7 +362,8 @@ def evaluate(c,paper,now):
         value=core.forward_score(p,bars,now)
         if value:
             put(c,'outcome_prices',p['key'],{s:{d:bars[s][d] for d in [p['entry'],p['exit']]} for s in {p['symbol'],'SPY'}})
-            done+=put(c,'outcome',p['key'],dict(value,key=p['key'],rule=p['rule'],symbol=p['symbol'],horizon=p['horizon'],recorded_at=now.isoformat()))
+            done+=put(c,'outcome',p['key'],dict(value,key=p['key'],rule=p['rule'],symbol=p['symbol'],horizon=p['horizon'],
+                policy_version=p.get('policy_version',core.LEGACY_VERSION),recorded_at=now.isoformat()))
     return dict(completed=done,unresolved=len(pending)-done)
 
 def ablations(outcomes):
@@ -338,9 +394,7 @@ def main():
     now=datetime.now(timezone.utc);public=Public(out);health={};issues=[]
     import investor_options
     policy=dict(core.POLICY,code_sha256=hashlib.sha256(Path(__file__).read_bytes()+Path(core.__file__).read_bytes()+Path(investor_options.__file__).read_bytes()).hexdigest())
-    previous=one(c,'policy',core.VERSION)
-    if previous and previous!=policy:raise ValueError('Frozen investor policy changed: start new evidence directory/version')
-    put(c,'policy',core.VERSION,policy)
+    register_version(c,policy,now)
     tickers=state(c,'tickers')
     try:
         if not tickers or (now-core.stamp(tickers['at'])).total_seconds()>86400:
@@ -362,24 +416,20 @@ def main():
         if model.get('status')=='DEGRADED':issues.append('Activist AI classification failed; unclassified filings cannot signal')
         allowed={a['symbol'] for a in assets if a.get('tradable') and a.get('exchange') not in ['OTC','CRYPTO']}
         calendar=paper.get('/v2/calendar',dict(start=(now-timedelta(days=100)).date().isoformat(),end=(now+timedelta(days=60)).date().isoformat()))
-        complete=[s['date'] for s in sessions(calendar) if dt(s['close'])+timedelta(minutes=15)<=now]
-        fresh_funds=[]
-        for fund in ARK:
-            value=health.get(fund,{})
-            if complete and value.get('date')==complete[-1] and value.get('status')=='OK':fresh_funds.append(fund)
-            elif value.get('status')=='OK':
-                health[fund]=dict(value,status='DELAYED_CONTEXT_ONLY')
-                coverage_notes.append(fund+' dated '+str(value.get('date'))+'; latest completed session '+str(complete[-1] if complete else None)+'; excluded from new signals')
-        state(c,'fresh-ark-funds',fresh_funds)
+        coverage_notes.extend(eligible_ark(c,health,calendar,now))
         actual=datetime.now(timezone.utc);context=market_context(c,paper,calendar,actual,allowed)
         actual=datetime.now(timezone.utc);created=propose(c,actual,calendar,allowed,context);scored=evaluate(c,paper,actual)
         option_comparison=investor_options.run(c,paper,datetime.now(timezone.utc),rows,one,put)
         if option_comparison.get('current_errors'):issues.append('Contemporaneous option comparison awaiting quote retry')
         if scored.get('unresolved'):issues.append('Completed-session prices missing for '+str(scored['unresolved'])+' forecasts')
     except Exception as e:issues.append('Market evaluation: '+str(e)[:150])
+    source_issues=[]
     for name,value in health.items():
-        if value['status'] not in ['OK','DELAYED_CONTEXT_ONLY']:issues.append(name+': '+value.get('error','Coverage gap'))
+        if value['status'] not in ['OK','DELAYED_CONTEXT_ONLY']:
+            (source_issues if name in ARK else issues).append(name+': '+value.get('error','Coverage gap'))
     if parsed['errors']:issues.append('Filing documents awaiting retry: '+str(len(parsed['errors'])))
+    retryable=bool(issues)
+    issues+=source_issues
     outcomes=rows(c,'outcome');scoreboard=[]
     for rule,hold in sorted(set((r['rule'],r['horizon']) for r in outcomes)):
         group=[r for r in outcomes if r['rule']==rule and r['horizon']==hold]
@@ -398,7 +448,6 @@ def main():
         execution_enabled=False,sources=health,counts=counts,parsed=parsed,new_forecasts=created,scored=scored,scoreboard=scoreboard,
         issues=issues,model=model,coverage_notes=coverage_notes,source_performance=source_performance,ablations=ablations(outcomes),option_comparison=option_comparison,poll_target_minutes=5,latency='First-seen and publication times retained; five-minute schedule is a target, not guaranteed latency',
         verdict='PROSPECTIVE_RESEARCH_ONLY',policy=policy)
-    atomic(out/'latest.json',report);c.close();print(json.dumps(report))
-    if issues:raise SystemExit(1)
+    finish_report(c,out,report,retryable)
 
 if __name__=='__main__':main()
