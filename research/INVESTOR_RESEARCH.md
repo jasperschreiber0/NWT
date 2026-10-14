@@ -41,7 +41,7 @@ cohort comparisons are evidence only. No automatic capital weighting or qualific
 
 Stock-versus-options comparisons collect contemporaneous quotes within 20 minutes of
 the frozen entry and exit opens. Bull put and bull call verticals use $1/$2 widths,
-21-45 days to expiry, expiry at least seven days beyond the forecast exit, and <=$100
+21–45 days to expiry, expiry at least seven days beyond the forecast exit, and <=$100
 modeled maximum loss including assumed fees. Equity comparisons use <=$500 entry cost.
 Different exposures are explicit; these are BBO estimates, not fills or account returns.
 Missing quotes, infeasible spreads and missed windows are counted, never filled from
