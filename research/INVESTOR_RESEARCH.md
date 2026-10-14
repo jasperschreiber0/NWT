@@ -53,5 +53,33 @@ Changes require a new evidence version/directory; do not overwrite the old exper
 The daily report includes counts and coverage limitations. Research-source failures are
 isolated from unrelated paper trading, while broker reconciliation remains mandatory.
 
+## Source backoff boundary: investor-observation-20261013-v2
+
+This version appends a policy and `version_boundary` record in the existing SQLite
+store, in one transaction. Existing v1 policies, source evidence, first-seen times,
+forecasts and outcomes remain unchanged. New forecasts carry `policy_version`; pending
+v1 forecasts continue evaluation with v1 lineage. Signal and scoring rules are unchanged.
+The first actual v2 run records the boundary time. A different code hash under the same
+v2 version still fails closed. Do not delete history or change its frozen policy to upgrade.
+
+Each ARK fund persists its latest check, observed date, source hash, failure count and
+`next_at`. Failed checks back off for 1, 2, 4, then at most 6 hours; healthy checks refresh
+hourly. Failure state remains visible during backoff. Cached successes are rechecked at
+UTC date boundaries, and every cycle rechecks the exchange-calendar session gate.
+Snapshots older than five calendar days or in the future remain excluded. Only holdings
+from the latest completed exchange session (close plus 15 minutes) can generate signals.
+Same-date revisions remain quarantined even if the original bytes later reappear.
+
+A completed cycle with only ARK-source failures writes `status=DEGRADED` and
+`retryable=false`, then exits zero: the scheduler records completed work without replaying
+the entire collector three times. The watchdog still warns on the degraded report.
+Healthy funds, other sources and pending outcome evaluation continue. Storage failures,
+market-evaluation failures and other retryable failures still exit nonzero. This does not
+change the scheduler, trading controls, source cadence for other sources, or model budgets.
+
+Validation adds `research/test_investor_backoff.py`, including a real SQLite boundary,
+legacy-outcome continuation, per-fund cache recovery and a mocked-child scheduler test.
+Publication does not activate this version; deployment requires separate authorization.
+
 Validation: `python3 -m pytest -q research/test_investors.py`; the release validation
 script also runs the existing trading and operations regressions against an isolated DB.

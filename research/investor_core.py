@@ -5,7 +5,8 @@ from urllib.parse import urljoin,urlparse
 from xml.etree import ElementTree as ET
 
 UTC=timezone.utc
-VERSION='investor-observation-20261011-v1'
+LEGACY_VERSION='investor-observation-20261011-v1'
+VERSION='investor-observation-20261013-v2'
 POLICY=dict(version=VERSION,minimum_purchase=25000,cluster_total=100000,cluster_owners=2,
     cluster_days=7,hold_sessions=[5,20],cost_per_side=.0015,stress_per_side=.003,
     minimum_stock_price=5,minimum_average_dollar_volume20=5000000,agreement_max_last_session_move=.03,
