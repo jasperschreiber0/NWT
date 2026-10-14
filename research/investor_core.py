@@ -3,10 +3,12 @@ import csv,io,hashlib,json,math,re,statistics
 from datetime import datetime,timedelta,timezone
 from urllib.parse import urljoin,urlparse
 from xml.etree import ElementTree as ET
+from investor_diagnostics import ResearchValidationError
 
 UTC=timezone.utc
 LEGACY_VERSION='investor-observation-20261011-v1'
-VERSION='investor-observation-20261013-v2'
+PREVIOUS_VERSION='investor-observation-20261013-v2'
+VERSION='investor-observation-20261014-v3'
 POLICY=dict(version=VERSION,minimum_purchase=25000,cluster_total=100000,cluster_owners=2,
     cluster_days=7,hold_sessions=[5,20],cost_per_side=.0015,stress_per_side=.003,
     minimum_stock_price=5,minimum_average_dollar_volume20=5000000,agreement_max_last_session_move=.03,
@@ -123,12 +125,12 @@ def holdings13f(blob):
 
 def validate_catalyst(value,purpose):
     actions=['board_change','capital_return','restructuring','transaction','none']
-    if type(value.get('action_present')) is not bool or value.get('action') not in actions or value.get('direction') not in ['up','down','uncertain']:
-        raise ValueError('Invalid activist classification')
+    if not isinstance(value,dict) or type(value.get('action_present')) is not bool or value.get('action') not in actions or value.get('direction') not in ['up','down','uncertain']:
+        raise ResearchValidationError('CLASSIFICATION_SCHEMA')
     quote=value.get('evidence_quote','')
     if not isinstance(quote,str) or not 10<=len(quote)<=1200 or quote not in purpose:
-        raise ValueError('Activist classification lacks exact source evidence')
-    if value['action_present'] and value['action']=='none':raise ValueError('Inconsistent action')
+        raise ResearchValidationError('CLASSIFICATION_SOURCE_QUOTE')
+    if value['action_present'] and value['action']=='none':raise ResearchValidationError('CLASSIFICATION_ACTION')
     return dict(action_present=value['action_present'],action=value['action'],direction=value['direction'],
         evidence_quote=quote,label='GROUNDED_MODEL_HYPOTHESIS_NOT_VERIFIED_OUTCOME')
 

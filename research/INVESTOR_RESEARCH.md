@@ -41,7 +41,7 @@ cohort comparisons are evidence only. No automatic capital weighting or qualific
 
 Stock-versus-options comparisons collect contemporaneous quotes within 20 minutes of
 the frozen entry and exit opens. Bull put and bull call verticals use $1/$2 widths,
-21–45 days to expiry, expiry at least seven days beyond the forecast exit, and <=$100
+21-45 days to expiry, expiry at least seven days beyond the forecast exit, and <=$100
 modeled maximum loss including assumed fees. Equity comparisons use <=$500 entry cost.
 Different exposures are explicit; these are BBO estimates, not fills or account returns.
 Missing quotes, infeasible spreads and missed windows are counted, never filled from
@@ -83,3 +83,41 @@ Publication does not activate this version; deployment requires separate authori
 
 Validation: `python3 -m pytest -q research/test_investors.py`; the release validation
 script also runs the existing trading and operations regressions against an isolated DB.
+
+## Diagnostic boundary: investor-observation-20261014-v3
+
+This additive version accepts the frozen v1/v2 policy records and appends its own
+boundary on the first actual run. Earlier evidence and pending forecast lineage are
+not rewritten. The diagnostic module is included in the frozen code hash. Publishing
+or merging this code does not authorize server deployment or a forced research run.
+
+Classification failures now include allowlisted `stage`, `reason`, and `error`
+category fields in new `model_error` records and the latest report. Validation reasons
+distinguish schema, exact source-quote and action-consistency failures. Option entry
+diagnostics distinguish quote validation, repeated pagination and chain-budget limits;
+other failures retain their stage and a bounded generic category. Exception text,
+dynamic exception class names, provider responses, prompts and credentials are never
+copied into these diagnostics. An unknown ValueError remains `INVALID_VALUE`; it is
+not assigned a speculative cause. SQLite failures still fail the cycle.
+
+`classification_coverage` reports classified and unclassified totals, current pending
+work, cooldown, ready, budget-blocked, expired, missing-purpose, historical-exclusion
+and unresolved-with-error counts. `budget_blocked` can overlap `cooldown`; these are
+constraints, not additive buckets. `EXCLUDED_ONLY` is explicit when all remaining
+unclassified records are outside the existing eligibility rules. No exclusion is
+converted into a classification or verified outcome. Old type-only error records
+remain usable for unresolved counts without modifying their payloads.
+
+Current pending classifications add an issue and make the report `DEGRADED`, even if
+the cycle exits zero because only scheduled/cooldown/budget-limited work remains.
+Coverage alone does not request whole-job retries. Actual classification, market and
+option failures still request retries and exit nonzero. The daily 20-attempt limit,
+one-hour filing cooldown, freshness and grounding gates, option request/window limits,
+paper-only controls and trial adjudication policy are unchanged. No model switch or
+extra API request is introduced by computing coverage.
+
+Regressions: `research/test_investor_diagnostics.py` covers the observed ValueError
+classes, secret-bearing exceptions, persisted unresolved work, the last budget attempt,
+midnight cooldown, option recovery and unknown outcomes, v1/v2 preservation, and complete
+cycles whose exit status differs from research-coverage health. Run alongside the
+existing investor/backoff suites and the full Linux/PostgreSQL CI suite.

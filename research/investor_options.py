@@ -2,7 +2,8 @@
 
 Models only. Broker GET access; no tickets, orders, positions or cash mutation.
 """
-import math
+import math,sqlite3
+from investor_diagnostics import ResearchValidationError,failure
 from datetime import datetime,timedelta,timezone
 from option_theories import choose,value
 from event_core import quote_check
@@ -11,7 +12,7 @@ from investor_core import stamp,digest
 VERSION='investor-option-comparison-v1'
 
 def choose_book(chain,quote,forecast,observed):
-    if quote_check(quote,observed,max_age=120,max_spread=.01)!='OK':raise ValueError('Equity quote unavailable or untradeable')
+    if quote_check(quote,observed,max_age=120,max_spread=.01)!='OK':raise ResearchValidationError('EQUITY_QUOTE_UNTRADEABLE')
     spot=(float(quote['bp'])+float(quote['ap']))/2
     minimum=datetime.fromisoformat(forecast['exit']).date()+timedelta(days=7)
     filtered={}
@@ -60,8 +61,10 @@ def run(c,paper,now,rows,one,put):
             continue
         if processed>=3:break
         processed+=1
+        stage='option_equity_quote'
         try:
             q=paper.get('/v2/stocks/'+pred['symbol']+'/quotes/latest',dict(feed='sip'),data=True)['quote']
+            stage='option_chain'
             params=dict(feed='opra',limit=1000,root_symbol=pred['symbol'])
             if book:
                 contracts=sorted({s['pair'][leg] for s in book['spreads'] for leg in ['short','long']})
@@ -79,22 +82,28 @@ def run(c,paper,now,rows,one,put):
                     response=paper.get('/v1beta1/options/snapshots/'+pred['symbol'],params,data=True)
                     chain.update(response.get('snapshots') or {});token=response.get('next_page_token')
                     if not token:break
-                    if token in seen:raise ValueError('Repeated option pagination')
+                    if token in seen:raise ResearchValidationError('OPTION_PAGINATION_REPEATED')
                     seen.add(token)
-                if token:raise ValueError('Option chain exceeds research budget')
+                if token:raise ResearchValidationError('OPTION_CHAIN_BUDGET')
             observed=datetime.now(timezone.utc)
             if observed>at+timedelta(minutes=20):continue
             if book:
+                stage='option_valuation'
                 closed=close_book(book,chain,q,observed)
                 if closed:
+                    stage='option_storage'
                     put(c,'option_exit_quote_evidence',key,dict(chain=chain,quote=q,observed_at=observed.isoformat()))
                     put(c,'option_result',key,dict(closed,state='COMPLETE'))
             else:
+                stage='option_selection'
                 entry=choose_book(chain,q,pred,observed)
+                stage='option_storage'
                 put(c,'option_quote_evidence',key,dict(chain=chain,quote=q,observed_at=observed.isoformat()))
                 put(c,'option_book',key,dict(entry,version=VERSION))
+        except sqlite3.Error:
+            raise
         except Exception as e:
-            errors.append(dict(forecast=key,error=type(e).__name__))
+            errors.append(dict(forecast=key,**failure(stage,e)))
     result=rows(c,'option_result')
     books=rows(c,'option_book')
     return dict(version=VERSION,books=len(books),books_with_options=sum(bool(b['spreads']) for b in books),

@@ -6,6 +6,7 @@ from urllib.parse import urljoin,urlparse,urlencode
 import requests
 from bs4 import BeautifulSoup
 import investor_core as core
+import investor_diagnostics as diagnostics
 from event_core import sessions,dt
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -34,7 +35,7 @@ def state(c,key,value=None):
 def register_version(c,policy,now):
     """Append a boundary; never rewrite prior policies, evidence or forecasts."""
     prior=rows(c,'policy')
-    if any(p['version'] not in [core.LEGACY_VERSION,core.VERSION] for p in prior):
+    if any(p['version'] not in [core.LEGACY_VERSION,core.PREVIOUS_VERSION,core.VERSION] for p in prior):
         raise ValueError('Unknown investor evidence version')
     previous=one(c,'policy',core.VERSION)
     if previous and previous!=policy:
@@ -257,18 +258,54 @@ def classify_activists(c,now):
             'action board_change/capital_return/restructuring/transaction/none, direction up/down/uncertain as a tentative stock-price hypothesis, '
             'and evidence_quote containing an exact contiguous 10-1200 character source passage supporting the classification, including relevant negation. '
             'Do not invent likelihood, price targets, outside facts, or management commitments.\nSOURCE:\n'+p['purpose'])
+        stage='classification_request'
         try:
             answer,ti,to=call_json(prompt,core.POLICY['activist_model'],dict,component='investor_research')
+            stage='classification_validation'
             result=core.validate_catalyst(answer,p['purpose'])
+            stage='classification_storage'
             put(c,'classification',p['event_id'],dict(result,classified_at=datetime.now(timezone.utc).isoformat(),
                 historical_context_only=historical,input_tokens=ti,output_tokens=to,model=core.POLICY['activist_model'],
                 source_sha256=p['source']['sha256']))
             if historical:state(c,'model-baseline-sample',p['event_id'])
             return dict(attempts_today=budget,status='OK')
+        except sqlite3.Error:
+            raise
         except Exception as e:
-            put(c,'model_error',p['event_id']+':'+now.isoformat(),dict(error=type(e).__name__,attempt=budget))
-            return dict(attempts_today=budget,status='DEGRADED',error=type(e).__name__)
+            detail=diagnostics.failure(stage,e)
+            put(c,'model_error',p['event_id']+':'+now.isoformat(),dict(detail,attempt=budget))
+            return dict(attempts_today=budget,status='DEGRADED',**detail)
     return dict(attempts_today=budget,status='OK')
+
+def classification_coverage(c,now):
+    """Report unresolved work without spending, changing retry state or relaxing gates."""
+    values=rows(c,'activist')
+    classified={r[0] for r in c.execute("SELECT key FROM evidence WHERE kind='classification'")}
+    error_keys=[r[0] for r in c.execute("SELECT key FROM evidence WHERE kind='model_error'")]
+    counts=dict(total=len(values),classified=0,unclassified=0,pending=0,cooldown=0,
+        ready=0,budget_blocked=0,expired=0,missing_purpose=0,historical_excluded=0,
+        unresolved_with_errors=0)
+    budget=state(c,'model-budget:'+now.date().isoformat()) or 0
+    exhausted=budget>=core.POLICY['maximum_model_attempts_per_day']
+    for p in values:
+        key=p['event_id']
+        if key in classified:counts['classified']+=1;continue
+        counts['unclassified']+=1
+        if not p['purpose']:counts['missing_purpose']+=1;continue
+        if p['baseline'] and state(c,'model-baseline-sample'):
+            counts['historical_excluded']+=1;continue
+        if not p['baseline'] and (now-core.stamp(p['first_seen_at'])).total_seconds()>2*86400:
+            counts['expired']+=1;continue
+        counts['pending']+=1
+        if any(e.startswith(key+':') for e in error_keys):counts['unresolved_with_errors']+=1
+        attempt=state(c,'classification-attempt:'+key)
+        cooling=attempt and (now-core.stamp(attempt)).total_seconds()<3600
+        if cooling:counts['cooldown']+=1
+        if exhausted:counts['budget_blocked']+=1
+        elif not cooling:counts['ready']+=1
+    return dict(counts,status='INCOMPLETE' if counts['pending'] else ('EXCLUDED_ONLY' if counts['unclassified'] else 'COMPLETE'),
+        attempts_today=budget,attempt_limit=core.POLICY['maximum_model_attempts_per_day'],
+        budget_exhausted=exhausted)
 
 def candidates(c,now):
     candidates=[]
@@ -393,7 +430,7 @@ def main():
     c.execute('CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT)');c.commit()
     now=datetime.now(timezone.utc);public=Public(out);health={};issues=[]
     import investor_options
-    policy=dict(core.POLICY,code_sha256=hashlib.sha256(Path(__file__).read_bytes()+Path(core.__file__).read_bytes()+Path(investor_options.__file__).read_bytes()).hexdigest())
+    policy=dict(core.POLICY,code_sha256=hashlib.sha256(Path(__file__).read_bytes()+Path(core.__file__).read_bytes()+Path(investor_options.__file__).read_bytes()+Path(diagnostics.__file__).read_bytes()).hexdigest())
     register_version(c,policy,now)
     tickers=state(c,'tickers')
     try:
@@ -409,7 +446,7 @@ def main():
     except Exception as e:
         issues.append(str(e)[:150]);parsed=dict(parsed=0,backlog=None,errors=[])
     created=0;scored={};coverage_notes=[];option_comparison={}
-    model={}
+    model={};evaluation_diagnostic=None
     try:
         paper=Paper();assets=paper.get('/v2/assets',dict(status='active',asset_class='us_equity'))
         model=classify_activists(c,now)
@@ -422,7 +459,9 @@ def main():
         option_comparison=investor_options.run(c,paper,datetime.now(timezone.utc),rows,one,put)
         if option_comparison.get('current_errors'):issues.append('Contemporaneous option comparison awaiting quote retry')
         if scored.get('unresolved'):issues.append('Completed-session prices missing for '+str(scored['unresolved'])+' forecasts')
-    except Exception as e:issues.append('Market evaluation: '+str(e)[:150])
+    except Exception as e:
+        evaluation_diagnostic=diagnostics.failure('market_evaluation',e)
+        issues.append('Market evaluation failed: '+evaluation_diagnostic['reason'])
     source_issues=[]
     for name,value in health.items():
         if value['status'] not in ['OK','DELAYED_CONTEXT_ONLY']:
@@ -430,6 +469,9 @@ def main():
     if parsed['errors']:issues.append('Filing documents awaiting retry: '+str(len(parsed['errors'])))
     retryable=bool(issues)
     issues+=source_issues
+    coverage=classification_coverage(c,now)
+    if coverage['pending']:
+        issues.append('Classification coverage incomplete: '+str(coverage['pending'])+' pending')
     outcomes=rows(c,'outcome');scoreboard=[]
     for rule,hold in sorted(set((r['rule'],r['horizon']) for r in outcomes)):
         group=[r for r in outcomes if r['rule']==rule and r['horizon']==hold]
@@ -445,8 +487,8 @@ def main():
         status='Evidence only; no fame-based or automatic capital weighting') for (a,h),values in sorted(actors.items())]
     counts={k:n for k,n in c.execute('SELECT kind,COUNT(*) FROM evidence GROUP BY kind')}
     report=dict(version=core.VERSION,observed_at=datetime.now(timezone.utc).isoformat(),status='DEGRADED' if issues else 'OK',
-        execution_enabled=False,sources=health,counts=counts,parsed=parsed,new_forecasts=created,scored=scored,scoreboard=scoreboard,
-        issues=issues,model=model,coverage_notes=coverage_notes,source_performance=source_performance,ablations=ablations(outcomes),option_comparison=option_comparison,poll_target_minutes=5,latency='First-seen and publication times retained; five-minute schedule is a target, not guaranteed latency',
+        execution_enabled=False,sources=health,counts=counts,parsed=parsed,new_forecasts=created,scored=scored,scoreboard=scoreboard,evaluation_diagnostic=evaluation_diagnostic,
+        issues=issues,model=model,classification_coverage=coverage,coverage_notes=coverage_notes,source_performance=source_performance,ablations=ablations(outcomes),option_comparison=option_comparison,poll_target_minutes=5,latency='First-seen and publication times retained; five-minute schedule is a target, not guaranteed latency',
         verdict='PROSPECTIVE_RESEARCH_ONLY',policy=policy)
     finish_report(c,out,report,retryable)
 
