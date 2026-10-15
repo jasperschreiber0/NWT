@@ -41,7 +41,7 @@ cohort comparisons are evidence only. No automatic capital weighting or qualific
 
 Stock-versus-options comparisons collect contemporaneous quotes within 20 minutes of
 the frozen entry and exit opens. Bull put and bull call verticals use $1/$2 widths,
-21–45 days to expiry, expiry at least seven days beyond the forecast exit, and <=$100
+21â€“45 days to expiry, expiry at least seven days beyond the forecast exit, and <=$100
 modeled maximum loss including assumed fees. Equity comparisons use <=$500 entry cost.
 Different exposures are explicit; these are BBO estimates, not fills or account returns.
 Missing quotes, infeasible spreads and missed windows are counted, never filled from
@@ -121,3 +121,7 @@ classes, secret-bearing exceptions, persisted unresolved work, the last budget a
 midnight cooldown, option recovery and unknown outcomes, v1/v2 preservation, and complete
 cycles whose exit status differs from research-coverage health. Run alongside the
 existing investor/backoff suites and the full Linux/PostgreSQL CI suite.
+
+## October 15 model migration candidate
+
+The v4 candidate appends a model-version boundary for GPT-6 Luna, preserves v1/v2/v3 evidence and existing daily counters, and records per-response usage before classification validation. Activation is pending quality and full-environment validation; see [MODEL-MIGRATION.md](../MODEL-MIGRATION.md).

@@ -6,7 +6,7 @@ from urllib.parse import urljoin,urlparse
 from event_core import *
 
 ROOT=Path(__file__).resolve().parents[1];OUT=ROOT/'research/event-evidence'
-VERSION='GLOBAL-EVENT-OBS-v1'
+VERSION='GLOBAL-EVENT-OBS-v2-luna'
 
 def main():
     import requests
@@ -102,7 +102,9 @@ def main():
     put(c,'source_health',now.isoformat(),health)
     # Budget attempts before calling the provider, including failures/crashes.
     sys.path.insert(0,str(ROOT/'nwt_agents'))
-    from openai_client import call_json
+    from openai_client import call_json, DEFAULT_MODEL, model_policy
+    register_model_boundary(c,VERSION,dict(model_policy(DEFAULT_MODEL),
+        client_sha256=hashlib.sha256((ROOT/'nwt_agents/openai_client.py').read_bytes()).hexdigest()),now.isoformat())
     os.environ['OPENAI_API_KEY']=v.get('OPENAI_API_KEY','')
     day=now.date().isoformat();attempts=int(state(c,'model_attempts:'+day) or 0)
     pending=c.execute("SELECT e.* FROM records e LEFT JOIN records a ON a.kind='classification' AND a.key=e.key WHERE e.kind='event' AND a.key IS NULL ORDER BY e.observed_at DESC").fetchall()
@@ -126,10 +128,10 @@ def main():
         try:
             import psycopg2
             conn=psycopg2.connect(v['NWT_DB_DSN'])
-            answer,ti,to=call_json(prompt,'gpt-4.1-mini-2025-04-14',dict,conn=conn,component='global_event_observer')
+            answer,ti,to=call_json(prompt,DEFAULT_MODEL,dict,conn=conn,component='global_event_observer')
             classified=validate_classification(answer,text)
-            classified.update(provider='openai',model='gpt-4.1-mini-2025-04-14',input_tokens=ti,output_tokens=to,
-                version=VERSION,classified_at=stamp(),historical_context_only=not e['prospective_eligible'],
+            classified.update(provider='openai',model=DEFAULT_MODEL,input_tokens=ti,output_tokens=to,
+                version=VERSION,model_policy=model_policy(DEFAULT_MODEL),classified_at=stamp(),historical_context_only=not e['prospective_eligible'],
                 timing_basis=e.get('timing_basis','PUBLICATION_TIMESTAMP'))
             put(c,'classification',row['key'],classified)
             if historical_sample:setstate(c,'historical_sample',row['key'])
@@ -153,11 +155,12 @@ def main():
             for impact in classification['impacts']:
                 symbol=impact['symbol'];key=row['key']+':'+symbol
                 put(c,'event_watch',key,{'event_id':row['key'],'symbol':symbol,'first_session':future[0],
-                    'version':VERSION,'reversal_threshold':.02,'volume_multiple':1.5,'consensus':None,'surprise':None,
+                    **classification_lineage(classification),'version':VERSION,'reversal_threshold':.02,'volume_multiple':1.5,'consensus':None,'surprise':None,
                     'timing_basis':classification.get('timing_basis','PUBLICATION_TIMESTAMP')},stamp())
                 if impact['direction']=='uncertain':continue
                 pred=make_prediction(row['key'],symbol,'delayed_reaction_v1',1 if impact['direction']=='up' else -1,future[0],future[1],datetime.now(UTC))
                 if pred:
+                    pred.update(classification_lineage(classification))
                     pred['timing_basis']=classification.get('timing_basis','PUBLICATION_TIMESTAMP')
                     put(c,'prediction',key+':delayed',pred,pred['frozen_at'])
             if not classification['impacts']:put(c,'no_prediction',row['key'],{'reason':'NO_GROUNDED_DIRECTION_OR_INSTRUMENT'})
@@ -189,6 +192,7 @@ def main():
                 for rule,side,horizon in [('overreaction_reversal_v1',-direction,1),('persistent_repricing_proxy_v1',direction,5)]:
                     pred=make_prediction(watch['event_id'],symbol,rule,side,later[0],later[horizon],datetime.now(UTC))
                     if pred:
+                        pred.update(classification_lineage(watch))
                         pred['timing_basis']=watch.get('timing_basis','PUBLICATION_TIMESTAMP')
                         put(c,'prediction',row['key']+':'+rule,pred,pred['frozen_at'])
             setstate(c,'activated:'+row['key'],stamp())
