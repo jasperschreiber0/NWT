@@ -111,3 +111,20 @@ def score(prediction,bars,spy,now):
     return dict(return_pct=100*net,matched_direction_spy_pct=100*benchmark,excess_pct=100*(net-benchmark),
         won=net>0,entry_open=a,exit_open=b,short_borrow_not_simulated=direction<0,
         label='HYPOTHETICAL_UNDERLYING_RETURN_NOT_BROKER_PNL')
+
+
+def classification_lineage(value):
+    """Missing historical metadata stays explicitly unknown, never relabelled."""
+    return {"classification_version": value.get("classification_version", value.get("version")),
+            "classification_model": value.get("classification_model", value.get("model")),
+            "model_policy": value.get("model_policy")}
+
+
+def register_model_boundary(c, version, policy, now):
+    row = c.execute("SELECT payload FROM records WHERE kind='model_version_boundary' AND key=?", (version,)).fetchone()
+    if row:
+        if json.loads(row[0])["policy"] != policy:
+            raise ValueError("Frozen event model policy changed without a new version")
+        return
+    put(c, "model_version_boundary", version, dict(policy=policy,effective_at=now,
+        prior_version="GLOBAL-EVENT-OBS-v1",history="Prior records and budgets unchanged"),now)

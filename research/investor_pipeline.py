@@ -35,7 +35,7 @@ def state(c,key,value=None):
 def register_version(c,policy,now):
     """Append a boundary; never rewrite prior policies, evidence or forecasts."""
     prior=rows(c,'policy')
-    if any(p['version'] not in [core.LEGACY_VERSION,core.PREVIOUS_VERSION,core.VERSION] for p in prior):
+    if any(p['version'] not in [core.LEGACY_VERSION,core.PREVIOUS_VERSION,core.DIAGNOSTIC_VERSION,core.VERSION] for p in prior):
         raise ValueError('Unknown investor evidence version')
     previous=one(c,'policy',core.VERSION)
     if previous and previous!=policy:
@@ -260,13 +260,14 @@ def classify_activists(c,now):
             'Do not invent likelihood, price targets, outside facts, or management commitments.\nSOURCE:\n'+p['purpose'])
         stage='classification_request'
         try:
-            answer,ti,to=call_json(prompt,core.POLICY['activist_model'],dict,component='investor_research')
+            answer,ti,to=call_json(prompt,core.POLICY['activist_model'],dict,component='investor_research',
+                usage_sink=lambda usage: put(c,'model_usage',p['event_id']+':'+now.isoformat(),usage))
             stage='classification_validation'
             result=core.validate_catalyst(answer,p['purpose'])
             stage='classification_storage'
             put(c,'classification',p['event_id'],dict(result,classified_at=datetime.now(timezone.utc).isoformat(),
                 historical_context_only=historical,input_tokens=ti,output_tokens=to,model=core.POLICY['activist_model'],
-                source_sha256=p['source']['sha256']))
+                source_sha256=p['source']['sha256'],policy_version=core.VERSION,model_epoch=core.POLICY['model_epoch']))
             if historical:state(c,'model-baseline-sample',p['event_id'])
             return dict(attempts_today=budget,status='OK')
         except sqlite3.Error:
@@ -354,7 +355,9 @@ def propose(c,now,calendar,allowed,context):
             created+=put(c,'forecast',key,dict(p,key=key,horizon=hold,entry=first['date'],exit=cal[i+hold]['date'],
                 entry_at=first['open'],exit_at=cal[i+hold]['open'],frozen_at=now.isoformat(),execution_enabled=False,
                 baseline='SPY; same-date/symbol single-source controls where available; no-trade return zero',evidence_hash=eventkey,
-                market_context=prices,policy_version=core.VERSION))
+                market_context=prices,policy_version=core.VERSION,
+                classification_models={event: {k: classification.get(k) for k in ("model","model_epoch","policy_version")}
+                    for event in p["events"] if (classification := one(c,"classification",event))}))
     return created
 
 def market_context(c,paper,calendar,now,allowed):
@@ -430,7 +433,7 @@ def main():
     c.execute('CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT)');c.commit()
     now=datetime.now(timezone.utc);public=Public(out);health={};issues=[]
     import investor_options
-    policy=dict(core.POLICY,code_sha256=hashlib.sha256(Path(__file__).read_bytes()+Path(core.__file__).read_bytes()+Path(investor_options.__file__).read_bytes()+Path(diagnostics.__file__).read_bytes()).hexdigest())
+    policy=dict(core.POLICY,code_sha256=hashlib.sha256(Path(__file__).read_bytes()+Path(core.__file__).read_bytes()+Path(investor_options.__file__).read_bytes()+Path(diagnostics.__file__).read_bytes()+(ROOT/"nwt_agents/openai_client.py").read_bytes()).hexdigest())
     register_version(c,policy,now)
     tickers=state(c,'tickers')
     try:

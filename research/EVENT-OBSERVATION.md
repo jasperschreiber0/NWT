@@ -25,3 +25,7 @@ The official-source polling service is independent of trading halts and runs eve
 Validation: test_event_observation.py checks baseline/future exclusion, immutable first-seen data, grounded classification, invalid/stale quotes, pre-open freezing, signed returns and costs, RSS/Atom parsing, independent China observations, disabled execution and no selection while closed. Run with python3 -m unittest discover -s research -p test_event_observation.py. The installed scripts also compile before deployment. Real observations do not establish profitable predictions; forward outcomes require subsequent market sessions.
 
 Source directories: https://www.federalreserve.gov/feeds/feeds.htm ; https://www.ecb.europa.eu/home/html/rss.en.html ; https://www.bankofengland.co.uk/rss ; https://www.rba.gov.au/rss/ ; https://www.bls.gov/feed/ ; https://www.stats.gov.cn/wzgl/rss/202305/t20230519_1939842.html ; https://english.www.gov.cn/policies/latestreleases/ ; https://www.abs.gov.au/media-centre/media-releases ; https://www.sec.gov/about/rss-feeds . Use latest.json for actual connectivity, not the presence of a source in this list.
+
+## October 15 model migration candidate
+
+GLOBAL-EVENT-OBS-v2-luna uses GPT-6 Luna with an additive frozen model boundary. Existing classifications, budgets and forecasts remain intact; new forecasts retain the originating classification's model/version. Activation is pending validation; see [MODEL-MIGRATION.md](../MODEL-MIGRATION.md).

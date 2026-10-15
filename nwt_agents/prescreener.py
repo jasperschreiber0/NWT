@@ -17,7 +17,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from openai_client import call_json
+from openai_client import call_json, DEFAULT_MODEL, model_policy
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -37,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger("prescreener")
 
 AGENTS_DIR = Path(os.environ.get("NWT_AGENTS_DIR", Path(__file__).parent))
-PRESCREENER_MODEL = os.environ.get("OPENAI_PRESCREENER_MODEL", "gpt-4.1-mini-2025-04-14")
+PRESCREENER_MODEL = os.environ.get("OPENAI_PRESCREENER_MODEL", DEFAULT_MODEL)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +209,7 @@ def main() -> None:
 
         # Enrich with layer0 data for downstream consumers
         for item in passed:
+            item["model_policy"] = model_policy(PRESCREENER_MODEL)
             sym = item["symbol"]
             if sym in symbols_data:
                 item["layer0"] = symbols_data[sym]
@@ -228,6 +229,7 @@ def main() -> None:
                 "filtered_hard": [f["symbol"] for f in filtered_out],
                 "provider": "openai",
                 "model": PRESCREENER_MODEL,
+                "model_policy": model_policy(PRESCREENER_MODEL),
             },
         )
 
