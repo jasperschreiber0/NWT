@@ -67,14 +67,10 @@ def fetch_unprocessed_closed_positions(conn) -> list:
     """
     Return closed positions NOT yet in nwt_trade_outcomes.
 
-    Matches on position_id — the mandatory, unambiguous FK (CLAUDE.md's own
-    documented gotcha: "fuzzy symbol/time attribution is a bug"). The old
-    entry_time+symbol+direction match false-positives whenever two rows
-    share those three fields — two unrelated same-day, same-direction
-    trades on the same symbol collide and one silently never gets an
-    outcome row written. Legacy rows written before position_id existed
-    (OR branch) still match the old fuzzy way, once, so they aren't
-    reprocessed either.
+    Exact position identity only. Require an entry snapshot so this worker
+    never performs an implicit historical backfill. Existing raw history is
+    preserved separately; missing legacy position IDs cannot block new trades
+    through a same-symbol/time guess.
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(

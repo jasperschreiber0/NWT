@@ -631,8 +631,10 @@ def link_decision_outcome(conn, ticket_id: str, outcome_id: str) -> None:
                 WHERE ticket_id = %s AND outcome_id IS NULL
                   AND (SELECT count(*) FROM nwt_decision_inputs d WHERE d.ticket_id=nwt_decision_inputs.ticket_id)=1
                   AND (SELECT count(*) FROM nwt_entry_evidence e WHERE e.decision_id=nwt_decision_inputs.id AND e.eligible)=1
+                  AND EXISTS (SELECT 1 FROM nwt_trade_outcomes o JOIN nwt_entry_evidence e ON e.position_id=o.position_id
+                              WHERE o.id=%s AND e.decision_id=nwt_decision_inputs.id AND e.eligible)
                 """,
-                (outcome_id, ticket_id),
+                (outcome_id, ticket_id, outcome_id),
             )
         conn.commit()
     except Exception as exc:
