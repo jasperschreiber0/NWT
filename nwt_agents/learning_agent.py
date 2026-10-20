@@ -438,9 +438,8 @@ def record_closed_outcome(conn, pos, *, commit=True):
     bot_source = pos.get("bot_source", "")
     ledger_ticket_id = pos.get("ticket_id")
 
-    if entry_price <= 0 or exit_price <= 0:
-        logger.warning("Skipping position %s — missing entry/exit price", position_id)
-        return False
+    if not all(math.isfinite(p) and p > 0 for p in (entry_price, exit_price)):
+        raise ValueError("Missing or invalid entry/exit price for " + position_id)
 
     # PnL computation
     if direction == "long":
