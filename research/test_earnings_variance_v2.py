@@ -82,12 +82,12 @@ def test_admission_deadline_and_discovery_lag(experiment,hours,status):
 
 
 def test_duplicate_and_correction_do_not_resurrect_event(experiment):
-    x=experiment;admit(x);x[1][0]+=timedelta(hours=1);x[5]['first_seen_at']=x[1][0].isoformat()
+    x=experiment;admit(x);x[1][0]+=timedelta(hours=1)
     assert admit(x)['status']=='DUPLICATE'
     x[1][0]+=timedelta(hours=1);x[5].update(first_seen_at=x[1][0].isoformat(),source_sha256='amended',correction_kind='financial_figures_changed',form='8-K/A')
     assert admit(x)['status']=='INVALIDATED_CORRECTION'
     assert not ev.census(x[0])[0]
-    x[1][0]+=timedelta(hours=1);x[5]['first_seen_at']=x[1][0].isoformat()
+    x[1][0]+=timedelta(hours=1)
     assert admit(x)['status']=='INVALIDATED_CORRECTION'
     assert not ev.census(x[0])[0] and len(ev.census(x[0])[1])==3
 
@@ -159,3 +159,18 @@ def test_pre_registration_source_is_not_prospective(experiment):
     x=experiment;x[5]['release_at']='2026-11-01T22:59:59Z'
     assert admit(x)['status']=='SKIPPED_PRE_REGISTRATION'
     assert not ev.census(x[0])[0]
+
+
+def test_repeated_scan_preserves_first_seen_and_advances_observation(experiment):
+    x=experiment;first=admit(x)
+    x[1][0]+=timedelta(hours=1)
+    again=admit(x)
+    assert again['status']=='DUPLICATE'
+    assert again['first_seen_at']==first['first_seen_at']
+    assert ev.stamp(again['observed_at'])>ev.stamp(first['observed_at'])
+
+
+def test_repeated_source_cannot_rewrite_first_seen(experiment):
+    x=experiment;admit(x);x[1][0]+=timedelta(hours=1)
+    x[5]['first_seen_at']=x[1][0].isoformat()
+    with pytest.raises(ValueError,match='Immutable first_seen'):admit(x)

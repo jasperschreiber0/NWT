@@ -110,10 +110,18 @@ def discover(folder,slot,checks,candidates):
             if c['url']!=r['config']['sources'][symbol][name+'_url'] or c['status'] not in ('OK','FAILED'):raise ValueError('Source check identity')
             if c['status']=='OK' and not c.get('sha256'):raise ValueError('Missing source receipt')
     seen={e['event_id']:e for row in rows if row['action']=='discovery' for e in row['payload']['events'] if e['status']=='ADMITTED'};items=[]
+    # First discovery belongs to a source version, not the latest hourly scan.
+    first_seen={(e['event_id'],e.get('accession'),e.get('source_sha256')):e.get('first_seen_at')
+                for row in rows if row['action']=='discovery' for e in row['payload']['events']
+                if e.get('first_seen_at') is not None}
     sessions=r['config']['calendar']['sessions']
     for candidate in candidates:
         symbol=candidate['symbol'];event_id=symbol+':'+candidate['fiscal_period_end']
-        item=dict(candidate,event_id=event_id)
+        item=dict(candidate,event_id=event_id,observed_at=at.isoformat())
+        identity=(event_id,candidate.get('accession'),candidate.get('source_sha256'))
+        if identity in first_seen and stamp(candidate['first_seen_at'])!=stamp(first_seen[identity]):
+            raise ValueError('Immutable first_seen changed for source version')
+        if candidate.get('first_seen_at') is not None:first_seen[identity]=candidate['first_seen_at']
         if symbol not in POLICY['universe']:item['status']='SKIPPED_OUTSIDE_UNIVERSE'
         elif candidate.get('form') not in ('8-K','8-K/A') or candidate.get('item')!='2.02':item['status']='SKIPPED_NON_EARNINGS'
         elif not candidate.get('release_at') or not candidate.get('timestamp_verified'):item['status']='SKIPPED_UNVERIFIED_TIME'
@@ -121,7 +129,7 @@ def discover(folder,slot,checks,candidates):
             source=r['config']['sources'][symbol]
             if str(candidate.get('cik'))!=str(source['cik']) or urlparse(candidate['release_url']).hostname!=urlparse(source['issuer_url']).hostname or not candidate.get('source_sha256') or not candidate.get('accession'):raise ValueError('Unverified candidate source')
             released=stamp(candidate['release_at'])
-            if not released<=stamp(candidate['first_seen_at'])<=at or stamp(candidate['first_seen_at'])<slot:raise ValueError('Discovery timing')
+            if not released<=stamp(candidate['first_seen_at'])<=at:raise ValueError('Discovery timing')
             future=[i for i,s in enumerate(sessions) if stamp(s['open'])>released]
             if not future:raise ValueError('Calendar exhausted')
             i=future[0];cutoff=sessions[i]['close']
