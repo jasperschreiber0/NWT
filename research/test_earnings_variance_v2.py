@@ -30,7 +30,7 @@ def experiment(tmp_path,monkeypatch):
              recorder_identity_reference='TEST-ONLY',source_map_reference='TEST-ONLY',model_revision_reference='TEST-ONLY',extraction_version='test-v1',evidence_class='engineering_smoke')
     ev.register(tmp_path,cfg)
     checks={s:{name:dict(url=v[name+'_url'],status='OK',sha256='fixture-source') for name in ('sec','issuer')} for s,v in cfg['sources'].items()}
-    candidate=dict(symbol='AAPL',cik='1',fiscal_period_end='2026-09-30',form='8-K',item='2.02',release_at='2026-11-01T22:00:00Z',
+    candidate=dict(symbol='AAPL',cik='1',fiscal_period_end='2026-09-30',form='8-K',item='2.02',release_at='2026-11-01T23:00:00Z',
                    first_seen_at=clock[0].isoformat(),timestamp_verified=True,release_url='https://aapl.example.test/releases/1',
                    source_sha256=hashlib.sha256(TEXT.encode()).hexdigest(),accession='fixture-accession')
     return tmp_path,clock,key,cfg,checks,candidate
@@ -152,3 +152,10 @@ def test_rehashed_prediction_tampering_still_fails_receipt_binding(experiment):
         path.write_text(json.dumps(dict(row,sha256=previous)))
     x[1][0]=datetime(2026,11,10,tzinfo=timezone.utc)
     with pytest.raises(ValueError,match='Prediction receipt changed'):ev.evaluate(x[0],[outcome(e)])
+
+
+
+def test_pre_registration_source_is_not_prospective(experiment):
+    x=experiment;x[5]['release_at']='2026-11-01T22:59:59Z'
+    assert admit(x)['status']=='SKIPPED_PRE_REGISTRATION'
+    assert not ev.census(x[0])[0]

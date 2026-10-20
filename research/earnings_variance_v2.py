@@ -134,6 +134,7 @@ def discover(folder,slot,checks,candidates):
                 elif candidate.get('correction_kind') in ('financial_figures_changed','official_withdrawal'):
                     item['status']='INVALIDATED_CORRECTION' if at<stamp(old['cutoff']) else 'POST_CUTOFF_AMENDMENT'
                 else:item['status']='UNRESOLVED_AMENDMENT'
+            elif released<stamp(r['registered_at']):item['status']='SKIPPED_PRE_REGISTRATION'
             elif candidate['form']=='8-K/A':item['status']='SKIPPED_AMENDMENT_WITHOUT_ORIGINAL'
             elif not stamp(POLICY['holdout_start'])<=stamp(cutoff)<stamp(POLICY['holdout_end']):item['status']='SKIPPED_OUTSIDE_WINDOW'
             elif at>stamp(sessions[i]['open'])-timedelta(seconds=300):item['status']='SKIPPED_LATE_DISCOVERY'
