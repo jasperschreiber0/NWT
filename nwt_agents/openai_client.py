@@ -18,20 +18,28 @@ MODEL_RATES = {
 }
 
 
-def call_json(prompt, model, expected_type, *, conn=None, component="openai_client"):
+def call_json(prompt, model, expected_type, *, conn=None, component="openai_client",
+              response_schema=None, capture=None):
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
         raise RuntimeError("OPENAI_API_KEY is required")
     if model not in MODEL_RATES:
         raise ValueError("OpenAI model has no verified cost rate; configure a supported model")
+    payload = {"model": model, "input": prompt, "max_output_tokens": 2048, "store": False}
+    if response_schema is not None:
+        payload["text"] = {"format": {"type": "json_schema", "name": "investor_classification",
+                                      "strict": True, "schema": response_schema}}
     response = requests.post(
         API_URL,
         headers={"Authorization": f"Bearer {key}"},
-        json={"model": model, "input": prompt, "max_output_tokens": 2048,
-              "store": False},
+        json=payload,
         timeout=(10, 90),
         allow_redirects=False,
     )
+    # Restricted evidence callback, never an operational-log sink. Capture before
+    # JSON/status/shape validation so rejected originals are retained too.
+    if capture is not None:
+        capture({"request": payload, "http_status": response.status_code, "response_raw": response.text})
     if response.status_code != 200:
         # Do not put provider response bodies or credentials into operational logs.
         raise RuntimeError(f"OpenAI Responses API HTTP {response.status_code}")

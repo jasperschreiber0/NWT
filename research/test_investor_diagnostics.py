@@ -190,7 +190,7 @@ def test_v3_boundary_preserves_v1_v2_and_pending_forecast_lineage():
     with pytest.raises(ValueError):pipeline.register_version(c,dict(policy,code_sha256='changed'),NOW)
 
 
-@pytest.mark.parametrize('mode',['budget','cooldown','failure','storage','option','partial_success'])
+@pytest.mark.parametrize('mode',['budget','cooldown','failure','storage','option','partial_success','validation','source_timeout'])
 def test_full_cycle_reports_incomplete_coverage_without_retries_or_false_success(monkeypatch,tmp_path,mode):
     out=tmp_path/'evidence';out.mkdir();c=sqlite3.connect(out/'investors.sqlite')
     c.execute('CREATE TABLE evidence(kind TEXT,key TEXT,payload TEXT,PRIMARY KEY(kind,key))')
@@ -199,14 +199,18 @@ def test_full_cycle_reports_incomplete_coverage_without_retries_or_false_success
     if mode=='partial_success':activist(c,'second')
     if mode=='budget':pipeline.state(c,'model-budget:'+NOW.date().isoformat(),20)
     if mode=='cooldown':pipeline.state(c,'classification-attempt:event',NOW.isoformat())
-    c.close();call=api(monkeypatch,error=ValueError(SECRET) if mode=='failure' else None)
+    c.close();call=api(monkeypatch,error=TimeoutError(SECRET) if mode=='failure' else None,
+        value=answer(evidence_quote=SECRET) if mode=='validation' else None)
     monkeypatch.setattr(pipeline.fcntl,'flock',lambda *a:None)
     class Clock(datetime):
         @classmethod
         def now(cls,tz=None):return NOW
     monkeypatch.setattr(pipeline,'datetime',Clock)
     monkeypatch.setattr(pipeline,'Public',lambda *a:Mock())
-    monkeypatch.setattr(pipeline,'collect_feed',lambda *a:dict(status='OK'))
+    def feed(*args):
+        if mode=='source_timeout':raise TimeoutError('SEC source unavailable')
+        return dict(status='OK')
+    monkeypatch.setattr(pipeline,'collect_feed',feed)
     monkeypatch.setattr(pipeline,'parse_filings',lambda *a:dict(parsed=0,backlog=0,errors=[]))
     monkeypatch.setattr(pipeline,'collect_managers',lambda *a:{})
     monkeypatch.setattr(pipeline,'collect_ark',lambda *a:{})
@@ -219,15 +223,15 @@ def test_full_cycle_reports_incomplete_coverage_without_retries_or_false_success
     monkeypatch.setattr(pipeline,'Paper',lambda:paper)
     monkeypatch.setattr(sys,'argv',['investor_pipeline','--output',str(out)])
     if mode=='storage':monkeypatch.setattr(pipeline,'classify_activists',Mock(side_effect=sqlite3.OperationalError(SECRET)))
-    retryable=mode in ['failure','storage','option']
+    retryable=mode in ['failure','storage','option','source_timeout']
     if retryable:
         with pytest.raises(SystemExit) as exc:pipeline.main()
         assert exc.value.code==1
     else:pipeline.main()
     report=json.loads((out/'latest.json').read_text())
     assert report['status']=='DEGRADED'
-    assert report['classification_coverage']['pending']==(0 if mode=='option' else 1)
+    assert report['classification_coverage']['pending']==(0 if mode in ['option','source_timeout'] else 1)
     assert report['retryable']==retryable
     assert report['execution_enabled'] is False and report['scored'].get('completed',0)==0
     assert SECRET not in json.dumps(report)
-    assert call.call_count==(1 if mode in ['failure','option','partial_success'] else 0)
+    assert call.call_count==(1 if mode in ['failure','option','partial_success','validation','source_timeout'] else 0)
