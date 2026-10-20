@@ -14,6 +14,7 @@ CRITICAL:
 
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -429,7 +430,7 @@ def record_closed_outcome(conn, pos, *, commit=True):
     exit_time = pos.get("exit_time")
     direction = pos.get("direction", "long")
     quantity = pos.get("closed_qty") or pos.get("qty")
-    if quantity is None or float(quantity) <= 0:
+    if quantity is None or not math.isfinite(float(quantity)) or float(quantity) <= 0:
         raise ValueError("Unknown filled quantity for " + position_id)
     notional = entry_price * float(quantity) * (100 if pos.get("asset_type") == "option" else 1)
     realized_slippage = float(pos['realized_slippage']) if pos.get('realized_slippage') is not None else None
