@@ -16,7 +16,7 @@ def main():
     try:
         with c.cursor(cursor_factory=RealDictCursor) as q:
             q.execute("SELECT o.strategy_id,COUNT(DISTINCT COALESCE(l.spread_group_id,l.position_id)) trades,"
-                      "SUM(o.pnl_adjusted) net FROM nwt_trade_outcomes o JOIN nwt_portfolio_ledger l "
+                      "SUM(o.pnl_adjusted) net FROM nwt_verified_learning_outcomes o JOIN nwt_portfolio_ledger l "
                       "ON l.position_id=o.position_id GROUP BY o.strategy_id")
             realized=[dict(x) for x in q.fetchall()]
             q.execute("SELECT strategy_id,genome_version,COUNT(*) observations,"

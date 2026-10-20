@@ -19,6 +19,7 @@ def recovery_db():
     with conn.cursor() as q:
         q.execute('''
         CREATE TEMP TABLE nwt_tickets(ticket_id uuid PRIMARY KEY,type text,payload jsonb,created_at timestamptz DEFAULT now());
+        CREATE TEMP TABLE nwt_entry_evidence(position_id uuid PRIMARY KEY,decision_id uuid,eligible boolean,snapshot jsonb);
         CREATE TEMP TABLE nwt_entry_intents(ticket_id uuid);
         CREATE TEMP TABLE nwt_ticket_decisions(ticket_id uuid,decision text,reasoning text,decided_by text,created_at timestamptz DEFAULT now());
         CREATE UNIQUE INDEX recovery_partial_decision ON nwt_ticket_decisions(ticket_id,decided_by)

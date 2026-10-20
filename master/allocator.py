@@ -48,7 +48,7 @@ def _fetch_bot_trades(conn, bot_key: str, limit: int = LOOKBACK_TRADES) -> list:
             """
             SELECT COALESCE(to_.pnl_adjusted, to_.pnl) AS pnl,
                    to_.regime_at_entry->>'primary_regime' AS primary_regime
-            FROM nwt_trade_outcomes to_
+            FROM nwt_verified_learning_outcomes to_
             JOIN nwt_portfolio_ledger pl ON pl.position_id = to_.position_id
             WHERE pl.bot_source = %s AND to_.closed_at IS NOT NULL
               AND COALESCE(to_.pnl_adjusted, to_.pnl) IS NOT NULL

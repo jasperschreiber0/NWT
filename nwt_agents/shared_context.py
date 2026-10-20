@@ -629,6 +629,8 @@ def link_decision_outcome(conn, ticket_id: str, outcome_id: str) -> None:
                 UPDATE nwt_decision_inputs
                 SET outcome_id = %s, outcome_reason = COALESCE(outcome_reason, 'EXECUTED')
                 WHERE ticket_id = %s AND outcome_id IS NULL
+                  AND (SELECT count(*) FROM nwt_decision_inputs d WHERE d.ticket_id=nwt_decision_inputs.ticket_id)=1
+                  AND (SELECT count(*) FROM nwt_entry_evidence e WHERE e.decision_id=nwt_decision_inputs.id AND e.eligible)=1
                 """,
                 (outcome_id, ticket_id),
             )
@@ -760,6 +762,7 @@ def get_distinct_trade_pnls(
     closed_after: datetime = None,
     order: str = "ASC",
     limit: int = None,
+    verified_only: bool = True,
 ) -> list:
     """
     One row per real trade. A trade's identity is
@@ -807,10 +810,13 @@ def get_distinct_trade_pnls(
     if limit is not None:
         params.append(limit)
 
+    # Risk accounting may explicitly retain all raw losses; learning defaults to
+    # verified evidence. This is a fixed identifier selection, not user SQL.
+    source = 'nwt_verified_learning_outcomes' if verified_only else 'nwt_trade_outcomes'
     query = f"""
         SELECT SUM(COALESCE(to_.pnl_adjusted, to_.pnl)) AS pnl,
                MAX(to_.closed_at) AS closed_at
-        FROM nwt_trade_outcomes to_
+        FROM {source} to_
         LEFT JOIN nwt_portfolio_ledger pl ON pl.position_id = to_.position_id
         WHERE to_.closed_at IS NOT NULL
           {filter_sql}

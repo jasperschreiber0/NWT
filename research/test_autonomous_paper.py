@@ -76,7 +76,7 @@ def test_rehearsal_whole_shares_and_cash_constraints():
 def test_costs_and_cash_transfers_are_not_trading_profit():
     assert expenses({},30)['accrued_usd'] is None
     config={s:{'monthly_usd':10} for s in ['alpaca','hetzner','railway','supabase']}
-    assert expenses(config,365.25/12)['accrued_usd']==pytest.approx(40)
+    assert expenses(config,365.25/12)['accrued_usd'] is None  # Unverified monthly guesses are not complete costs
     flows=cash_adjustment([dict(activity_type='CSD',net_amount='5000',id='1'),dict(activity_type='CSW',net_amount='-1000',id='2'),
         dict(activity_type='FEE',net_amount='-1',id='3'),dict(activity_type='JNLC',net_amount='10',id='4')])
     assert flows['net_external_cash']==4000 and flows['ambiguous_transfer_ids']==['4']

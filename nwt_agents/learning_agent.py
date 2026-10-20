@@ -27,6 +27,8 @@ from psycopg2.extras import RealDictCursor
 
 load_dotenv(Path(__file__).parent / ".env")
 
+from entry_evidence import VERSION, load as load_entry_evidence
+
 from shared_context import (
     get_db,
     get_distinct_trade_pnls,
@@ -98,51 +100,16 @@ def fetch_unprocessed_closed_positions(conn) -> list:
     return [dict(r) for r in rows]
 
 
-def find_original_ticket(conn, alpaca_order_id: str, asset: str) -> Optional[dict]:
-    """
-    Find the original conviction/proposal ticket for this position.
-    Searches nwt_tickets payload for the alpaca_order_id or asset symbol.
-    """
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        # Try to find by alpaca_order_id in payload
-        cur.execute(
-            """
-            SELECT * FROM nwt_tickets
-            WHERE type IN ('TRADE_REQUEST', 'TRADE_PROPOSAL', 'CONVICTION_TICKET')
-              AND (
-                payload->>'alpaca_order_id' = %s
-                OR payload->>'option_symbol' = %s
-                OR payload->>'symbol' = %s
-              )
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            (alpaca_order_id, asset, asset),
-        )
-        row = cur.fetchone()
-    if not row:
+def find_original_ticket(conn, ledger_ticket_id, entry_time=None) -> Optional[dict]:
+    """Exact ledger FK only. No symbol/order fallback and no post-entry tickets."""
+    if not ledger_ticket_id:
         return None
-    ticket = dict(row)
-    # TRADE_REQUEST tickets whose originating TRADE_PROPOSAL predates the
-    # regime_at_decision field (or otherwise omitted it) leave regime_at_entry
-    # empty on every downstream nwt_trade_outcomes row — silently violating
-    # the "regime_at_entry is always a full JSONB object" invariant above.
-    # Follow source_proposal_ticket_id back to the TRADE_PROPOSAL to recover it.
-    payload = ticket.get("payload") or {}
-    if ticket.get("type") == "TRADE_REQUEST" and not payload.get("regime_at_decision"):
-        source_id = payload.get("source_proposal_ticket_id")
-        if source_id:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT * FROM nwt_tickets WHERE ticket_id = %s",
-                    (source_id,),
-                )
-                proposal_row = cur.fetchone()
-            if proposal_row:
-                proposal_payload = dict(proposal_row).get("payload") or {}
-                regime = proposal_payload.get("regime_at_decision")
-                if regime:
-                    ticket["payload"] = {**payload, "regime_at_decision": regime}
-    return ticket
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM nwt_tickets WHERE ticket_id=%s", (ledger_ticket_id,))
+        row = cur.fetchone()
+    if row and entry_time is not None and row['created_at'] <= entry_time:
+        return dict(row)
+    return None
 
 
 def resolve_decision_ticket_id(conn, ledger_ticket_id: str) -> Optional[str]:
@@ -247,14 +214,16 @@ def compute_edge_summary(conn, bucket_width: float = 0.5) -> list:
     """
     query = """
         WITH realized AS (
-            SELECT di.strategy_id, di.genome_version,
-                   COALESCE(di.regime->>'primary_regime', 'unknown') AS regime,
-                   di.direction,
-                   FLOOR(ABS(COALESCE(di.signal_strength, 0)) / %(bw)s) * %(bw)s AS strength_bucket,
-                   COALESCE(to_.pnl_adjusted, to_.pnl) AS pnl
+            SELECT to_.strategy_id, (ee.snapshot->'decision_context'->>'genome_version')::integer AS genome_version,
+                   ee.snapshot->'decision_context'->'regime'->>'primary_regime' AS regime,
+                   ee.snapshot->'decision_context'->>'direction' AS direction,
+                   FLOOR(ABS(COALESCE((ee.snapshot->'decision_context'->>'signal_strength')::numeric, 0)) / %(bw)s) * %(bw)s AS strength_bucket,
+                   SUM(COALESCE(to_.pnl_adjusted, to_.pnl)) AS pnl
             FROM nwt_decision_inputs di
-            JOIN nwt_trade_outcomes to_ ON to_.id = di.outcome_id
+            JOIN nwt_entry_evidence ee ON ee.decision_id=di.id AND ee.eligible
+            JOIN nwt_verified_learning_outcomes to_ ON to_.position_id=ee.position_id
             WHERE di.outcome_reason = 'EXECUTED'
+            GROUP BY to_.strategy_id, ee.decision_id, ee.snapshot->'decision_context'
         ),
         shadow AS (
             SELECT strategy_id, genome_version,
@@ -457,14 +426,7 @@ def main() -> None:
     conn = get_db()
 
     try:
-        layer0 = load_layer0_data()
-        symbols_data = layer0.get("symbols", {})
-
-        try:
-            directives = load_master_directives()
-            current_regime = directives.get("regime", {})
-        except FileNotFoundError:
-            current_regime = {"primary_regime": "unknown", "confidence": 0.0}
+        # Current market data must never be used as historical entry/exit evidence.
 
         closed_positions = fetch_unprocessed_closed_positions(conn)
         logger.info("Found %d unprocessed closed positions", len(closed_positions))
@@ -480,7 +442,11 @@ def main() -> None:
             entry_time = pos.get("entry_time")
             exit_time = pos.get("exit_time")
             direction = pos.get("direction", "long")
-            notional = float(pos.get("notional_risk") or 0)
+            quantity = pos.get("closed_qty") or pos.get("qty")
+            if quantity is None or float(quantity) <= 0:
+                logger.warning("Skipping position %s - unknown filled quantity", position_id)
+                continue
+            notional = entry_price * float(quantity) * (100 if pos.get("asset_type") == "option" else 1)
             realized_slippage = float(pos.get("realized_slippage") or 0)
             alpaca_order_id = pos.get("alpaca_order_id", "")
             bot_source = pos.get("bot_source", "")
@@ -508,7 +474,8 @@ def main() -> None:
             )
 
             # Find original ticket for signal quality and regime context
-            original_ticket = find_original_ticket(conn, alpaca_order_id, asset)
+            evidence = load_entry_evidence(conn, position_id)
+            original_ticket = find_original_ticket(conn, ledger_ticket_id, entry_time)
             original_payload = (original_ticket.get("payload") or {}) if original_ticket else {}
 
             # Strategy ID — ledger column is authoritative (written at fill);
@@ -521,7 +488,7 @@ def main() -> None:
             )
 
             # Archetype — attribution pools here; genome is the source of truth
-            archetype = get_archetype(conn, strategy_id) or original_payload.get("archetype") or strategy_id
+            archetype = (evidence.get('decision_context') or {}).get('archetype') or 'UNKNOWN'
 
             # pnl_adjusted — spread-haircut PnL from captured NBBO (or default
             # spread when quotes are missing). This is the number that matters.
@@ -556,17 +523,10 @@ def main() -> None:
                 entry_price, exit_price, direction, expected_move_capture
             )
 
-            # IV — from layer0 data (approximation using current; historical not available yet)
-            sym_data = symbols_data.get(asset, symbols_data.get(asset.split(":")[0], {}))
-            iv_current = sym_data.get("iv", 0.0)
-
-            # Regime at entry — from original ticket payload (full JSONB)
-            regime_at_entry = original_payload.get("regime_at_decision", {})
-            if not regime_at_entry:
-                regime_at_entry = current_regime
-
-            # DTE at entry — from original ticket
-            dte_at_entry = original_payload.get("dte_target") or original_payload.get("dte_min")
+            # Point-in-time unknowns stay unknown. Decision IV is not fill-time IV.
+            iv_at_entry = evidence.get('iv_at_entry')
+            regime_at_entry = evidence.get('regime_at_entry') or {'status': 'unknown'}
+            dte_at_entry = None
 
             try:
                 with conn.cursor() as cur:
@@ -585,7 +545,7 @@ def main() -> None:
                              entry_timing_score, exit_timing_score,
                              thesis_validity,
                              expected_move_capture, realized_move_capture,
-                             closed_at)
+                             closed_at, evidence_version)
                         VALUES
                             (%s, %s, %s, %s, %s,
                              %s, %s, %s, %s,
@@ -599,7 +559,7 @@ def main() -> None:
                              %s, %s,
                              %s,
                              %s, %s,
-                             %s)
+                             %s, %s)
                         RETURNING id
                         """,
                         (
@@ -618,10 +578,10 @@ def main() -> None:
                             round(pnl_adjusted_pct, 6),
                             round(entry_spread_pct, 6),
                             round(exit_spread_pct, 6),
-                            iv_current,   # iv_at_entry (approximated)
-                            iv_current,   # iv_at_exit (same approximation until historical available)
+                            iv_at_entry,
+                            None,  # No measured exit-time IV
                             json.dumps(regime_at_entry),
-                            json.dumps(current_regime),  # regime_at_exit = current directives regime
+                            json.dumps({'status': 'unknown', 'reason': 'No measured exit snapshot'}),
                             dte_at_entry,
                             realized_slippage,
                             round(slippage_adjusted_efficiency, 4),
@@ -631,6 +591,7 @@ def main() -> None:
                             expected_move_capture,
                             realized_move_capture,
                             exit_time,
+                            VERSION if evidence.get("eligible") else None,
                         ),
                     )
                     outcome_row_id = cur.fetchone()[0]
@@ -640,8 +601,8 @@ def main() -> None:
 
                 # Deterministic decision -> outcome wiring (never a fuzzy
                 # timestamp/symbol join — see resolve_decision_ticket_id).
-                decision_ticket_id = resolve_decision_ticket_id(conn, ledger_ticket_id)
-                link_decision_outcome(conn, decision_ticket_id, str(outcome_row_id))
+                # Canonical one-to-many decision -> leg outcomes is the immutable
+                # snapshot join. The legacy scalar outcome_id cannot represent spreads.
                 logger.info(
                     "Logged outcome for %s (%s/%s): pnl=%.4f pnl_adjusted=%.4f exit_timing=%.2f entry_timing=%.2f",
                     asset, strategy_id, archetype, pnl_dollars, pnl_adjusted, exit_timing_score, entry_timing_score,
@@ -653,7 +614,7 @@ def main() -> None:
         # Compute strategy decay for all strategies seen this run + any with enough history
         all_strategy_ids_with_data = set()
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT strategy_id FROM nwt_trade_outcomes")
+            cur.execute("SELECT DISTINCT strategy_id FROM nwt_verified_learning_outcomes")
             for row in cur.fetchall():
                 all_strategy_ids_with_data.add(row[0])
 
@@ -666,7 +627,7 @@ def main() -> None:
         # Pooled decay per archetype — the granularity with real sample sizes
         archetypes_with_data = set()
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT archetype FROM nwt_trade_outcomes WHERE archetype IS NOT NULL")
+            cur.execute("SELECT DISTINCT archetype FROM nwt_verified_learning_outcomes WHERE archetype IS NOT NULL")
             for row in cur.fetchall():
                 archetypes_with_data.add(row[0])
 

@@ -23,6 +23,7 @@ def allocator_db():
           CREATE TEMP TABLE nwt_portfolio_ledger(position_id uuid PRIMARY KEY, bot_source text);
           CREATE TEMP TABLE nwt_trade_outcomes(position_id uuid, pnl numeric, pnl_adjusted numeric,
             regime_at_entry jsonb, closed_at timestamptz);
+          CREATE TEMP VIEW nwt_verified_learning_outcomes AS SELECT * FROM nwt_trade_outcomes;
           CREATE TEMP TABLE nwt_allocator_history(bot text, regime text, baseline_weight numeric,
             dynamic_weight numeric, sample_trades integer, rolling_expectancy numeric, sharpe_proxy numeric, note text);
           INSERT INTO nwt_portfolio_ledger VALUES
@@ -56,7 +57,7 @@ def test_native_uuid_join_produces_shadow_but_never_changes_effective_weights(al
 def test_database_failure_is_visible_and_connection_recovers(allocator_db, stage):
     with allocator_db.cursor() as q:
         if stage=='score':
-            q.execute('ALTER TABLE nwt_trade_outcomes RENAME COLUMN pnl_adjusted TO unavailable')
+            q.execute('DROP VIEW nwt_verified_learning_outcomes')
         else:
             q.execute("ALTER TABLE nwt_allocator_history ADD CHECK(bot='impossible')")
     allocator_db.commit()
