@@ -15,6 +15,9 @@ $$;
 DROP TRIGGER IF EXISTS nwt_entry_evidence_immutable ON nwt_entry_evidence;
 CREATE TRIGGER nwt_entry_evidence_immutable BEFORE UPDATE OR DELETE ON nwt_entry_evidence
  FOR EACH ROW EXECUTE FUNCTION nwt_entry_evidence_immutable();
+-- Mark closes recorded by this writer so legacy open positions receive raw
+-- accounting, without implicitly backfilling previously closed history.
+ALTER TABLE nwt_portfolio_ledger ADD COLUMN IF NOT EXISTS outcome_accounting_version TEXT;
 ALTER TABLE nwt_trade_outcomes ADD COLUMN IF NOT EXISTS evidence_version TEXT;
 -- A legacy outcome is never made eligible merely by attaching a new snapshot.
 CREATE OR REPLACE VIEW nwt_verified_learning_outcomes AS

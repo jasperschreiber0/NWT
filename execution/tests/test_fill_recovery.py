@@ -29,13 +29,20 @@ def recovery_db():
         CREATE TEMP TABLE nwt_portfolio_ledger(position_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),bot_source text,strategy_id text,
           asset text,asset_type text,direction text,delta_exposure numeric,notional_risk numeric,qty numeric,entry_price numeric,
           entry_time timestamptz,entry_bid numeric,entry_ask numeric,alpaca_order_id uuid,stop_pct numeric,target_pct numeric,
-          spread_group_id uuid,ticket_id uuid,status text,lifecycle_state text,exit_price numeric,exit_time timestamptz,realized_slippage numeric,exit_reason text,exit_bid numeric,exit_ask numeric,close_generation integer DEFAULT 0,close_requested boolean DEFAULT false);
+          spread_group_id uuid,ticket_id uuid,status text,lifecycle_state text,exit_price numeric,exit_time timestamptz,realized_slippage numeric,exit_reason text,exit_bid numeric,exit_ask numeric,close_generation integer DEFAULT 0,close_requested boolean DEFAULT false,outcome_accounting_version text);
         CREATE UNIQUE INDEX recovery_order_asset ON nwt_portfolio_ledger(alpaca_order_id,asset) WHERE alpaca_order_id IS NOT NULL;
         CREATE TEMP TABLE nwt_close_progress(position_id uuid,generation integer,order_id uuid,requested_qty numeric,recorded_qty numeric,recorded_value numeric,PRIMARY KEY(position_id,generation));
         ''')
         q.execute('INSERT INTO nwt_tickets(ticket_id,payload) VALUES(%s,%s)',(TID,json.dumps(PAYLOAD)))
         q.execute('INSERT INTO nwt_entry_intents VALUES(%s)',(TID,))
         q.execute("INSERT INTO nwt_decision_inputs VALUES(%s,'EXECUTION_FAILED','EXECUTION')",(TID,))
+    from pathlib import Path
+    schema=(Path(__file__).resolve().parents[2]/'db/schema.sql').read_text()
+    outcome=schema[schema.index('CREATE TABLE IF NOT EXISTS nwt_trade_outcomes ('):]
+    outcome=outcome[:outcome.index(');')+2].replace('CREATE TABLE IF NOT EXISTS','CREATE TEMP TABLE')
+    with conn.cursor() as q:
+        q.execute(outcome)
+        q.execute('ALTER TABLE nwt_trade_outcomes ADD position_id uuid, ADD evidence_version text')
     conn.commit()
     yield conn
     conn.close()
@@ -280,12 +287,7 @@ def learning_close_db(recovery_db,monkeypatch):
     import learning_agent as learning
     root=Path(__file__).resolve().parents[2]
     conn=recovery_db
-    schema=(root/'db/schema.sql').read_text()
-    outcome=schema[schema.index('CREATE TABLE IF NOT EXISTS nwt_trade_outcomes ('):]
-    outcome=outcome[:outcome.index(');')+2].replace('CREATE TABLE IF NOT EXISTS','CREATE TEMP TABLE')
     with conn.cursor() as q:
-        q.execute(outcome)
-        q.execute("ALTER TABLE nwt_trade_outcomes ADD position_id uuid")
         q.execute("ALTER TABLE nwt_decision_inputs ADD id uuid DEFAULT gen_random_uuid() UNIQUE, ADD created_at timestamptz, ADD run_at timestamptz, ADD strategy_id text, ADD symbol text, ADD regime jsonb")
         q.execute("UPDATE nwt_tickets SET created_at='2026-09-17T12:00:00Z'")
         q.execute("UPDATE nwt_decision_inputs SET created_at='2026-09-17T11:00:00Z',run_at='2026-09-17T11:00:00Z',strategy_id='EU-MR-001',symbol='VGK',regime=%s",(json.dumps({'primary_regime':'range'}),))
@@ -318,7 +320,7 @@ def test_actual_option_close_then_learning_uses_filled_quantity(learning_close_d
     monkeypatch.setattr(engine,'poll_order_until_filled',lambda _:receipt)
     engine.process_close_ticket(conn,dict(ticket_id=OID,payload=dict(position_id=pid,asset_type='option',symbol='VGK')))
     with conn.cursor() as q:
-        q.execute('SELECT count(*) FROM nwt_trade_outcomes');assert q.fetchone()==(0,)
+        q.execute('SELECT count(*) FROM nwt_trade_outcomes');assert q.fetchone()==(1,)
     learning.main();learning.main()
     with conn.cursor() as q:
         q.execute('SELECT count(*),sum(pnl) FROM nwt_verified_learning_outcomes')
@@ -349,3 +351,42 @@ def test_partial_close_inherits_entry_and_counts_one_trade(learning_close_db):
         q.execute('SELECT count(*),sum(pnl) FROM nwt_verified_learning_outcomes');assert q.fetchone()==(2,Decimal('42.7600'))
         q.execute("SELECT count(*) FROM nwt_entry_evidence WHERE eligible AND snapshot->'decision_context'->'regime'->>'primary_regime'='range'");assert q.fetchone()==(2,)
     assert allocator._bot_score(conn,'eu','range')['total_sample']==1
+
+
+@pytest.mark.parametrize('partial',[False,True])
+def test_legacy_open_close_records_raw_loss_without_learning(learning_close_db,monkeypatch,partial):
+    import engine
+    from close_recovery import recover_closes
+    from shared_context import get_distinct_trade_pnls
+    conn,learning=learning_close_db
+    with conn.cursor() as q:
+        # Pre-existing ledger row: exact filled quantity, no immutable snapshot.
+        q.execute("""INSERT INTO nwt_portfolio_ledger(bot_source,strategy_id,asset,asset_type,
+            direction,qty,entry_price,entry_time,notional_risk,alpaca_order_id,ticket_id,status)
+            VALUES('EU_BOT','EU-MR-001','VGK','option','long',32,90,'2026-09-17T13:00:00Z',1,%s,%s,'open') RETURNING position_id""",(OID,TID))
+        pid=str(q.fetchone()[0])
+        # Older closed history is not implicitly backfilled either.
+        q.execute("""INSERT INTO nwt_portfolio_ledger(bot_source,strategy_id,asset,asset_type,
+            direction,qty,entry_price,entry_time,exit_price,exit_time,status)
+            VALUES('EU_BOT','EU-MR-001','OLD','option','long',1,90,'2026-09-01',80,'2026-09-02','closed')""")
+    conn.commit()
+    receipt=close_receipt(pid,filled_avg_price='89')
+    if partial:
+        recover_closes(conn,lambda _:dict(receipt,status='partially_filled',filled_qty='12'))
+        assert get_distinct_trade_pnls(conn,verified_only=False)[0][0]<0
+        recover_closes(conn,lambda _:receipt)
+    else:
+        monkeypatch.setattr(engine,'option_close_order',lambda _:receipt)
+        monkeypatch.setattr(engine,'poll_order_until_filled',lambda _:receipt)
+        engine.process_close_ticket(conn,dict(ticket_id=OID,payload=dict(position_id=pid,asset_type='option',symbol='VGK')))
+    # Raw risk loss is visible before nightly catch-up, including partial fills.
+    assert get_distinct_trade_pnls(conn,verified_only=False)[0][0]<=-3200
+    learning.main();learning.main()
+    with conn.cursor() as q:
+        q.execute('SELECT count(*),sum(pnl),min(evidence_version) FROM nwt_trade_outcomes')
+        assert q.fetchone()==(2 if partial else 1,Decimal('-3200'),'raw-fill-unverified-20261020-v1')
+        q.execute('SELECT count(*) FROM nwt_verified_learning_outcomes');assert q.fetchone()==(0,)
+        q.execute('SELECT count(*) FROM nwt_entry_evidence');assert q.fetchone()==(0,)
+    risk=get_distinct_trade_pnls(conn,verified_only=False)
+    assert len(risk)==1 and risk[0][0]<=-3200
+    assert get_distinct_trade_pnls(conn)==[]
