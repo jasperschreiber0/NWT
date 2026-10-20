@@ -16,7 +16,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from openai_client import call_json
+from openai_client import call_json, DEFAULT_MODEL, model_policy
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -38,7 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger("conviction_engine")
 
 AGENTS_DIR = Path(os.environ.get("NWT_AGENTS_DIR", Path(__file__).parent))
-CONVICTION_MODEL = os.environ.get("OPENAI_CONVICTION_MODEL", "gpt-4.1-2025-04-14")
+CONVICTION_MODEL = os.environ.get("OPENAI_CONVICTION_MODEL", DEFAULT_MODEL)
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +222,7 @@ def main() -> None:
             # Add metadata
             proposal["prescreener_score"] = item.get("score", 0)
             proposal["prescreener_direction"] = item.get("direction")
+            proposal["prescreener_model_policy"] = item.get("model_policy")
             proposal["iv_at_conviction"] = iv
             proposal["vix_at_conviction"] = vix
             proposal["regime_at_conviction"] = regime  # full JSONB object
@@ -231,6 +232,7 @@ def main() -> None:
 
             # INSERT into nwt_tickets (DB)
             try:
+                proposal["model_policy"] = model_policy(CONVICTION_MODEL)
                 ticket_id = insert_ticket(
                     conn,
                     from_agent="CONVICTION_ENGINE",
@@ -258,6 +260,7 @@ def main() -> None:
                 "tickets": [t["symbol"] for t in conviction_tickets],
                 "provider": "openai",
                 "model": CONVICTION_MODEL,
+                "model_policy": model_policy(CONVICTION_MODEL),
             },
         )
 

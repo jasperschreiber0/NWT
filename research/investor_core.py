@@ -8,11 +8,12 @@ from investor_diagnostics import ResearchValidationError
 UTC=timezone.utc
 LEGACY_VERSION='investor-observation-20261011-v1'
 PREVIOUS_VERSION='investor-observation-20261013-v2'
-VERSION='investor-observation-20261014-v3'
+DIAGNOSTIC_VERSION='investor-observation-20261014-v3'
+VERSION='investor-observation-20261015-v4'
 POLICY=dict(version=VERSION,minimum_purchase=25000,cluster_total=100000,cluster_owners=2,
     cluster_days=7,hold_sessions=[5,20],cost_per_side=.0015,stress_per_side=.003,
     minimum_stock_price=5,minimum_average_dollar_volume20=5000000,agreement_max_last_session_move=.03,
-    activist_model='gpt-4.1-mini-2025-04-14',maximum_model_attempts_per_day=20,
+    activist_model='gpt-6-luna',model_epoch='nwt-openai-20261015-luna-v1',reasoning_effort='none',maximum_model_attempts_per_day=20,
     promotion='RESEARCH_ONLY; no automatic broker qualification',
     limitations=['13F positions are delayed and incomplete portfolios',
         'ARK holdings changes are flow-adjusted proxies, not verified transactions',
