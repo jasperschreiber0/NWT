@@ -440,7 +440,7 @@ def main() -> None:
                 logger.warning("Skipping position %s - unknown filled quantity", position_id)
                 continue
             notional = entry_price * float(quantity) * (100 if pos.get("asset_type") == "option" else 1)
-            realized_slippage = float(pos.get("realized_slippage") or 0)
+            realized_slippage = float(pos['realized_slippage']) if pos.get('realized_slippage') is not None else None
             alpaca_order_id = pos.get("alpaca_order_id", "")
             bot_source = pos.get("bot_source", "")
             ledger_ticket_id = pos.get("ticket_id")
@@ -459,11 +459,11 @@ def main() -> None:
 
             # Adjust for notional
             pnl_dollars = pnl_pct * notional
-            slippage_cost = realized_slippage * notional
+            slippage_cost = realized_slippage * notional if realized_slippage is not None else None
             slippage_adjusted_efficiency = (
                 pnl_dollars / (pnl_dollars + slippage_cost)
-                if (pnl_dollars + slippage_cost) != 0
-                else 0.0
+                if slippage_cost is not None and (pnl_dollars + slippage_cost) != 0
+                else None
             )
 
             # Find original ticket for signal quality and regime context
@@ -500,21 +500,21 @@ def main() -> None:
 
             # Signal quality — logged SEPARATELY from PnL quality
             sq = original_payload.get("signal_quality", {})
-            entry_timing_score = sq.get("entry_timing_score", 0.5)
-            thesis_validity = sq.get("thesis_validity", "")
-            expected_move_capture = float(sq.get("expected_move_capture", 0.0))
+            entry_timing_score = sq.get("entry_timing_score")
+            thesis_validity = sq.get("thesis_validity")
+            expected_move_capture = float(sq['expected_move_capture']) if sq.get('expected_move_capture') is not None else None
 
             # Exit timing score — computed from actual vs expected outcome
-            stop_pct = abs(float(original_payload.get("stop_pct", -0.50)))
-            target_pct = abs(float(original_payload.get("target_pct", 0.50)))
+            stop_pct = abs(float(original_payload['stop_pct'])) if original_payload.get('stop_pct') is not None else None
+            target_pct = abs(float(original_payload['target_pct'])) if original_payload.get('target_pct') is not None else None
             exit_timing_score = compute_exit_timing_score(
                 exit_price, entry_price, direction, stop_pct, target_pct
-            )
+            ) if stop_pct is not None and target_pct is not None else None
 
             # Realized move capture
             realized_move_capture = compute_realized_move_capture(
                 entry_price, exit_price, direction, expected_move_capture
-            )
+            ) if expected_move_capture is not None else None
 
             # Point-in-time unknowns stay unknown. Decision IV is not fill-time IV.
             iv_at_entry = evidence.get('iv_at_entry')
@@ -583,7 +583,7 @@ def main() -> None:
                             json.dumps({'status': 'unknown', 'reason': 'No measured exit snapshot'}),
                             dte_at_entry,
                             realized_slippage,
-                            round(slippage_adjusted_efficiency, 4),
+                            round(slippage_adjusted_efficiency, 4) if slippage_adjusted_efficiency is not None else None,
                             entry_timing_score,   # signal quality — separate from PnL
                             exit_timing_score,    # signal quality — separate from PnL
                             thesis_validity,
@@ -603,7 +603,7 @@ def main() -> None:
                 # Canonical one-to-many decision -> leg outcomes is the immutable
                 # snapshot join. The legacy scalar outcome_id cannot represent spreads.
                 logger.info(
-                    "Logged outcome for %s (%s/%s): pnl=%.4f pnl_adjusted=%.4f exit_timing=%.2f entry_timing=%.2f",
+                    "Logged outcome for %s (%s/%s): pnl=%.4f pnl_adjusted=%.4f exit_timing=%s entry_timing=%s",
                     asset, strategy_id, archetype, pnl_dollars, pnl_adjusted, exit_timing_score, entry_timing_score,
                 )
             except Exception as exc:

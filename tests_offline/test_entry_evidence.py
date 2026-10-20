@@ -59,3 +59,31 @@ def test_ticket_lookup_does_not_fall_back_to_symbol():
     assert find_original_ticket(conn,'missing') is None
     sql,args=conn.cursor.return_value.__enter__.return_value.execute.call_args.args
     assert args==('missing',) and 'symbol' not in sql and 'ORDER BY' not in sql
+
+
+def test_learning_keeps_missing_metrics_unknown_and_retries_idempotently(monkeypatch):
+    import learning_agent as learning
+    conn=MagicMock();q=conn.cursor.return_value.__enter__.return_value
+    state={'query':'','saved':None}
+    def execute(sql,args=None):
+        state['query']=sql
+        if 'INSERT INTO nwt_trade_outcomes' in sql:
+            assert state['saved'] is None
+            columns=sql.split('(',1)[1].split(')',1)[0].replace('\n','').split(',')
+            state['saved']=dict(zip((x.strip() for x in columns),args))
+    def fetchone():
+        if 'INSERT INTO nwt_trade_outcomes' in state['query']:return ('outcome',)
+        return (1,) if state['saved'] is not None else None
+    q.execute.side_effect=execute;q.fetchone.side_effect=fetchone;q.fetchall.return_value=[]
+    monkeypatch.setattr(learning,'get_db',lambda:conn)
+    monkeypatch.setattr(learning,'fetch_unprocessed_closed_positions',lambda c:[dict(position_id='p',asset='SPY',
+        asset_type='equity',strategy_id='A',entry_price=100,exit_price=101,qty=2,direction='long')])
+    monkeypatch.setattr(learning,'load_entry_evidence',lambda *a:{'eligible':False})
+    monkeypatch.setattr(learning,'compute_edge_summary',lambda c:[])
+    monkeypatch.setattr(learning,'log_system_event',lambda *a:None)
+    learning.main();learning.main()
+    outcome=state['saved']
+    assert outcome['pnl']==2 and outcome['evidence_version'] is None
+    for name in ['iv_at_entry','iv_at_exit','dte_at_entry','slippage','entry_timing_score',
+                 'exit_timing_score','expected_move_capture','realized_move_capture','slippage_adjusted_efficiency']:
+        assert outcome[name] is None
