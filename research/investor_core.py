@@ -1,18 +1,20 @@
 """Public investor evidence parsers. No order authority or inferred execution times."""
 import csv,io,hashlib,json,math,re,statistics
 from datetime import datetime,timedelta,timezone
-from urllib.parse import urljoin,urlparse
+from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 from investor_diagnostics import ResearchValidationError
 
 UTC=timezone.utc
 LEGACY_VERSION='investor-observation-20261011-v1'
 PREVIOUS_VERSION='investor-observation-20261013-v2'
-VERSION='investor-observation-20261014-v3'
+DIAGNOSTIC_VERSION='investor-observation-20261014-v3'
+VERSION='investor-observation-20261020-v4'
 POLICY=dict(version=VERSION,minimum_purchase=25000,cluster_total=100000,cluster_owners=2,
     cluster_days=7,hold_sessions=[5,20],cost_per_side=.0015,stress_per_side=.003,
     minimum_stock_price=5,minimum_average_dollar_volume20=5000000,agreement_max_last_session_move=.03,
-    activist_model='gpt-4.1-mini-2025-04-14',maximum_model_attempts_per_day=20,
+    activist_model='gpt-4.1-mini-2025-04-14',maximum_model_attempts_per_day=20,maximum_attempts_per_event=3,
+    classification_recipe="strict-json-exact-quote-v1",
     promotion='RESEARCH_ONLY; no automatic broker qualification',
     limitations=['13F positions are delayed and incomplete portfolios',
         'ARK holdings changes are flow-adjusted proxies, not verified transactions',
