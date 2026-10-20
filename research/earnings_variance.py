@@ -42,12 +42,34 @@ def write_once(path, value):
         json.dump(value,f,sort_keys=True,indent=2)
 
 
-def register(folder, input_manifest=None):
+
+def validate_procedure(procedure):
+    """Require an explicit complete recipe before registration; no default model.
+
+    Caller must supply an immutable model revision, all effective API settings,
+    and a versioned source selection/extraction recipe. This offline harness
+    validates identity, not provider attestations; retain the original receipts.
+    """
+    required={'model_version','model_revision_reference','settings','prompt',
+              'source_selection_version','source_selection_rules','extraction_version',
+              'output_schema','retry_policy'}
+    if set(procedure)!=required or any(not procedure[k] for k in required):
+        raise ValueError('Complete prediction procedure required')
+    if not isinstance(procedure['settings'],dict):raise ValueError('Explicit effective settings required')
+    if procedure['prompt']!=POLICY['score_prompt']:raise ValueError('Prompt differs from hypothesis')
+    if procedure['retry_policy']!='one_attempt_no_retries':raise ValueError('No output selection or retries allowed')
+    if procedure['output_schema']!={'uncertainty_score':'number_0_to_1','quote':'exact_source_substring'}:
+        raise ValueError('Fixed output schema required')
+
+
+def register(folder, input_manifest=None, procedure=None):
     """Must happen before holdout. No fitting or selection on holdout data."""
     now=datetime.now(timezone.utc)
     if now>=stamp(POLICY['holdout_start']):raise ValueError('Registration must precede holdout')
     folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
-    value=dict(policy=POLICY,policy_sha256=digest(POLICY),registered_at=now.isoformat(),
+    if procedure is not None:
+        validate_procedure(procedure)
+    value=dict(procedure=procedure, procedure_sha256=digest(procedure), policy=POLICY,policy_sha256=digest(POLICY),registered_at=now.isoformat(),
                input_manifest=input_manifest, input_manifest_sha256=digest(input_manifest),
                code_sha256=hashlib.sha256(Path(__file__).read_text(encoding='utf-8').encode()).hexdigest())
     write_once(folder/'registration.json',value)
@@ -58,6 +80,7 @@ def registration(folder):
     r=json.loads((Path(folder)/'registration.json').read_text(encoding='utf-8'))
     if r['policy_sha256']!=digest(POLICY) or r['code_sha256']!=hashlib.sha256(Path(__file__).read_text(encoding='utf-8').encode()).hexdigest():
         raise ValueError('Frozen policy or harness changed; new experiment required')
+    if r.get('procedure_sha256') != digest(r.get('procedure')):raise ValueError('Frozen procedure changed')
     if r['input_manifest_sha256']!=digest(r['input_manifest']):raise ValueError('Input manifest changed')
     return r
 
@@ -77,17 +100,23 @@ def seal_prediction(folder, features):
     # Every submission attempt gets a receipt, including rejected submissions.
     attempt=folder/('attempt-'+now.strftime('%Y%m%dT%H%M%S%f')+'.json')
     write_once(attempt,dict(at=now.isoformat(),action='seal',input_sha256=digest(features)))
+    procedure=r.get('procedure')
+    if procedure is None:raise ValueError('Frozen prediction procedure required')
+    validate_procedure(procedure)
+    if features.get('procedure') != procedure:raise ValueError('Prediction procedure mismatch')
+    if features.get('model') != procedure['model_version']:raise ValueError('Model version mismatch')
     manifest=r['input_manifest']
     if not manifest or not manifest.get('source_reference'):raise ValueError('Frozen issuer-event and exchange-calendar manifest required')
     event=manifest['events'].get(features.get('event_id'))
-    if not event or any(features.get(k)!=event[k] for k in ('symbol','cutoff','earnings_open_at','prior_session_dates','session_dates')):
+    if not event or any(features.get(k)!=event[k] for k in ('symbol','cutoff','cutoff_session_close','earnings_open_at','prior_session_dates','session_dates')):
         raise ValueError('Event or session selection differs from frozen manifest')
-    allowed={'event_id','symbol','cutoff','source_text','source_reference','source_published_at',
+    allowed={'cutoff_session_close','procedure','event_id','symbol','cutoff','source_text','source_reference','source_published_at',
              'features_available_at','model_output_at','model','prior_variance','earnings_gap',
              'uncertainty_score','quote','inference_cost_usd','prior_returns','prior_session_dates',
              'earnings_open_at','session_dates','data_source_reference'}
     if set(features)-allowed:raise ValueError('Unexpected fields (possible label leakage)')
     cutoff=stamp(features['cutoff'])
+    if cutoff!=stamp(features['cutoff_session_close']):raise ValueError('Cutoff must equal frozen exchange-session close')
     if not stamp(r['policy']['holdout_start'])<=cutoff<stamp(r['policy']['holdout_end']):raise ValueError('Outside holdout')
     if not stamp(r['registered_at'])<=now<=cutoff:raise ValueError('Prediction must be sealed before cutoff')
     for name in ('source_published_at','features_available_at','model_output_at'):
@@ -137,6 +166,8 @@ def evaluate(folder, outcomes):
             p['source_sha256']!=digest(f['source_text']) or stamp(p['sealed_at'])>stamp(f['cutoff'])):
             raise ValueError('Prediction receipt mismatch')
         if o['session_dates']!=f['session_dates'] or stamp(o['session_dates'][-1])>now:raise ValueError('Outcome session mismatch/not mature')
+        if o.get('price_timestamps') != [f['cutoff']]+f['session_dates']:
+            raise ValueError('Six prices must be anchored exactly at cutoff and subsequent closes')
         closes=o['closes']
         if len(closes)!=6 or any(not math.isfinite(float(x)) or float(x)<=0 for x in closes):raise ValueError('Six verified adjusted closes required')
         if not o.get('source_reference') or o.get('corporate_actions_checked') is not True:raise ValueError('Unverified price/corporate-action evidence')

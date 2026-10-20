@@ -24,6 +24,8 @@ def expenses(config, elapsed_days=None, *, start=None, end=None):
     from cost_accounting import operating_costs
     if start is None or end is None:
         return dict(complete=False, missing=['explicit_window_and_reconciled_service_evidence'], accrued_usd=None)
+    if stamp(start) == (stamp(end) if isinstance(end, str) else end):
+        return dict(complete=False, missing=['initial_baseline_no_elapsed_window'], accrued_usd=None)
     return operating_costs(config.get('records', []), config.get('coverage', {}), start, end)
 
 
@@ -103,7 +105,7 @@ def main():
         limitations=['Transfer journals require classification before net profit is claimed','Legacy missing links remain explicit'])
     db.execute('INSERT INTO snapshots VALUES (?,?)',(now.isoformat(),json.dumps(report,default=str)));db.commit();db.close()
     atomic(STATE/'unified-performance.json',report)
-    print(json.dumps({k:report[k] for k in ['status','equity','unrealized_broker','measured_trading_profit','operating_costs']}))
+    print(json.dumps({k:report[k] for k in ['status','equity','unrealized_broker','measured_trading_profit','operating_costs']}, default=str, allow_nan=False))
 
 
 if __name__=='__main__':main()

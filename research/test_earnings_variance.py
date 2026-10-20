@@ -9,12 +9,20 @@ class Clock(datetime):
     def now(cls,tz=None):return cls.current
 
 
+def procedure():
+    return dict(model_version='synthetic-immutable-revision-1',model_revision_reference='smoke-fixture-only',
+                settings={'temperature':0,'max_output_tokens':256},prompt=ev.POLICY['score_prompt'],
+                source_selection_version='issuer-release-v1',source_selection_rules='First official issuer earnings release; full text; no later revisions',
+                extraction_version='plain-text-v1',output_schema={'uncertainty_score':'number_0_to_1','quote':'exact_source_substring'},
+                retry_policy='one_attempt_no_retries')
+
+
 def features():
-    return dict(event_id='AAPL-20261103',symbol='AAPL',cutoff='2026-11-03T21:00:00Z',
+    return dict(event_id='AAPL-20261103',symbol='AAPL',cutoff='2026-11-03T21:00:00Z',cutoff_session_close='2026-11-03T21:00:00Z',
                 source_text='Management reports unresolved demand uncertainty.',quote='unresolved demand uncertainty',
                 source_reference='issuer-cached-sha',source_published_at='2026-11-03T12:00:00Z',
                 features_available_at='2026-11-03T15:00:00Z',model_output_at='2026-11-03T15:30:00Z',
-                model='existing-output-model-id',prior_variance=.0001,earnings_gap=.02,uncertainty_score=.8,
+                procedure=procedure(),model=procedure()['model_version'],prior_variance=.0001,earnings_gap=.02,uncertainty_score=.8,
                 inference_cost_usd=None,prior_returns=[.01]*20,
                 prior_session_dates=[(datetime(2026,10,1,tzinfo=timezone.utc)+timedelta(days=i)).isoformat() for i in range(20)],
                 earnings_open_at='2026-11-03T14:30:00Z',
@@ -28,7 +36,7 @@ def registered(tmp_path,monkeypatch):
     Clock.current=datetime(2026,10,20,tzinfo=timezone.utc)
     f=features()
     ev.register(tmp_path,dict(source_reference='SYNTHETIC-SMOKE-NOT-RESEARCH',evidence_class='engineering_smoke',
-        events={f['event_id']:{k:f[k] for k in ('symbol','cutoff','earnings_open_at','prior_session_dates','session_dates')}}))
+        events={f['event_id']:{k:f[k] for k in ('symbol','cutoff','cutoff_session_close','earnings_open_at','prior_session_dates','session_dates')} }),procedure=procedure())
     Clock.current=datetime(2026,11,3,16,tzinfo=timezone.utc)
     return tmp_path
 
@@ -41,7 +49,7 @@ def test_fixed_forecast_and_prospective_single_use(registered):
     with pytest.raises(FileExistsError):ev.seal_prediction(registered,f)
     with pytest.raises(ValueError,match='not complete'):ev.evaluate(registered,[])
     Clock.current=datetime(2027,4,2,tzinfo=timezone.utc)
-    outcome=dict(event_id=f['event_id'],session_dates=f['session_dates'],closes=[100,101,100,101,100,101],
+    outcome=dict(event_id=f['event_id'],session_dates=f['session_dates'],price_timestamps=[f['cutoff']]+f['session_dates'],closes=[100,101,100,101,100,101],
                  source_reference='held-out-prices-sha',corporate_actions_checked=True)
     result=ev.evaluate(registered,[outcome])
     assert result['events']==1 and not result['accepted'] and not result['costs_complete']
@@ -63,3 +71,30 @@ def test_missing_outcomes_cannot_be_cherry_picked(registered):
     Clock.current=datetime(2027,4,2,tzinfo=timezone.utc)
     with pytest.raises(ValueError,match='Incomplete'):ev.evaluate(registered,[])
     assert (registered/'evaluation-attempt.json').exists()
+
+
+@pytest.mark.parametrize('field,value', [('model_version','different'),('settings',{'temperature':1}),
+    ('source_selection_rules','choose best source'),('prompt','different prompt')])
+def test_procedure_changes_rejected_and_logged(registered,field,value):
+    f=features();f['procedure'][field]=value
+    with pytest.raises(ValueError):ev.seal_prediction(registered,f)
+    assert len(list(registered.glob('attempt-*.json')))==1
+    assert not list(registered.glob('prediction-*.json'))
+
+
+def test_undated_or_prior_close_anchor_rejected(registered):
+    f=features();ev.seal_prediction(registered,f)
+    Clock.current=datetime(2027,4,2,tzinfo=timezone.utc)
+    o=dict(event_id=f['event_id'],session_dates=f['session_dates'],closes=[100]*6,
+           price_timestamps=['2026-11-02T21:00:00Z']+f['session_dates'],source_reference='test',corporate_actions_checked=True)
+    with pytest.raises(ValueError,match='anchored exactly'):ev.evaluate(registered,[o])
+
+
+def test_intraday_cutoff_cannot_include_known_earnings_gap(tmp_path,monkeypatch):
+    monkeypatch.setattr(ev,'datetime',Clock)
+    Clock.current=datetime(2026,10,20,tzinfo=timezone.utc)
+    f=features();f['cutoff']='2026-11-03T17:00:00Z'
+    ev.register(tmp_path,dict(source_reference='smoke',events={f['event_id']:{k:f[k] for k in
+        ('symbol','cutoff','cutoff_session_close','earnings_open_at','prior_session_dates','session_dates')}}),procedure=procedure())
+    Clock.current=datetime(2026,11,3,16,tzinfo=timezone.utc)
+    with pytest.raises(ValueError,match='exchange-session close'):ev.seal_prediction(tmp_path,f)

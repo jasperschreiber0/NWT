@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS nwt_entry_evidence (
  recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
  CHECK (NOT eligible OR decision_id IS NOT NULL)
 );
+ALTER TABLE nwt_entry_evidence ADD COLUMN IF NOT EXISTS parent_position_id UUID REFERENCES nwt_portfolio_ledger(position_id);
 CREATE OR REPLACE FUNCTION nwt_entry_evidence_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN RAISE EXCEPTION 'Entry evidence is immutable; retain raw evidence and append a reviewed correction separately'; END;
 $$;

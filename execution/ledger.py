@@ -82,7 +82,11 @@ def insert_position(conn, data: dict, *, commit=True) -> str:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'nwt_agents'))
     from entry_evidence import capture
-    capture(conn, position_id, data)
+    if data.get('entry_evidence_parent_id'):
+        from entry_evidence import inherit
+        inherit(conn, position_id, data['entry_evidence_parent_id'])
+    else:
+        capture(conn, position_id, data)
     if commit:
         conn.commit()
     logger.info("Inserted position %s for %s (%s)", position_id, data["asset"], data["bot_source"])

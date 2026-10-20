@@ -19,7 +19,7 @@ def recovery_db():
     with conn.cursor() as q:
         q.execute('''
         CREATE TEMP TABLE nwt_tickets(ticket_id uuid PRIMARY KEY,type text,payload jsonb,created_at timestamptz DEFAULT now());
-        CREATE TEMP TABLE nwt_entry_evidence(position_id uuid PRIMARY KEY,decision_id uuid,eligible boolean,snapshot jsonb);
+        CREATE TEMP TABLE nwt_entry_evidence(position_id uuid PRIMARY KEY,decision_id uuid,eligible boolean,snapshot jsonb,parent_position_id uuid);
         CREATE TEMP TABLE nwt_entry_intents(ticket_id uuid);
         CREATE TEMP TABLE nwt_ticket_decisions(ticket_id uuid,decision text,reasoning text,decided_by text,created_at timestamptz DEFAULT now());
         CREATE UNIQUE INDEX recovery_partial_decision ON nwt_ticket_decisions(ticket_id,decided_by)
@@ -271,3 +271,78 @@ def test_partial_close_retry_limit_preserves_verified_fill(close_db):
     assert result['blocked'] and not result['residual_retries']
     with conn.cursor() as q:
         q.execute("SELECT qty FROM nwt_portfolio_ledger WHERE status='open'");assert q.fetchone()[0]==20
+
+
+@pytest.fixture
+def learning_close_db(recovery_db,monkeypatch):
+    """Actual entry/recovery/learning paths with a broker mock and isolated DB."""
+    from pathlib import Path
+    import learning_agent as learning
+    root=Path(__file__).resolve().parents[2]
+    conn=recovery_db
+    schema=(root/'db/schema.sql').read_text()
+    outcome=schema[schema.index('CREATE TABLE IF NOT EXISTS nwt_trade_outcomes ('):]
+    outcome=outcome[:outcome.index(');')+2].replace('CREATE TABLE IF NOT EXISTS','CREATE TEMP TABLE')
+    with conn.cursor() as q:
+        q.execute(outcome)
+        q.execute("ALTER TABLE nwt_trade_outcomes ADD position_id uuid")
+        q.execute("ALTER TABLE nwt_decision_inputs ADD id uuid DEFAULT gen_random_uuid() UNIQUE, ADD created_at timestamptz, ADD run_at timestamptz, ADD strategy_id text, ADD symbol text, ADD regime jsonb")
+        q.execute("UPDATE nwt_tickets SET created_at='2026-09-17T12:00:00Z'")
+        q.execute("UPDATE nwt_decision_inputs SET created_at='2026-09-17T11:00:00Z',run_at='2026-09-17T11:00:00Z',strategy_id='EU-MR-001',symbol='VGK',regime=%s",(json.dumps({'primary_regime':'range'}),))
+        q.execute((root/'db/migrate_2026_10_20_learning_evidence.sql').read_text())
+    conn.commit()
+    class Keep:
+        def __getattr__(self,key):return getattr(conn,key)
+        def close(self):pass
+    monkeypatch.setattr(learning,'get_db',lambda:Keep())
+    monkeypatch.setattr(learning,'compute_strategy_decay',lambda *a,**k:None)
+    monkeypatch.setattr(learning,'compute_edge_summary',lambda *a:[])
+    monkeypatch.setattr(learning,'log_system_event',lambda *a,**k:None)
+    return conn,learning
+
+
+def test_actual_option_close_then_learning_uses_filled_quantity(learning_close_db,monkeypatch):
+    import engine
+    conn,learning=learning_close_db
+    with conn.cursor() as q:
+        q.execute('UPDATE nwt_tickets SET payload=%s',(json.dumps(dict(PAYLOAD,asset_type='option')),))
+    conn.commit()
+    recover_entries(conn,lambda _:ORDER)
+    with conn.cursor() as q:
+        q.execute('SELECT position_id FROM nwt_portfolio_ledger');pid=str(q.fetchone()[0])
+        # Requested risk deliberately differs from actual filled contracts.
+        q.execute('UPDATE nwt_portfolio_ledger SET notional_risk=1')
+    conn.commit()
+    receipt=close_receipt(pid,filled_avg_price='91')
+    monkeypatch.setattr(engine,'option_close_order',lambda _:receipt)
+    monkeypatch.setattr(engine,'poll_order_until_filled',lambda _:receipt)
+    engine.process_close_ticket(conn,dict(ticket_id=OID,payload=dict(position_id=pid,asset_type='option',symbol='VGK')))
+    with conn.cursor() as q:
+        q.execute('SELECT count(*) FROM nwt_trade_outcomes');assert q.fetchone()==(0,)
+    learning.main();learning.main()
+    with conn.cursor() as q:
+        q.execute('SELECT count(*),sum(pnl) FROM nwt_verified_learning_outcomes')
+        assert q.fetchone()==(1,Decimal('4276.0000'))
+        q.execute('SELECT count(*) FROM nwt_trade_outcomes');assert q.fetchone()==(1,)
+
+
+def test_partial_close_inherits_entry_and_counts_one_trade(learning_close_db):
+    from close_recovery import recover_closes
+    import allocator
+    conn,learning=learning_close_db
+    recover_entries(conn,lambda _:ORDER)
+    with conn.cursor() as q:
+        q.execute('SELECT position_id FROM nwt_portfolio_ledger');pid=str(q.fetchone()[0])
+        # Changing mutable decision context must not affect the child's snapshot.
+        q.execute("UPDATE nwt_decision_inputs SET regime='{}'")
+    conn.commit()
+    first=close_receipt(pid,status='partially_filled',filled_qty='12',filled_avg_price='90')
+    recover_closes(conn,lambda _:first);learning.main()
+    with conn.cursor() as q:
+        q.execute('SELECT count(*) FROM nwt_verified_learning_outcomes');assert q.fetchone()==(0,)
+    recover_closes(conn,lambda _:close_receipt(pid,filled_avg_price='91'))
+    learning.main();learning.main()
+    with conn.cursor() as q:
+        q.execute('SELECT count(*),sum(pnl) FROM nwt_verified_learning_outcomes');assert q.fetchone()==(2,Decimal('42.7600'))
+        q.execute("SELECT count(*) FROM nwt_entry_evidence WHERE eligible AND snapshot->'decision_context'->'regime'->>'primary_regime'='range'");assert q.fetchone()==(2,)
+    assert allocator._bot_score(conn,'eu','range')['total_sample']==1

@@ -80,7 +80,6 @@ def fetch_unprocessed_closed_positions(conn) -> list:
             WHERE pl.status = 'closed'
               AND pl.strategy_id IS DISTINCT FROM 'QA_PAPER_LIFECYCLE'
               AND pl.exit_price IS NOT NULL
-              AND pl.alpaca_order_id IS NOT NULL
               AND EXISTS (SELECT 1 FROM nwt_entry_evidence ee WHERE ee.position_id=pl.position_id)
               AND NOT EXISTS (
                   SELECT 1 FROM nwt_trade_outcomes to_

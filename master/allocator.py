@@ -46,13 +46,15 @@ def _fetch_bot_trades(conn, bot_key: str, limit: int = LOOKBACK_TRADES) -> list:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT COALESCE(to_.pnl_adjusted, to_.pnl) AS pnl,
-                   to_.regime_at_entry->>'primary_regime' AS primary_regime
+            SELECT SUM(COALESCE(to_.pnl_adjusted, to_.pnl)) AS pnl,
+                   CASE WHEN COUNT(DISTINCT to_.regime_at_entry->>'primary_regime')=1
+                        THEN MIN(to_.regime_at_entry->>'primary_regime') END AS primary_regime
             FROM nwt_verified_learning_outcomes to_
             JOIN nwt_portfolio_ledger pl ON pl.position_id = to_.position_id
             WHERE pl.bot_source = %s AND to_.closed_at IS NOT NULL
               AND COALESCE(to_.pnl_adjusted, to_.pnl) IS NOT NULL
-            ORDER BY to_.closed_at DESC
+            GROUP BY COALESCE(pl.spread_group_id, pl.position_id)
+            ORDER BY MAX(to_.closed_at) DESC
             LIMIT %s
             """,
             (bot_source, limit),

@@ -98,3 +98,15 @@ def load(conn, position_id):
         q.execute('SELECT snapshot FROM nwt_entry_evidence WHERE position_id=%s', (position_id,))
         row = q.fetchone()
     return row[0] if row else {'eligible': False, 'reasons': ['missing_entry_snapshot']}
+
+
+def inherit(conn, position_id, parent_id):
+    """A close segment inherits only its parent's frozen entry, never today's context.
+
+    Missing legacy parent evidence creates no snapshot and cannot enter learning.
+    The ledger caller creates the segment in this same locked close transaction.
+    """
+    with conn.cursor() as q:
+        q.execute("INSERT INTO nwt_entry_evidence(position_id,decision_id,eligible,snapshot,parent_position_id) "
+                  "SELECT %s,decision_id,eligible,snapshot,%s::uuid "
+                  "FROM nwt_entry_evidence WHERE position_id=%s", (position_id,str(parent_id),parent_id))
