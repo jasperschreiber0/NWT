@@ -341,10 +341,14 @@ def seal(folder,event_id,features,receipt):
     r=registration(folder)
     if attempt_path(folder,event_id,True).exists():raise ValueError('One attempt only; inference already terminal')
     try:
-        event=census(folder)[0][event_id]
-        # Retain even a rejected original receipt before validating it.
+        # Retain even a rejected original receipt before checking eligibility.
         exclusive(Path(folder)/('inference-receipt-'+digest(event_id)+'.json'),receipt)
         append(folder,'inference_receipt_received',dict(event_id=event_id,receipt_sha256=digest(receipt)))
+        events=census(folder)[0]
+        if event_id not in events:
+            append(folder,'inference_receipt_rejected',dict(event_id=event_id,receipt_sha256=digest(receipt),reason='event_not_admitted'))
+            raise KeyError(event_id)
+        event=events[event_id]
         validate_attempt(folder,r,event,features,receipt,journal(folder))
         value=_seal(folder,event_id,features,receipt)
         success=dict(event_id=event_id,attempt_id=receipt['body']['attempt_id'],status='SUCCEEDED',at=now().isoformat(),receipt_sha256=digest(receipt))

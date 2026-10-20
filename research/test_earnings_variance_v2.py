@@ -400,6 +400,17 @@ def test_amendment_after_request_produces_terminal_failure(experiment):
     ev.discover(x[0],x[1][0].isoformat(),x[4],[corrected])
     with pytest.raises(KeyError):ev.seal(x[0],e['event_id'],f,r)
     assert ev.inference_accounting(x[0],ev.journal(x[0]))=={'SUCCEEDED':0,'FAILED':1}
+    saved=x[0]/('inference-receipt-'+ev.digest(e['event_id'])+'.json')
+    original=saved.read_bytes()
+    assert json.loads(original)==r
+    rows=ev.journal(x[0])
+    rejected=[row for row in rows if row['action']=='inference_receipt_rejected']
+    assert rejected[0]['payload']==dict(event_id=e['event_id'],receipt_sha256=ev.digest(r),reason='event_not_admitted')
+    assert not ev.census(x[0])[0]
+    assert not any(row['action'] in ('prediction','inference_succeeded') for row in rows)
+    with pytest.raises(ValueError,match='already terminal'):
+        ev.seal(x[0],e['event_id'],f,dict(r,signature='replacement'))
+    assert saved.read_bytes()==original
 
 
 @pytest.mark.parametrize('field,value',[('network_attempt_limit',2),('sdk_retries',1),('sign_only_journaled_attempts',False),('record_terminal_failures',False),('timestamp_custody_reference','')])
