@@ -416,12 +416,33 @@ def compute_strategy_decay(conn, key: str, key_column: str = "strategy_id") -> N
 # Main
 # ---------------------------------------------------------------------------
 
+def optional_metadata(value, kind, name, issues):
+    """Malformed optional enrichment is unknown, never a raw-accounting veto."""
+    if value is None:
+        return {} if kind is dict else None
+    if kind is float:
+        try:
+            if isinstance(value, bool):raise ValueError('boolean')
+            number=float(value)
+            if math.isfinite(number):return number
+        except (ValueError, TypeError, OverflowError):
+            pass
+    elif isinstance(value, kind):
+        return value
+    issues.append(name)
+    return {} if kind is dict else None
+
+
 def record_closed_outcome(conn, pos, *, commit=True):
     """Single idempotent outcome writer shared by verified closes and catch-up.
 
     With commit=False, caller owns rollback/commit so ledger and raw risk loss
     become visible atomically. Missing entry provenance remains quarantined.
     """
+    issues = []
+    def optional(value, kind, name):
+        return optional_metadata(value, kind, name, issues)
+
     position_id = str(pos.get("position_id", ""))
     asset = pos.get("asset", "")
     entry_price = float(pos.get("entry_price") or 0)
@@ -433,7 +454,7 @@ def record_closed_outcome(conn, pos, *, commit=True):
     if quantity is None or not math.isfinite(float(quantity)) or float(quantity) <= 0:
         raise ValueError("Unknown filled quantity for " + position_id)
     notional = entry_price * float(quantity) * (100 if pos.get("asset_type") == "option" else 1)
-    realized_slippage = float(pos['realized_slippage']) if pos.get('realized_slippage') is not None else None
+    realized_slippage = optional(pos.get('realized_slippage'), float, 'realized_slippage')
     alpaca_order_id = pos.get("alpaca_order_id", "")
     bot_source = pos.get("bot_source", "")
     ledger_ticket_id = pos.get("ticket_id")
@@ -459,21 +480,22 @@ def record_closed_outcome(conn, pos, *, commit=True):
     )
 
     # Find original ticket for signal quality and regime context
-    evidence = load_entry_evidence(conn, position_id)
+    evidence = optional(load_entry_evidence(conn, position_id), dict, 'entry_evidence')
     original_ticket = find_original_ticket(conn, ledger_ticket_id, entry_time)
-    original_payload = (original_ticket.get("payload") or {}) if original_ticket else {}
+    original_payload = optional(original_ticket.get('payload') if original_ticket else None, dict, 'ticket_payload')
 
     # Strategy ID — ledger column is authoritative (written at fill);
     # ticket fishing is the legacy fallback
     strategy_id = (
-        pos.get("strategy_id")
-        or original_payload.get("strategy_id")
-        or bot_source
+        optional(pos.get('strategy_id'), str, 'strategy_id')
+        or optional(original_payload.get('strategy_id'), str, 'ticket_strategy_id')
+        or optional(bot_source, str, 'bot_source')
         or "UNKNOWN"
     )
 
     # Archetype — attribution pools here; genome is the source of truth
-    archetype = (evidence.get('decision_context') or {}).get('archetype') or 'UNKNOWN'
+    context = optional(evidence.get('decision_context'), dict, 'decision_context')
+    archetype = optional(context.get('archetype'), str, 'archetype') or 'UNKNOWN'
 
     # pnl_adjusted — spread-haircut PnL from captured NBBO (or default
     # spread when quotes are missing). This is the number that matters.
@@ -483,22 +505,22 @@ def record_closed_outcome(conn, pos, *, commit=True):
         exit_price,
         direction,
         notional,
-        pos.get("entry_bid"),
-        pos.get("entry_ask"),
-        pos.get("exit_bid"),
-        pos.get("exit_ask"),
+        optional(pos.get('entry_bid'), float, 'entry_bid'),
+        optional(pos.get('entry_ask'), float, 'entry_ask'),
+        optional(pos.get('exit_bid'), float, 'exit_bid'),
+        optional(pos.get('exit_ask'), float, 'exit_ask'),
         asset_type,
     )
 
     # Signal quality — logged SEPARATELY from PnL quality
-    sq = original_payload.get("signal_quality", {})
-    entry_timing_score = sq.get("entry_timing_score")
-    thesis_validity = sq.get("thesis_validity")
-    expected_move_capture = float(sq['expected_move_capture']) if sq.get('expected_move_capture') is not None else None
+    sq = optional(original_payload.get('signal_quality'), dict, 'signal_quality')
+    entry_timing_score = optional(sq.get('entry_timing_score'), float, 'entry_timing_score')
+    thesis_validity = optional(sq.get('thesis_validity'), str, 'thesis_validity')
+    expected_move_capture = optional(sq.get('expected_move_capture'), float, 'expected_move_capture')
 
     # Exit timing score — computed from actual vs expected outcome
-    stop_pct = abs(float(original_payload['stop_pct'])) if original_payload.get('stop_pct') is not None else None
-    target_pct = abs(float(original_payload['target_pct'])) if original_payload.get('target_pct') is not None else None
+    stop_pct = optional(original_payload.get('stop_pct'), float, 'stop_pct')
+    target_pct = optional(original_payload.get('target_pct'), float, 'target_pct')
     exit_timing_score = compute_exit_timing_score(
         exit_price, entry_price, direction, stop_pct, target_pct
     ) if stop_pct is not None and target_pct is not None else None
@@ -509,8 +531,10 @@ def record_closed_outcome(conn, pos, *, commit=True):
     ) if expected_move_capture is not None else None
 
     # Point-in-time unknowns stay unknown. Decision IV is not fill-time IV.
-    iv_at_entry = evidence.get('iv_at_entry')
-    regime_at_entry = evidence.get('regime_at_entry') or {'status': 'unknown'}
+    iv_at_entry = optional(evidence.get('iv_at_entry'), float, 'iv_at_entry')
+    regime_at_entry = optional(evidence.get('regime_at_entry'), dict, 'regime_at_entry') or {'status': 'unknown'}
+    if issues:
+        regime_at_entry = dict(regime_at_entry, optional_metadata_issues=sorted(set(issues)))
     dte_at_entry = None
 
     with conn.cursor() as cur:
@@ -580,7 +604,7 @@ def record_closed_outcome(conn, pos, *, commit=True):
                 expected_move_capture,
                 realized_move_capture,
                 exit_time,
-                VERSION if evidence.get("eligible") else "raw-fill-unverified-20261020-v1",
+                VERSION if evidence.get("eligible") is True and not issues else "raw-fill-unverified-20261020-v1",
             ),
         )
         outcome_row_id = cur.fetchone()[0]

@@ -413,3 +413,35 @@ def test_outcome_failure_rolls_back_verified_close(learning_close_db):
     with conn.cursor() as q:
         q.execute('SELECT status FROM nwt_portfolio_ledger');assert q.fetchone()==('open',)
         q.execute('SELECT count(*) FROM nwt_trade_outcomes');assert q.fetchone()==(0,)
+
+@pytest.mark.parametrize('payload,quarantined',[
+    ({'signal_quality':None},False),
+    ({'signal_quality':['invalid']},True),
+    ({'signal_quality':{'entry_timing_score':{'bad':1},'expected_move_capture':'not-a-number','thesis_validity':['invalid']},
+      'stop_pct':'NaN','target_pct':{'bad':1}},True),
+    (['invalid-ticket-payload'],True),
+])
+def test_optional_enrichment_never_blocks_immediate_close_accounting(learning_close_db,payload,quarantined):
+    from ledger import close_position
+    from risk_agent import get_intraday_pnl
+    conn,learning=learning_close_db
+    recover_entries(conn,lambda _:ORDER)
+    with conn.cursor() as q:
+        q.execute('SELECT position_id FROM nwt_portfolio_ledger');pid=str(q.fetchone()[0])
+        q.execute('UPDATE nwt_tickets SET payload=%s',(json.dumps(payload),))
+    conn.commit()
+    close_position(conn,pid,80,0,'test_optional_metadata')
+    # No nightly worker call before the real risk query.
+    assert get_intraday_pnl(conn)<-309
+    with conn.cursor() as q:
+        q.execute('SELECT status FROM nwt_portfolio_ledger');assert q.fetchone()==('closed',)
+        q.execute('SELECT pnl,entry_timing_score,expected_move_capture,thesis_validity,exit_timing_score,evidence_version,regime_at_entry FROM nwt_trade_outcomes')
+        row=q.fetchone()
+        assert row[0]==Decimal('-309.2400') and row[1:5]==(None,None,None,None)
+        if quarantined:
+            assert row[5]=='raw-fill-unverified-20261020-v1'
+            assert row[6]['optional_metadata_issues']
+        q.execute('SELECT count(*) FROM nwt_verified_learning_outcomes');assert q.fetchone()==(0 if quarantined else 1,)
+    learning.main()
+    with conn.cursor() as q:
+        q.execute('SELECT count(*) FROM nwt_trade_outcomes');assert q.fetchone()==(1,)
