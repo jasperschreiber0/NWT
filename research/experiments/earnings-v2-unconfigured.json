@@ -8,5 +8,6 @@
   "source_map_reference": null,
   "model_revision_reference": null,
   "extraction_version": null,
-  "evidence_class": null
+  "evidence_class": null,
+  "recorder_contract": null
 }
