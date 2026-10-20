@@ -774,54 +774,6 @@ def compute_pnl_adjusted(asset_type: str, pnl: float, entry_price: float,
         return pnl - haircut, "equity_1bp_v1"
 
 
-def write_trade_outcome(conn, position: dict, fill_price: float,
-                        exit_reason: str, strategy_id: str = None) -> None:
-    """Write a completed nwt_trade_outcomes row. Called on options position close."""
-    entry_price = float(position.get("entry_price") or 0)
-    notional = float(position.get("notional_risk") or 0)
-    qty = max(int(round(notional / (entry_price * 100))) if entry_price > 0 else 1, 1)
-
-    pnl = (fill_price - entry_price) * qty * 100
-    if position.get("direction") == "short":
-        pnl = -pnl
-
-    pnl_adj, slippage_model = compute_pnl_adjusted(
-        "option", pnl, entry_price, fill_price, qty
-    )
-
-    entry_time = position.get("entry_time")
-    entry_dt = entry_time if isinstance(entry_time, datetime) else datetime.now(timezone.utc)
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO nwt_trade_outcomes (
-              strategy_id, symbol, direction,
-              entry_price, entry_time, exit_price, exit_time,
-              pnl, pnl_pct, pnl_adjusted, slippage_model,
-              position_id, closed_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT DO NOTHING
-            """,
-            (
-                strategy_id or position.get("bot_source", "UNKNOWN"),
-                position.get("asset", ""),
-                position.get("direction", ""),
-                entry_price, entry_dt, fill_price,
-                round(pnl, 4),
-                round(pnl / notional, 6) if notional > 0 else 0,
-                round(pnl_adj, 4),
-                slippage_model,
-                str(position.get("position_id", "")),
-            ),
-        )
-    conn.commit()
-
-
-# ---------------------------------------------------------------------------
-# Position monitor (equity multi-day exits)
-# ---------------------------------------------------------------------------
-
 def run_equity_position_monitor(conn) -> None:
     positions = get_open_positions(conn)
     equity_positions = [p for p in positions if p.get("asset_type") == "equity"
@@ -1023,9 +975,8 @@ def process_close_ticket(conn, ticket: dict) -> None:
             if pos:
                 pos = dict(pos)
                 close_position(conn, position_id, fill_price, slippage, exit_reason)
-                if asset_type == "option":
-                    write_trade_outcome(conn, pos, fill_price, exit_reason,
-                                        payload.get("strategy_id"))
+                # The learning worker is the sole outcome writer. It uses actual
+                # filled quantities and immutable entry evidence for all assets.
 
         insert_decision(conn, ticket_id, "EXECUTED",
                         f"Closed {symbol} at {fill_price:.4f} reason={exit_reason}")

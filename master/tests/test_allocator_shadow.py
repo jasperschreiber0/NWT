@@ -20,17 +20,17 @@ def allocator_db():
     conn = psycopg2.connect(os.environ['NWT_TEST_DB_DSN'])
     with conn.cursor() as q:
         q.execute('''
-          CREATE TEMP TABLE nwt_portfolio_ledger(position_id uuid PRIMARY KEY, bot_source text);
+          CREATE TEMP TABLE nwt_portfolio_ledger(position_id uuid PRIMARY KEY, bot_source text, spread_group_id uuid);
           CREATE TEMP TABLE nwt_trade_outcomes(position_id uuid, pnl numeric, pnl_adjusted numeric,
             regime_at_entry jsonb, closed_at timestamptz);
+          CREATE TEMP VIEW nwt_verified_learning_outcomes AS SELECT * FROM nwt_trade_outcomes;
           CREATE TEMP TABLE nwt_allocator_history(bot text, regime text, baseline_weight numeric,
             dynamic_weight numeric, sample_trades integer, rolling_expectancy numeric, sharpe_proxy numeric, note text);
-          INSERT INTO nwt_portfolio_ledger VALUES
-            ('11111111-1111-1111-1111-111111111111','EU_BOT'),
-            ('22222222-2222-2222-2222-222222222222','AUS_BOT');
+          INSERT INTO nwt_portfolio_ledger(position_id,bot_source)
+            SELECT gen_random_uuid(),bot FROM unnest(ARRAY['EU_BOT','AUS_BOT']) bot CROSS JOIN generate_series(1,20);
           INSERT INTO nwt_trade_outcomes
             SELECT position_id, 999, CASE WHEN bot_source='EU_BOT' THEN -20 ELSE 30 END,
-              '{"primary_regime":"risk_on"}'::jsonb, now() FROM nwt_portfolio_ledger CROSS JOIN generate_series(1,20);
+              '{"primary_regime":"risk_on"}'::jsonb, now() FROM nwt_portfolio_ledger;
         ''')
     conn.commit()
     yield conn
@@ -56,7 +56,7 @@ def test_native_uuid_join_produces_shadow_but_never_changes_effective_weights(al
 def test_database_failure_is_visible_and_connection_recovers(allocator_db, stage):
     with allocator_db.cursor() as q:
         if stage=='score':
-            q.execute('ALTER TABLE nwt_trade_outcomes RENAME COLUMN pnl_adjusted TO unavailable')
+            q.execute('DROP VIEW nwt_verified_learning_outcomes')
         else:
             q.execute("ALTER TABLE nwt_allocator_history ADD CHECK(bot='impossible')")
     allocator_db.commit()
@@ -94,3 +94,23 @@ def test_strategist_reports_allocator_failure_without_activating_shadow(monkeypa
     assert directives['allocator_status']==('failed' if failed else 'ok')
     assert state.call_args.args[2]==('degraded' if failed else 'ok')
     if failed:conn.rollback.assert_called()
+
+
+@pytest.mark.parametrize('segments',[1,2])
+def test_four_four_leg_trades_remain_four_samples(allocator_db,segments):
+    import uuid
+    c=allocator_db
+    with c.cursor() as q:
+        q.execute('DELETE FROM nwt_trade_outcomes');q.execute('DELETE FROM nwt_portfolio_ledger')
+        for _ in range(4):
+            group=str(uuid.uuid4())
+            for leg in range(4*segments):
+                pid=str(uuid.uuid4())
+                q.execute("INSERT INTO nwt_portfolio_ledger VALUES(%s,'EU_BOT',%s)",(pid,group))
+                q.execute("INSERT INTO nwt_trade_outcomes VALUES(%s,10,5,'{}',now())",(pid,))
+    c.commit()
+    score=allocator._bot_score(c,'eu','range')
+    assert score['sample']==score['total_sample']==4
+    assert score['expectancy']==20*segments
+    effective,notes=allocator.compute_dynamic_weights(c,{},BASE)
+    assert effective==BASE and any('only 0/4' in n for n in notes)

@@ -71,7 +71,7 @@ def recover_closes(conn,get):
                         # Closed segments and the remaining root share a group;
                         # complete-trade reports wait for every segment to close.
                         group=position.get('spread_group_id') or pid
-                        part=dict(position,alpaca_order_id=None,qty=delta,notional_risk=Decimal(str(position['notional_risk']))*delta/remaining,spread_group_id=group)
+                        part=dict(position,entry_evidence_parent_id=pid,alpaca_order_id=None,qty=delta,notional_risk=Decimal(str(position['notional_risk']))*delta/remaining,spread_group_id=group)
                         child=insert_position(conn,part,commit=False)
                         close_position(conn,child,increment_price,0,'verified_partial_close',exit_time=stamp,commit=False)
                         q.execute('UPDATE nwt_portfolio_ledger SET qty=%s,notional_risk=%s,spread_group_id=%s,close_requested=true WHERE position_id=%s',

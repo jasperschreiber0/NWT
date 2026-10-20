@@ -7,23 +7,26 @@ from paper_io import Paper,STATE,atomic,stamp
 
 def cash_adjustment(activities):
     amount=0.;ambiguous=[]
+    seen={}
     for row in activities:
+        ident=row['id']
+        if ident in seen:
+            if seen[ident] != row: raise ValueError('Conflicting account activity')
+            continue
+        seen[ident]=row
         kind=row.get('activity_type')
         if kind in ('CSD','CSW'):amount+=float(row['net_amount'])
         elif kind in ('ACATC','ACATS','JNLC','JNLS','TRANS'):ambiguous.append(row['id'])
     return dict(net_external_cash=amount,ambiguous_transfer_ids=ambiguous)
 
 
-def expenses(config,elapsed_days):
-    services=['alpaca','hetzner','railway','supabase']
-    missing=[s for s in services if not isinstance(config.get(s),dict) or config[s].get('monthly_usd') is None]
-    if missing:return dict(complete=False,missing=missing,accrued_usd=None)
-    amounts=[float(config[s]['monthly_usd']) for s in services]
-    import math
-    if any(not math.isfinite(x) or x<0 for x in amounts):raise ValueError('Invalid monthly operating costs')
-    monthly=sum(amounts)
-    return dict(complete=True,monthly_usd=monthly,accrued_usd=monthly*elapsed_days/(365.25/12),
-                monthly_break_even_on_5000=monthly/5000)
+def expenses(config, elapsed_days=None, *, start=None, end=None):
+    from cost_accounting import operating_costs
+    if start is None or end is None:
+        return dict(complete=False, missing=['explicit_window_and_reconciled_service_evidence'], accrued_usd=None)
+    if stamp(start) == (stamp(end) if isinstance(end, str) else end):
+        return dict(complete=False, missing=['initial_baseline_no_elapsed_window'], accrued_usd=None)
+    return operating_costs(config.get('records', []), config.get('coverage', {}), start, end)
 
 
 def trace(rows):
@@ -71,7 +74,7 @@ def main():
         activities=[];flows=dict(net_external_cash=None,ambiguous_transfer_ids=[]);activity_status='UNAVAILABLE'
     elapsed=max(0,(now-stamp(baseline['observed_at'])).total_seconds()/86400)
     config_path=STATE/'operating-costs.json'
-    costs=expenses(json.loads(config_path.read_text()) if config_path.exists() else {},elapsed)
+    costs=expenses(json.loads(config_path.read_text()) if config_path.exists() else {},elapsed,start=baseline['observed_at'],end=now)
     change=float(account['equity'])-float(baseline['equity'])
     profit=change-flows['net_external_cash'] if activity_status=='COMPLETE' and not flows['ambiguous_transfer_ids'] else None
     conn=paper.db()
@@ -95,14 +98,14 @@ def main():
         reference_100k_change=float(account['equity'])-100000,reference_note='Reference difference only; not verified lifetime cash-flow-adjusted profit',
         measured_since=baseline['observed_at'],measured_equity_change=change,flows=flows,activity_status=activity_status,
         measured_trading_profit=profit,operating_costs=costs,
-        measured_after_operating_costs=profit-costs['accrued_usd'] if profit is not None and costs['complete'] else None,
+        measured_after_operating_costs=profit-float(costs['accrued_usd']) if profit is not None and costs['complete'] else None,
         broker_reported_fee_activities=sum(float(x.get('net_amount') or 0) for x in activities if x.get('activity_type')=='FEE'),
         fee_note='Broker fees already affect account equity; never deducted twice. Trade adjusted outcomes use separate modeled costs.',
         completed_trade_groups=grouped,trace=trace(rows),proposals=proposals,
         limitations=['Transfer journals require classification before net profit is claimed','Legacy missing links remain explicit'])
     db.execute('INSERT INTO snapshots VALUES (?,?)',(now.isoformat(),json.dumps(report,default=str)));db.commit();db.close()
     atomic(STATE/'unified-performance.json',report)
-    print(json.dumps({k:report[k] for k in ['status','equity','unrealized_broker','measured_trading_profit','operating_costs']}))
+    print(json.dumps({k:report[k] for k in ['status','equity','unrealized_broker','measured_trading_profit','operating_costs']}, default=str, allow_nan=False))
 
 
 if __name__=='__main__':main()

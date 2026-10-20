@@ -77,6 +77,16 @@ def insert_position(conn, data: dict, *, commit=True) -> str:
             ),
         )
         position_id = cur.fetchone()[0]
+    # Freeze exact decision context before the insert transaction commits.
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'nwt_agents'))
+    from entry_evidence import capture
+    if data.get('entry_evidence_parent_id'):
+        from entry_evidence import inherit
+        inherit(conn, position_id, data['entry_evidence_parent_id'])
+    else:
+        capture(conn, position_id, data)
     if commit:
         conn.commit()
     logger.info("Inserted position %s for %s (%s)", position_id, data["asset"], data["bot_source"])
@@ -104,6 +114,7 @@ def close_position(
             UPDATE nwt_portfolio_ledger
             SET status = 'closed',
                 lifecycle_state = 'CLOSED',
+                outcome_accounting_version = 'fill-close-20261020-v1',
                 exit_price = %s,
                 exit_time = %s,
                 realized_slippage = %s,
@@ -115,7 +126,22 @@ def close_position(
             (exit_price, exit_time or datetime.now(timezone.utc), slippage, exit_reason, exit_bid, exit_ask, position_id),
         )
         if cur.rowcount == 0:
-            logger.warning("close_position: no rows updated for position_id=%s", position_id)
+            raise ValueError('Close position not found: '+str(position_id))
+    # Commit the exact filled-quantity outcome together with the ledger close.
+    # Risk reads raw outcomes immediately; learning still requires entry evidence.
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'nwt_agents'))
+    from learning_agent import record_closed_outcome
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute('SELECT * FROM nwt_portfolio_ledger WHERE position_id=%s', (position_id,))
+        closed = dict(cur.fetchone())
+    if closed.get('strategy_id') != 'QA_PAPER_LIFECYCLE':
+        try:
+            record_closed_outcome(conn, closed, commit=False)
+        except Exception:
+            conn.rollback()
+            raise
     if commit:
         conn.commit()
     logger.info("Closed position %s at %.4f slippage=%.4f reason=%s",

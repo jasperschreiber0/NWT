@@ -172,7 +172,7 @@ def get_consecutive_losses_by_track(conn) -> dict:
     """
     result = {}
     for track in ("C", "D", "E"):
-        trades = get_distinct_trade_pnls(conn, strategy_prefix=track, order="DESC", limit=4)
+        trades = get_distinct_trade_pnls(conn, strategy_prefix=track, order="DESC", limit=4, verified_only=False)
         losses = sum(1 for pnl, _closed_at in trades if pnl is not None and pnl < 0)
         result[track] = losses
     return result

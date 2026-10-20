@@ -8,6 +8,7 @@ skip cleanly if that isn't configured/reachable rather than failing the
 whole suite.
 """
 import os
+from pathlib import Path
 
 import psycopg2
 import pytest
@@ -52,6 +53,14 @@ CREATE TABLE nwt_trade_outcomes (
     position_id UUID REFERENCES nwt_portfolio_ledger(position_id)
 );
 """
+
+
+# Aggregation fixtures now explicitly distinguish verified evidence from legacy.
+SCHEMA_SQL += """
+DROP TABLE IF EXISTS nwt_entry_evidence CASCADE;
+DROP TABLE IF EXISTS nwt_decision_inputs CASCADE;
+CREATE TABLE nwt_decision_inputs(id uuid PRIMARY KEY);
+""" + (Path(__file__).resolve().parents[2]/'db/migrate_2026_10_20_learning_evidence.sql').read_text()
 
 
 @pytest.fixture()

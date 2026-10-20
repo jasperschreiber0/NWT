@@ -43,6 +43,8 @@ def aggregate(rows):
             'by_exit_reason':dict(exits),'by_entry_hour_et':dict(hours),
             'equity_buy_hold_same_intervals_gross':sum(x['long_buy_hold_same_interval_gross'] for x in trades if x['equity_only'])})
     return {'strategies':sorted(results,key=lambda x:x['net']),'excluded_groups':excluded,
+            'net_basis':'Legacy field net is modeled spread-stressed P&L, not fully loaded net profit',
+            'complete_costs':False,'fully_loaded_net_usd':None,
             'complete_groups':[t for trades in by_strategy.values() for t in trades],
             'benchmark_note':'Same-asset long buy-and-hold over each executed equity holding interval only; not a passive whole-period portfolio comparison.',
             'timing_note':'Descriptive buckets, not causal proof that changing an entry hour or exit rule improves returns.'}

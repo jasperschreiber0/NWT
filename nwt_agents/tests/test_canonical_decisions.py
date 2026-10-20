@@ -132,6 +132,10 @@ SCHEMA_SQL += '\nDROP TABLE IF EXISTS nwt_opportunity_outcomes CASCADE;\n' + (
     Path(__file__).resolve().parents[2] / 'db/migrate_2026_09_opportunity_outcomes.sql'
 ).read_text().replace('source_decision_id BIGINT', 'source_decision_id UUID')
 
+SCHEMA_SQL += '\nDROP TABLE IF EXISTS nwt_entry_evidence CASCADE;\n' + (
+    Path(__file__).resolve().parents[2] / 'db/migrate_2026_10_20_learning_evidence.sql'
+).read_text()
+
 @pytest.fixture()
 def conn():
     if not TEST_DSN:
@@ -332,6 +336,9 @@ def test_executed_decision_receives_outcome_id_via_deterministic_ticket_link(con
         stop_pct=-0.015, ticket_id=ticket_id, genome_version=1, stage_reached="SIGNAL",
     )
 
+    with conn.cursor() as q:
+        q.execute("INSERT INTO nwt_entry_evidence(position_id,decision_id,eligible,snapshot) SELECT %s,id,true,'{}' FROM nwt_decision_inputs WHERE ticket_id=%s", (position_id,ticket_id))
+    conn.commit()
     link_decision_outcome(conn, ticket_id, outcome_id)
 
     with conn.cursor() as cur:

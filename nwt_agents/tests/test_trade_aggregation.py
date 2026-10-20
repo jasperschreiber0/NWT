@@ -44,6 +44,11 @@ def _insert_outcome_leg(conn, strategy_id, position_id, pnl, closed_at, archetyp
             """,
             (strategy_id, archetype, pnl, closed_at, position_id),
         )
+        cur.execute('SELECT spread_group_id FROM nwt_portfolio_ledger WHERE position_id=%s',(position_id,))
+        decision_id=str(cur.fetchone()[0] or position_id)
+        cur.execute('INSERT INTO nwt_decision_inputs VALUES(%s) ON CONFLICT DO NOTHING',(decision_id,))
+        cur.execute('INSERT INTO nwt_entry_evidence(position_id,decision_id,eligible,snapshot) VALUES(%s,%s,true,%s)',(position_id,decision_id,'{"expected_assets":["TESTSYM"]}'))
+        cur.execute("UPDATE nwt_trade_outcomes SET evidence_version='entry-evidence-20261020-v1' WHERE position_id=%s",(position_id,))
     conn.commit()
 
 
@@ -180,7 +185,7 @@ def test_archetype_grouping_also_collapses_legs(conn):
     assert trades[0][0] == -10.0
 
 
-def test_legacy_row_with_no_position_id_is_its_own_trade(conn):
+def test_legacy_row_with_no_position_id_is_excluded_from_learning(conn):
     # Rows written before position_id existed — each must still count as one
     # trade (the same fallback fetch_unprocessed_closed_positions relies on).
     with conn.cursor() as cur:
@@ -193,5 +198,4 @@ def test_legacy_row_with_no_position_id_is_its_own_trade(conn):
 
     trades = get_distinct_trade_pnls(conn, strategy_id="D4")
 
-    assert len(trades) == 1
-    assert trades[0][0] == -7.0
+    assert trades == []

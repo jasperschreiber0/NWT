@@ -14,6 +14,7 @@ CRITICAL:
 
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -26,6 +27,8 @@ from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 
 load_dotenv(Path(__file__).parent / ".env")
+
+from entry_evidence import VERSION, load as load_entry_evidence
 
 from shared_context import (
     get_db,
@@ -65,14 +68,10 @@ def fetch_unprocessed_closed_positions(conn) -> list:
     """
     Return closed positions NOT yet in nwt_trade_outcomes.
 
-    Matches on position_id — the mandatory, unambiguous FK (CLAUDE.md's own
-    documented gotcha: "fuzzy symbol/time attribution is a bug"). The old
-    entry_time+symbol+direction match false-positives whenever two rows
-    share those three fields — two unrelated same-day, same-direction
-    trades on the same symbol collide and one silently never gets an
-    outcome row written. Legacy rows written before position_id existed
-    (OR branch) still match the old fuzzy way, once, so they aren't
-    reprocessed either.
+    Exact position identity only. New verified close accounting includes legacy
+    open positions without entry snapshots, but their outcomes remain quarantined.
+    The close-writer marker prevents automatic backfill of older closed history.
+    Existing outcomes are preserved; learning eligibility is enforced by the view.
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
@@ -82,14 +81,11 @@ def fetch_unprocessed_closed_positions(conn) -> list:
             WHERE pl.status = 'closed'
               AND pl.strategy_id IS DISTINCT FROM 'QA_PAPER_LIFECYCLE'
               AND pl.exit_price IS NOT NULL
-              AND pl.alpaca_order_id IS NOT NULL
+              AND (pl.outcome_accounting_version = 'fill-close-20261020-v1'
+                   OR EXISTS (SELECT 1 FROM nwt_entry_evidence ee WHERE ee.position_id=pl.position_id))
               AND NOT EXISTS (
                   SELECT 1 FROM nwt_trade_outcomes to_
                   WHERE to_.position_id = pl.position_id
-                     OR (to_.position_id IS NULL
-                         AND to_.entry_time = pl.entry_time
-                         AND to_.symbol = pl.asset
-                         AND to_.direction = pl.direction)
               )
             ORDER BY pl.exit_time ASC
             """
@@ -98,51 +94,16 @@ def fetch_unprocessed_closed_positions(conn) -> list:
     return [dict(r) for r in rows]
 
 
-def find_original_ticket(conn, alpaca_order_id: str, asset: str) -> Optional[dict]:
-    """
-    Find the original conviction/proposal ticket for this position.
-    Searches nwt_tickets payload for the alpaca_order_id or asset symbol.
-    """
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        # Try to find by alpaca_order_id in payload
-        cur.execute(
-            """
-            SELECT * FROM nwt_tickets
-            WHERE type IN ('TRADE_REQUEST', 'TRADE_PROPOSAL', 'CONVICTION_TICKET')
-              AND (
-                payload->>'alpaca_order_id' = %s
-                OR payload->>'option_symbol' = %s
-                OR payload->>'symbol' = %s
-              )
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            (alpaca_order_id, asset, asset),
-        )
-        row = cur.fetchone()
-    if not row:
+def find_original_ticket(conn, ledger_ticket_id, entry_time=None) -> Optional[dict]:
+    """Exact ledger FK only. No symbol/order fallback and no post-entry tickets."""
+    if not ledger_ticket_id:
         return None
-    ticket = dict(row)
-    # TRADE_REQUEST tickets whose originating TRADE_PROPOSAL predates the
-    # regime_at_decision field (or otherwise omitted it) leave regime_at_entry
-    # empty on every downstream nwt_trade_outcomes row — silently violating
-    # the "regime_at_entry is always a full JSONB object" invariant above.
-    # Follow source_proposal_ticket_id back to the TRADE_PROPOSAL to recover it.
-    payload = ticket.get("payload") or {}
-    if ticket.get("type") == "TRADE_REQUEST" and not payload.get("regime_at_decision"):
-        source_id = payload.get("source_proposal_ticket_id")
-        if source_id:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT * FROM nwt_tickets WHERE ticket_id = %s",
-                    (source_id,),
-                )
-                proposal_row = cur.fetchone()
-            if proposal_row:
-                proposal_payload = dict(proposal_row).get("payload") or {}
-                regime = proposal_payload.get("regime_at_decision")
-                if regime:
-                    ticket["payload"] = {**payload, "regime_at_decision": regime}
-    return ticket
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM nwt_tickets WHERE ticket_id=%s", (ledger_ticket_id,))
+        row = cur.fetchone()
+    if row and entry_time is not None and row['created_at'] <= entry_time:
+        return dict(row)
+    return None
 
 
 def resolve_decision_ticket_id(conn, ledger_ticket_id: str) -> Optional[str]:
@@ -247,14 +208,16 @@ def compute_edge_summary(conn, bucket_width: float = 0.5) -> list:
     """
     query = """
         WITH realized AS (
-            SELECT di.strategy_id, di.genome_version,
-                   COALESCE(di.regime->>'primary_regime', 'unknown') AS regime,
-                   di.direction,
-                   FLOOR(ABS(COALESCE(di.signal_strength, 0)) / %(bw)s) * %(bw)s AS strength_bucket,
-                   COALESCE(to_.pnl_adjusted, to_.pnl) AS pnl
+            SELECT to_.strategy_id, (ee.snapshot->'decision_context'->>'genome_version')::integer AS genome_version,
+                   ee.snapshot->'decision_context'->'regime'->>'primary_regime' AS regime,
+                   ee.snapshot->'decision_context'->>'direction' AS direction,
+                   FLOOR(ABS(COALESCE((ee.snapshot->'decision_context'->>'signal_strength')::numeric, 0)) / %(bw)s) * %(bw)s AS strength_bucket,
+                   SUM(COALESCE(to_.pnl_adjusted, to_.pnl)) AS pnl
             FROM nwt_decision_inputs di
-            JOIN nwt_trade_outcomes to_ ON to_.id = di.outcome_id
+            JOIN nwt_entry_evidence ee ON ee.decision_id=di.id AND ee.eligible
+            JOIN nwt_verified_learning_outcomes to_ ON to_.position_id=ee.position_id
             WHERE di.outcome_reason = 'EXECUTED'
+            GROUP BY to_.strategy_id, ee.decision_id, ee.snapshot->'decision_context'
         ),
         shadow AS (
             SELECT strategy_id, genome_version,
@@ -453,18 +416,217 @@ def compute_strategy_decay(conn, key: str, key_column: str = "strategy_id") -> N
 # Main
 # ---------------------------------------------------------------------------
 
+def optional_metadata(value, kind, name, issues):
+    """Malformed optional enrichment is unknown, never a raw-accounting veto."""
+    if value is None:
+        return {} if kind is dict else None
+    if kind is float:
+        try:
+            if isinstance(value, bool):raise ValueError('boolean')
+            number=float(value)
+            if math.isfinite(number):return number
+        except (ValueError, TypeError, OverflowError):
+            pass
+    elif isinstance(value, kind):
+        return value
+    issues.append(name)
+    return {} if kind is dict else None
+
+
+def record_closed_outcome(conn, pos, *, commit=True):
+    """Single idempotent outcome writer shared by verified closes and catch-up.
+
+    With commit=False, caller owns rollback/commit so ledger and raw risk loss
+    become visible atomically. Missing entry provenance remains quarantined.
+    """
+    issues = []
+    def optional(value, kind, name):
+        return optional_metadata(value, kind, name, issues)
+
+    position_id = str(pos.get("position_id", ""))
+    asset = pos.get("asset", "")
+    entry_price = float(pos.get("entry_price") or 0)
+    exit_price = float(pos.get("exit_price") or 0)
+    entry_time = pos.get("entry_time")
+    exit_time = pos.get("exit_time")
+    direction = pos.get("direction", "long")
+    quantity = pos.get("closed_qty") or pos.get("qty")
+    if quantity is None or not math.isfinite(float(quantity)) or float(quantity) <= 0:
+        raise ValueError("Unknown filled quantity for " + position_id)
+    notional = entry_price * float(quantity) * (100 if pos.get("asset_type") == "option" else 1)
+    realized_slippage = optional(pos.get('realized_slippage'), float, 'realized_slippage')
+    alpaca_order_id = pos.get("alpaca_order_id", "")
+    bot_source = pos.get("bot_source", "")
+    ledger_ticket_id = pos.get("ticket_id")
+
+    if not all(math.isfinite(p) and p > 0 for p in (entry_price, exit_price)):
+        raise ValueError("Missing or invalid entry/exit price for " + position_id)
+
+    # PnL computation
+    if direction == "long":
+        pnl = exit_price - entry_price
+        pnl_pct = pnl / entry_price
+    else:
+        pnl = entry_price - exit_price
+        pnl_pct = pnl / entry_price
+
+    # Adjust for notional
+    pnl_dollars = pnl_pct * notional
+    slippage_cost = realized_slippage * notional if realized_slippage is not None else None
+    slippage_adjusted_efficiency = (
+        pnl_dollars / (pnl_dollars + slippage_cost)
+        if slippage_cost is not None and (pnl_dollars + slippage_cost) != 0
+        else None
+    )
+
+    # Find original ticket for signal quality and regime context
+    evidence = optional(load_entry_evidence(conn, position_id), dict, 'entry_evidence')
+    original_ticket = find_original_ticket(conn, ledger_ticket_id, entry_time)
+    original_payload = optional(original_ticket.get('payload') if original_ticket else None, dict, 'ticket_payload')
+
+    # Strategy ID — ledger column is authoritative (written at fill);
+    # ticket fishing is the legacy fallback
+    strategy_id = (
+        optional(pos.get('strategy_id'), str, 'strategy_id')
+        or optional(original_payload.get('strategy_id'), str, 'ticket_strategy_id')
+        or optional(bot_source, str, 'bot_source')
+        or "UNKNOWN"
+    )
+
+    # Archetype — attribution pools here; genome is the source of truth
+    context = optional(evidence.get('decision_context'), dict, 'decision_context')
+    archetype = optional(context.get('archetype'), str, 'archetype') or 'UNKNOWN'
+
+    # pnl_adjusted — spread-haircut PnL from captured NBBO (or default
+    # spread when quotes are missing). This is the number that matters.
+    asset_type = pos.get("asset_type", "option")
+    pnl_adjusted, pnl_adjusted_pct, entry_spread_pct, exit_spread_pct = compute_pnl_adjusted(
+        entry_price,
+        exit_price,
+        direction,
+        notional,
+        optional(pos.get('entry_bid'), float, 'entry_bid'),
+        optional(pos.get('entry_ask'), float, 'entry_ask'),
+        optional(pos.get('exit_bid'), float, 'exit_bid'),
+        optional(pos.get('exit_ask'), float, 'exit_ask'),
+        asset_type,
+    )
+
+    # Signal quality — logged SEPARATELY from PnL quality
+    sq = optional(original_payload.get('signal_quality'), dict, 'signal_quality')
+    entry_timing_score = optional(sq.get('entry_timing_score'), float, 'entry_timing_score')
+    thesis_validity = optional(sq.get('thesis_validity'), str, 'thesis_validity')
+    expected_move_capture = optional(sq.get('expected_move_capture'), float, 'expected_move_capture')
+
+    # Exit timing score — computed from actual vs expected outcome
+    stop_pct = optional(original_payload.get('stop_pct'), float, 'stop_pct')
+    target_pct = optional(original_payload.get('target_pct'), float, 'target_pct')
+    exit_timing_score = compute_exit_timing_score(
+        exit_price, entry_price, direction, stop_pct, target_pct
+    ) if stop_pct is not None and target_pct is not None else None
+
+    # Realized move capture
+    realized_move_capture = compute_realized_move_capture(
+        entry_price, exit_price, direction, expected_move_capture
+    ) if expected_move_capture is not None else None
+
+    # Point-in-time unknowns stay unknown. Decision IV is not fill-time IV.
+    iv_at_entry = optional(evidence.get('iv_at_entry'), float, 'iv_at_entry')
+    regime_at_entry = optional(evidence.get('regime_at_entry'), dict, 'regime_at_entry') or {'status': 'unknown'}
+    if issues:
+        regime_at_entry = dict(regime_at_entry, optional_metadata_issues=sorted(set(issues)))
+    dte_at_entry = None
+
+    with conn.cursor() as cur:
+        # Serialize concurrent/repeated learning jobs by exact position.
+        cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', ('learning:'+position_id,))
+        cur.execute('SELECT 1 FROM nwt_trade_outcomes WHERE position_id=%s', (position_id,))
+        if cur.fetchone():
+            return False
+        cur.execute(
+            """
+            INSERT INTO nwt_trade_outcomes
+                (position_id, strategy_id, archetype, symbol, direction,
+                 entry_price, entry_time, exit_price, exit_time,
+                 pnl, pnl_pct,
+                 pnl_adjusted, pnl_adjusted_pct,
+                 entry_spread_pct, exit_spread_pct,
+                 iv_at_entry, iv_at_exit,
+                 regime_at_entry, regime_at_exit,
+                 dte_at_entry,
+                 slippage, slippage_adjusted_efficiency,
+                 entry_timing_score, exit_timing_score,
+                 thesis_validity,
+                 expected_move_capture, realized_move_capture,
+                 closed_at, evidence_version)
+            VALUES
+                (%s, %s, %s, %s, %s,
+                 %s, %s, %s, %s,
+                 %s, %s,
+                 %s, %s,
+                 %s, %s,
+                 %s, %s,
+                 %s, %s,
+                 %s,
+                 %s, %s,
+                 %s, %s,
+                 %s,
+                 %s, %s,
+                 %s, %s)
+            RETURNING id
+            """,
+            (
+                position_id,
+                strategy_id,
+                archetype,
+                asset,
+                direction,
+                entry_price,
+                entry_time,
+                exit_price,
+                exit_time,
+                round(pnl_dollars, 4),
+                round(pnl_pct, 6),
+                round(pnl_adjusted, 4),
+                round(pnl_adjusted_pct, 6),
+                round(entry_spread_pct, 6),
+                round(exit_spread_pct, 6),
+                iv_at_entry,
+                None,  # No measured exit-time IV
+                json.dumps(regime_at_entry),
+                json.dumps({'status': 'unknown', 'reason': 'No measured exit snapshot'}),
+                dte_at_entry,
+                realized_slippage,
+                round(slippage_adjusted_efficiency, 4) if slippage_adjusted_efficiency is not None else None,
+                entry_timing_score,   # signal quality — separate from PnL
+                exit_timing_score,    # signal quality — separate from PnL
+                thesis_validity,
+                expected_move_capture,
+                realized_move_capture,
+                exit_time,
+                VERSION if evidence.get("eligible") is True and not issues else "raw-fill-unverified-20261020-v1",
+            ),
+        )
+        outcome_row_id = cur.fetchone()[0]
+    if commit:
+        conn.commit()
+
+    # Deterministic decision -> outcome wiring (never a fuzzy
+    # timestamp/symbol join — see resolve_decision_ticket_id).
+    # Canonical one-to-many decision -> leg outcomes is the immutable
+    # snapshot join. The legacy scalar outcome_id cannot represent spreads.
+    logger.info(
+        "Logged outcome for %s (%s/%s): pnl=%.4f pnl_adjusted=%.4f exit_timing=%s entry_timing=%s",
+        asset, strategy_id, archetype, pnl_dollars, pnl_adjusted, exit_timing_score, entry_timing_score,
+    )
+    return True
+
+
 def main() -> None:
     conn = get_db()
 
     try:
-        layer0 = load_layer0_data()
-        symbols_data = layer0.get("symbols", {})
-
-        try:
-            directives = load_master_directives()
-            current_regime = directives.get("regime", {})
-        except FileNotFoundError:
-            current_regime = {"primary_regime": "unknown", "confidence": 0.0}
+        # Current market data must never be used as historical entry/exit evidence.
 
         closed_positions = fetch_unprocessed_closed_positions(conn)
         logger.info("Found %d unprocessed closed positions", len(closed_positions))
@@ -473,187 +635,14 @@ def main() -> None:
         strategies_seen = set()
 
         for pos in closed_positions:
-            position_id = str(pos.get("position_id", ""))
-            asset = pos.get("asset", "")
-            entry_price = float(pos.get("entry_price") or 0)
-            exit_price = float(pos.get("exit_price") or 0)
-            entry_time = pos.get("entry_time")
-            exit_time = pos.get("exit_time")
-            direction = pos.get("direction", "long")
-            notional = float(pos.get("notional_risk") or 0)
-            realized_slippage = float(pos.get("realized_slippage") or 0)
-            alpaca_order_id = pos.get("alpaca_order_id", "")
-            bot_source = pos.get("bot_source", "")
-            ledger_ticket_id = pos.get("ticket_id")
-
-            if entry_price <= 0 or exit_price <= 0:
-                logger.warning("Skipping position %s — missing entry/exit price", position_id)
-                continue
-
-            # PnL computation
-            if direction == "long":
-                pnl = exit_price - entry_price
-                pnl_pct = pnl / entry_price
-            else:
-                pnl = entry_price - exit_price
-                pnl_pct = pnl / entry_price
-
-            # Adjust for notional
-            pnl_dollars = pnl_pct * notional
-            slippage_cost = realized_slippage * notional
-            slippage_adjusted_efficiency = (
-                pnl_dollars / (pnl_dollars + slippage_cost)
-                if (pnl_dollars + slippage_cost) != 0
-                else 0.0
-            )
-
-            # Find original ticket for signal quality and regime context
-            original_ticket = find_original_ticket(conn, alpaca_order_id, asset)
-            original_payload = (original_ticket.get("payload") or {}) if original_ticket else {}
-
-            # Strategy ID — ledger column is authoritative (written at fill);
-            # ticket fishing is the legacy fallback
-            strategy_id = (
-                pos.get("strategy_id")
-                or original_payload.get("strategy_id")
-                or bot_source
-                or "UNKNOWN"
-            )
-
-            # Archetype — attribution pools here; genome is the source of truth
-            archetype = get_archetype(conn, strategy_id) or original_payload.get("archetype") or strategy_id
-
-            # pnl_adjusted — spread-haircut PnL from captured NBBO (or default
-            # spread when quotes are missing). This is the number that matters.
-            asset_type = pos.get("asset_type", "option")
-            pnl_adjusted, pnl_adjusted_pct, entry_spread_pct, exit_spread_pct = compute_pnl_adjusted(
-                entry_price,
-                exit_price,
-                direction,
-                notional,
-                pos.get("entry_bid"),
-                pos.get("entry_ask"),
-                pos.get("exit_bid"),
-                pos.get("exit_ask"),
-                asset_type,
-            )
-
-            # Signal quality — logged SEPARATELY from PnL quality
-            sq = original_payload.get("signal_quality", {})
-            entry_timing_score = sq.get("entry_timing_score", 0.5)
-            thesis_validity = sq.get("thesis_validity", "")
-            expected_move_capture = float(sq.get("expected_move_capture", 0.0))
-
-            # Exit timing score — computed from actual vs expected outcome
-            stop_pct = abs(float(original_payload.get("stop_pct", -0.50)))
-            target_pct = abs(float(original_payload.get("target_pct", 0.50)))
-            exit_timing_score = compute_exit_timing_score(
-                exit_price, entry_price, direction, stop_pct, target_pct
-            )
-
-            # Realized move capture
-            realized_move_capture = compute_realized_move_capture(
-                entry_price, exit_price, direction, expected_move_capture
-            )
-
-            # IV — from layer0 data (approximation using current; historical not available yet)
-            sym_data = symbols_data.get(asset, symbols_data.get(asset.split(":")[0], {}))
-            iv_current = sym_data.get("iv", 0.0)
-
-            # Regime at entry — from original ticket payload (full JSONB)
-            regime_at_entry = original_payload.get("regime_at_decision", {})
-            if not regime_at_entry:
-                regime_at_entry = current_regime
-
-            # DTE at entry — from original ticket
-            dte_at_entry = original_payload.get("dte_target") or original_payload.get("dte_min")
-
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO nwt_trade_outcomes
-                            (position_id, strategy_id, archetype, symbol, direction,
-                             entry_price, entry_time, exit_price, exit_time,
-                             pnl, pnl_pct,
-                             pnl_adjusted, pnl_adjusted_pct,
-                             entry_spread_pct, exit_spread_pct,
-                             iv_at_entry, iv_at_exit,
-                             regime_at_entry, regime_at_exit,
-                             dte_at_entry,
-                             slippage, slippage_adjusted_efficiency,
-                             entry_timing_score, exit_timing_score,
-                             thesis_validity,
-                             expected_move_capture, realized_move_capture,
-                             closed_at)
-                        VALUES
-                            (%s, %s, %s, %s, %s,
-                             %s, %s, %s, %s,
-                             %s, %s,
-                             %s, %s,
-                             %s, %s,
-                             %s, %s,
-                             %s, %s,
-                             %s,
-                             %s, %s,
-                             %s, %s,
-                             %s,
-                             %s, %s,
-                             %s)
-                        RETURNING id
-                        """,
-                        (
-                            position_id,
-                            strategy_id,
-                            archetype,
-                            asset,
-                            direction,
-                            entry_price,
-                            entry_time,
-                            exit_price,
-                            exit_time,
-                            round(pnl_dollars, 4),
-                            round(pnl_pct, 6),
-                            round(pnl_adjusted, 4),
-                            round(pnl_adjusted_pct, 6),
-                            round(entry_spread_pct, 6),
-                            round(exit_spread_pct, 6),
-                            iv_current,   # iv_at_entry (approximated)
-                            iv_current,   # iv_at_exit (same approximation until historical available)
-                            json.dumps(regime_at_entry),
-                            json.dumps(current_regime),  # regime_at_exit = current directives regime
-                            dte_at_entry,
-                            realized_slippage,
-                            round(slippage_adjusted_efficiency, 4),
-                            entry_timing_score,   # signal quality — separate from PnL
-                            exit_timing_score,    # signal quality — separate from PnL
-                            thesis_validity,
-                            expected_move_capture,
-                            realized_move_capture,
-                            exit_time,
-                        ),
-                    )
-                    outcome_row_id = cur.fetchone()[0]
-                conn.commit()
+            if record_closed_outcome(conn, pos):
                 outcomes_inserted += 1
-                strategies_seen.add(strategy_id)
-
-                # Deterministic decision -> outcome wiring (never a fuzzy
-                # timestamp/symbol join — see resolve_decision_ticket_id).
-                decision_ticket_id = resolve_decision_ticket_id(conn, ledger_ticket_id)
-                link_decision_outcome(conn, decision_ticket_id, str(outcome_row_id))
-                logger.info(
-                    "Logged outcome for %s (%s/%s): pnl=%.4f pnl_adjusted=%.4f exit_timing=%.2f entry_timing=%.2f",
-                    asset, strategy_id, archetype, pnl_dollars, pnl_adjusted, exit_timing_score, entry_timing_score,
-                )
-            except Exception as exc:
-                logger.error("Failed to insert outcome for position %s: %s", position_id, exc)
-                conn.rollback()
+                strategies_seen.add(pos.get('strategy_id') or pos.get('bot_source') or 'UNKNOWN')
 
         # Compute strategy decay for all strategies seen this run + any with enough history
         all_strategy_ids_with_data = set()
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT strategy_id FROM nwt_trade_outcomes")
+            cur.execute("SELECT DISTINCT strategy_id FROM nwt_verified_learning_outcomes")
             for row in cur.fetchall():
                 all_strategy_ids_with_data.add(row[0])
 
@@ -666,7 +655,7 @@ def main() -> None:
         # Pooled decay per archetype — the granularity with real sample sizes
         archetypes_with_data = set()
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT archetype FROM nwt_trade_outcomes WHERE archetype IS NOT NULL")
+            cur.execute("SELECT DISTINCT archetype FROM nwt_verified_learning_outcomes WHERE archetype IS NOT NULL")
             for row in cur.fetchall():
                 archetypes_with_data.add(row[0])
 
