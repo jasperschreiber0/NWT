@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 from copy import deepcopy
 from decimal import Decimal
 from datetime import timezone
@@ -16,36 +17,48 @@ ORDER=dict(id=OID,client_order_id='nwt-entry-'+TID,symbol='VGK',side='buy',qty='
 @pytest.fixture
 def recovery_db():
     conn=psycopg2.connect(os.environ['NWT_TEST_DB_DSN'])
-    with conn.cursor() as q:
-        q.execute('''
-        CREATE TEMP TABLE nwt_tickets(ticket_id uuid PRIMARY KEY,type text,payload jsonb,created_at timestamptz DEFAULT now());
-        CREATE TEMP TABLE nwt_entry_evidence(position_id uuid PRIMARY KEY,decision_id uuid,eligible boolean,snapshot jsonb,parent_position_id uuid);
-        CREATE TEMP TABLE nwt_entry_intents(ticket_id uuid);
-        CREATE TEMP TABLE nwt_ticket_decisions(ticket_id uuid,decision text,reasoning text,decided_by text,created_at timestamptz DEFAULT now());
-        CREATE UNIQUE INDEX recovery_partial_decision ON nwt_ticket_decisions(ticket_id,decided_by)
-          WHERE created_at >= TIMESTAMPTZ '2026-07-24 00:00:00+00';
-        CREATE TEMP TABLE nwt_decision_inputs(ticket_id uuid,outcome_reason text,stage_reached text);
-        CREATE TEMP TABLE nwt_system_log(level text,component text,message text,payload jsonb);
-        CREATE TEMP TABLE nwt_portfolio_ledger(position_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),bot_source text,strategy_id text,
-          asset text,asset_type text,direction text,delta_exposure numeric,notional_risk numeric,qty numeric,entry_price numeric,
-          entry_time timestamptz,entry_bid numeric,entry_ask numeric,alpaca_order_id uuid,stop_pct numeric,target_pct numeric,
-          spread_group_id uuid,ticket_id uuid,status text,lifecycle_state text,exit_price numeric,exit_time timestamptz,realized_slippage numeric,exit_reason text,exit_bid numeric,exit_ask numeric,close_generation integer DEFAULT 0,close_requested boolean DEFAULT false,outcome_accounting_version text);
-        CREATE UNIQUE INDEX recovery_order_asset ON nwt_portfolio_ledger(alpaca_order_id,asset) WHERE alpaca_order_id IS NOT NULL;
-        CREATE TEMP TABLE nwt_close_progress(position_id uuid,generation integer,order_id uuid,requested_qty numeric,recorded_qty numeric,recorded_value numeric,PRIMARY KEY(position_id,generation));
-        ''')
-        q.execute('INSERT INTO nwt_tickets(ticket_id,payload) VALUES(%s,%s)',(TID,json.dumps(PAYLOAD)))
-        q.execute('INSERT INTO nwt_entry_intents VALUES(%s)',(TID,))
-        q.execute("INSERT INTO nwt_decision_inputs VALUES(%s,'EXECUTION_FAILED','EXECUTION')",(TID,))
-    from pathlib import Path
-    schema=(Path(__file__).resolve().parents[2]/'db/schema.sql').read_text()
-    outcome=schema[schema.index('CREATE TABLE IF NOT EXISTS nwt_trade_outcomes ('):]
-    outcome=outcome[:outcome.index(');')+2].replace('CREATE TABLE IF NOT EXISTS','CREATE TEMP TABLE')
-    with conn.cursor() as q:
-        q.execute(outcome)
-        q.execute('ALTER TABLE nwt_trade_outcomes ADD position_id uuid, ADD evidence_version text')
-    conn.commit()
-    yield conn
-    conn.close()
+    # Production migrations create permanent relations. Use a fresh schema so
+    # their existence checks cannot depend on tables left by another suite.
+    isolated_schema='recovery_'+uuid.uuid4().hex
+    try:
+        with conn.cursor() as q:
+            q.execute('CREATE SCHEMA '+isolated_schema)
+            q.execute('SET search_path TO '+isolated_schema)
+        with conn.cursor() as q:
+            q.execute('''
+            CREATE TABLE nwt_tickets(ticket_id uuid PRIMARY KEY,type text,payload jsonb,created_at timestamptz DEFAULT now());
+            CREATE TABLE nwt_entry_evidence(position_id uuid PRIMARY KEY,decision_id uuid,eligible boolean,snapshot jsonb,parent_position_id uuid);
+            CREATE TABLE nwt_entry_intents(ticket_id uuid);
+            CREATE TABLE nwt_ticket_decisions(ticket_id uuid,decision text,reasoning text,decided_by text,created_at timestamptz DEFAULT now());
+            CREATE UNIQUE INDEX recovery_partial_decision ON nwt_ticket_decisions(ticket_id,decided_by)
+              WHERE created_at >= TIMESTAMPTZ '2026-07-24 00:00:00+00';
+            CREATE TABLE nwt_decision_inputs(ticket_id uuid,outcome_reason text,stage_reached text);
+            CREATE TABLE nwt_system_log(level text,component text,message text,payload jsonb);
+            CREATE TABLE nwt_portfolio_ledger(position_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),bot_source text,strategy_id text,
+              asset text,asset_type text,direction text,delta_exposure numeric,notional_risk numeric,qty numeric,entry_price numeric,
+              entry_time timestamptz,entry_bid numeric,entry_ask numeric,alpaca_order_id uuid,stop_pct numeric,target_pct numeric,
+              spread_group_id uuid,ticket_id uuid,status text,lifecycle_state text,exit_price numeric,exit_time timestamptz,realized_slippage numeric,exit_reason text,exit_bid numeric,exit_ask numeric,close_generation integer DEFAULT 0,close_requested boolean DEFAULT false,outcome_accounting_version text);
+            CREATE UNIQUE INDEX recovery_order_asset ON nwt_portfolio_ledger(alpaca_order_id,asset) WHERE alpaca_order_id IS NOT NULL;
+            CREATE TABLE nwt_close_progress(position_id uuid,generation integer,order_id uuid,requested_qty numeric,recorded_qty numeric,recorded_value numeric,PRIMARY KEY(position_id,generation));
+            ''')
+            q.execute('INSERT INTO nwt_tickets(ticket_id,payload) VALUES(%s,%s)',(TID,json.dumps(PAYLOAD)))
+            q.execute('INSERT INTO nwt_entry_intents VALUES(%s)',(TID,))
+            q.execute("INSERT INTO nwt_decision_inputs VALUES(%s,'EXECUTION_FAILED','EXECUTION')",(TID,))
+        from pathlib import Path
+        schema=(Path(__file__).resolve().parents[2]/'db/schema.sql').read_text()
+        outcome=schema[schema.index('CREATE TABLE IF NOT EXISTS nwt_trade_outcomes ('):]
+        outcome=outcome[:outcome.index(');')+2].replace('CREATE TABLE IF NOT EXISTS','CREATE TABLE')
+        with conn.cursor() as q:
+            q.execute(outcome)
+            q.execute('ALTER TABLE nwt_trade_outcomes ADD position_id uuid, ADD evidence_version text')
+        conn.commit()
+        yield conn
+    finally:
+        conn.rollback()
+        with conn.cursor() as q:
+            q.execute('DROP SCHEMA IF EXISTS '+isolated_schema+' CASCADE')
+        conn.commit()
+        conn.close()
 
 
 def test_late_fill_recovers_once_with_exact_broker_evidence(recovery_db):
