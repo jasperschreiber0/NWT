@@ -83,7 +83,8 @@ def test_learning_keeps_missing_metrics_unknown_and_retries_idempotently(monkeyp
     monkeypatch.setattr(learning,'log_system_event',lambda *a:None)
     learning.main();learning.main()
     outcome=state['saved']
-    assert outcome['pnl']==2 and outcome['evidence_version'] is None
+    assert outcome['pnl']==2 and outcome['evidence_version']=='raw-fill-unverified-20261020-v1'
     for name in ['iv_at_entry','iv_at_exit','dte_at_entry','slippage','entry_timing_score',
                  'exit_timing_score','expected_move_capture','realized_move_capture','slippage_adjusted_efficiency']:
         assert outcome[name] is None
+

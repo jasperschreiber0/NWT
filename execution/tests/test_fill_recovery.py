@@ -315,16 +315,18 @@ def test_actual_option_close_then_learning_uses_filled_quantity(learning_close_d
         # Requested risk deliberately differs from actual filled contracts.
         q.execute('UPDATE nwt_portfolio_ledger SET notional_risk=1')
     conn.commit()
-    receipt=close_receipt(pid,filled_avg_price='91')
+    receipt=close_receipt(pid,filled_avg_price='89')
     monkeypatch.setattr(engine,'option_close_order',lambda _:receipt)
     monkeypatch.setattr(engine,'poll_order_until_filled',lambda _:receipt)
     engine.process_close_ticket(conn,dict(ticket_id=OID,payload=dict(position_id=pid,asset_type='option',symbol='VGK')))
     with conn.cursor() as q:
         q.execute('SELECT count(*) FROM nwt_trade_outcomes');assert q.fetchone()==(1,)
+    from risk_agent import get_intraday_pnl
+    assert get_intraday_pnl(conn)<=-2124  # visible before nightly learning
     learning.main();learning.main()
     with conn.cursor() as q:
         q.execute('SELECT count(*),sum(pnl) FROM nwt_verified_learning_outcomes')
-        assert q.fetchone()==(1,Decimal('4276.0000'))
+        assert q.fetchone()==(1,Decimal('-2124.0000'))
         q.execute('SELECT count(*) FROM nwt_trade_outcomes');assert q.fetchone()==(1,)
 
 
@@ -379,6 +381,12 @@ def test_legacy_open_close_records_raw_loss_without_learning(learning_close_db,m
         monkeypatch.setattr(engine,'option_close_order',lambda _:receipt)
         monkeypatch.setattr(engine,'poll_order_until_filled',lambda _:receipt)
         engine.process_close_ticket(conn,dict(ticket_id=OID,payload=dict(position_id=pid,asset_type='option',symbol='VGK')))
+    import risk_agent
+    if partial:
+        from datetime import datetime
+        from types import SimpleNamespace
+        monkeypatch.setattr(risk_agent,'datetime',SimpleNamespace(now=lambda tz:datetime(2026,9,17,16,tzinfo=timezone.utc)))
+    assert risk_agent.get_intraday_pnl(conn)<=-3200
     # Raw risk loss is visible before nightly catch-up, including partial fills.
     assert get_distinct_trade_pnls(conn,verified_only=False)[0][0]<=-3200
     learning.main();learning.main()
@@ -390,3 +398,18 @@ def test_legacy_open_close_records_raw_loss_without_learning(learning_close_db,m
     risk=get_distinct_trade_pnls(conn,verified_only=False)
     assert len(risk)==1 and risk[0][0]<=-3200
     assert get_distinct_trade_pnls(conn)==[]
+
+
+def test_outcome_failure_rolls_back_verified_close(learning_close_db):
+    from close_recovery import recover_closes
+    conn,_=learning_close_db
+    recover_entries(conn,lambda _:ORDER)
+    with conn.cursor() as q:
+        q.execute('SELECT position_id FROM nwt_portfolio_ledger');pid=str(q.fetchone()[0])
+        q.execute("ALTER TABLE nwt_trade_outcomes ADD CHECK(pnl IS NULL)")
+    conn.commit()
+    with pytest.raises(psycopg2.IntegrityError):
+        recover_closes(conn,lambda _:close_receipt(pid,filled_avg_price='80'))
+    with conn.cursor() as q:
+        q.execute('SELECT status FROM nwt_portfolio_ledger');assert q.fetchone()==('open',)
+        q.execute('SELECT count(*) FROM nwt_trade_outcomes');assert q.fetchone()==(0,)
