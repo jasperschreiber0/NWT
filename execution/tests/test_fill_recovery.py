@@ -328,7 +328,10 @@ def test_actual_option_close_then_learning_uses_filled_quantity(learning_close_d
 
 def test_partial_close_inherits_entry_and_counts_one_trade(learning_close_db):
     from close_recovery import recover_closes
-    import allocator
+    import importlib.util
+    from pathlib import Path
+    spec=importlib.util.spec_from_file_location('close_test_allocator',Path(__file__).resolve().parents[2]/'master/allocator.py')
+    allocator=importlib.util.module_from_spec(spec);spec.loader.exec_module(allocator)
     conn,learning=learning_close_db
     recover_entries(conn,lambda _:ORDER)
     with conn.cursor() as q:
