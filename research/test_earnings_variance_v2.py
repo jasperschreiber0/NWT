@@ -406,3 +406,24 @@ def test_amendment_after_request_produces_terminal_failure(experiment):
 def test_registration_requires_fixed_first_attempt_recorder_contract(experiment,tmp_path,field,value):
     cfg=deepcopy(experiment[3]);cfg['recorder_contract'][field]=value
     with pytest.raises(ValueError,match='recorder contract'):ev.register(tmp_path/'bad-contract',cfg)
+
+
+
+def test_signer_failure_retains_original_response_and_blocks_retry(experiment):
+    x=experiment;e=admit(x);x[1][0]=datetime(2026,11,2,16,tzinfo=timezone.utc);f=market_features(e,x[1][0])
+    def sign(_):raise RuntimeError('synthetic signing outage')
+    with pytest.raises(RuntimeError):ev.execute_inference(x[0],e['event_id'],f,TEXT,lambda *_:'original raw response',sign)
+    raw=json.loads((x[0]/('inference-response-'+ev.digest(e['event_id'])+'.json')).read_text())
+    assert raw['response_raw']=='original raw response'
+    assert ev.inference_accounting(x[0],ev.journal(x[0]))=={'SUCCEEDED':0,'FAILED':1}
+
+
+def test_elapsed_deadline_after_durable_intent_never_calls_transport(experiment,monkeypatch):
+    x=experiment;e=admit(x);x[1][0]=datetime(2026,11,2,16,tzinfo=timezone.utc);f=market_features(e,x[1][0])
+    begin=ev.begin_inference
+    def delayed(*args):
+        intent=begin(*args);x[1][0]=datetime(2026,11,2,21,1,tzinfo=timezone.utc);return intent
+    monkeypatch.setattr(ev,'begin_inference',delayed)
+    with pytest.raises(ValueError,match='deadline elapsed'):
+        ev.execute_inference(x[0],e['event_id'],f,TEXT,lambda *_:pytest.fail('must not send after deadline'),lambda _:None)
+    assert ev.inference_accounting(x[0],ev.journal(x[0]))=={'SUCCEEDED':0,'FAILED':1}

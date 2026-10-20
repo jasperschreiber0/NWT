@@ -331,6 +331,8 @@ def validate_attempt(folder,r,event,features,receipt,rows,require_success=False)
     if require_success:
         state=json.loads(terminal.read_text())
         successes=[x for x in rows if x['action']=='inference_succeeded' and x['payload']['event_id']==ident]
+        saved=json.loads((Path(folder)/('inference-receipt-'+digest(ident)+'.json')).read_text())
+        if saved!=receipt:raise ValueError('Original receipt file changed')
         if state.get('attempt_id')!=expected or state.get('status')!='SUCCEEDED' or state.get('receipt_sha256')!=digest(receipt) or len(successes)!=1 or successes[0]['payload']!=state:raise ValueError('Incomplete inference terminal accounting')
     elif terminal.exists():raise ValueError('Inference attempt already terminal')
 
@@ -340,6 +342,9 @@ def seal(folder,event_id,features,receipt):
     if attempt_path(folder,event_id,True).exists():raise ValueError('One attempt only; inference already terminal')
     try:
         event=census(folder)[0][event_id]
+        # Retain even a rejected original receipt before validating it.
+        exclusive(Path(folder)/('inference-receipt-'+digest(event_id)+'.json'),receipt)
+        append(folder,'inference_receipt_received',dict(event_id=event_id,receipt_sha256=digest(receipt)))
         validate_attempt(folder,r,event,features,receipt,journal(folder))
         value=_seal(folder,event_id,features,receipt)
         success=dict(event_id=event_id,attempt_id=receipt['body']['attempt_id'],status='SUCCEEDED',at=now().isoformat(),receipt_sha256=digest(receipt))
@@ -360,11 +365,15 @@ def execute_inference(folder,event_id,features,source_text,transport,sign):
     """
     intent=begin_inference(folder,event_id,features,source_text)
     try:
+        if now()>stamp(census(folder)[0][event_id]['cutoff']):raise ValueError('Request deadline elapsed before transport')
         requested=now().isoformat()
         raw=transport(intent['attempt_id'],intent['request_raw'])
         body=dict(event_id=event_id,attempt_id=intent['attempt_id'],attempt_number=1,
                   source_text=source_text,features=features,request_raw=intent['request_raw'],response_raw=raw,
                   requested_at=requested,received_at=now().isoformat())
+        # A signing or validation failure must not erase the received response.
+        exclusive(Path(folder)/('inference-response-'+digest(event_id)+'.json'),body)
+        append(folder,'inference_response_received',dict(event_id=event_id,body_sha256=digest(body)))
         return seal(folder,event_id,features,dict(body=body,signature=sign(canonical(body))))
     except Exception as exc:
         if not attempt_path(folder,event_id,True).exists():fail_inference(folder,event_id,type(exc).__name__)
