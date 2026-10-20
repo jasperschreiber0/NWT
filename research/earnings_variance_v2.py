@@ -398,4 +398,3 @@ def inference_accounting(folder,rows):
         if len(terminals)!=1 or terminals[0]!=state or not any(r['action']==action and r['payload']==state for r in rows):raise ValueError('Incomplete inference terminal journal')
         counts[status]+=1
     return counts
-
