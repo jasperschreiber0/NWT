@@ -11,7 +11,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+import earnings_variance as baseline_dependency
 from earnings_variance import POLICY as ORIGINAL, forecast, stamp, digest
+
+PROSPECTIVE_BLOCKERS = (
+    'trusted recorder must enforce first actual inference attempt and retain every failed attempt',
+    'prior returns require timestamped price binding and verified opening/previous-close prices',
+    'SEC acceptance lag and holiday/early-close acceptance fixtures require completion',
+    'full >=30-event and >=5-issuer acceptance fixtures require completion',
+)
 
 POLICY = dict(ORIGINAL, version='earnings-variance-rolling-v2', cadence_seconds=3600,
               admission_lead_seconds=300, receipt_format='signed-responses-api-v1')
@@ -29,8 +37,14 @@ def exclusive(path,value):
     with Path(path).open('xb') as f:f.write(canonical(value))
 
 
+def dependency_hashes():
+    """Freeze both admission code and the imported policy/formula implementation."""
+    return {name:hashlib.sha256(Path(path).read_text(encoding='utf-8').encode()).hexdigest()
+            for name,path in {'rolling_harness':__file__,'baseline_policy_and_forecast':baseline_dependency.__file__}.items()}
+
+
 def code_hash():
-    return hashlib.sha256(Path(__file__).read_text(encoding='utf-8').encode()).hexdigest()
+    return digest(dependency_hashes())
 
 
 def register(folder, config):
@@ -39,7 +53,8 @@ def register(folder, config):
     required={'sources','calendar','model','settings','recorder_public_key','recorder_identity_reference',
               'source_map_reference','model_revision_reference','extraction_version','evidence_class'}
     if set(config)!=required or any(config[k] is None for k in required):raise ValueError('Unconfigured registration')
-    if config['evidence_class'] not in ('engineering_smoke','prospective_source_verified'):raise ValueError('Evidence class')
+    if config['evidence_class']!='engineering_smoke':
+        raise ValueError('Prospective registration disabled: '+'; '.join(PROSPECTIVE_BLOCKERS))
     if set(config['sources'])!=set(POLICY['universe']):raise ValueError('Complete fixed issuer map required')
     for source in config['sources'].values():
         if set(source)!={'cik','sec_url','issuer_url'} or not str(source['cik']).isdigit():raise ValueError('Source map')
@@ -55,7 +70,7 @@ def register(folder, config):
     if closes!=sorted(set(closes)) or any(stamp(s['open'])>=stamp(s['close']) for s in sessions):raise ValueError('Calendar order')
     if closes[20]>=stamp(POLICY['holdout_start']) or len([c for c in closes if c>=stamp(POLICY['holdout_end'])])<5:raise ValueError('Calendar coverage')
     folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
-    record=dict(policy=POLICY,config=config,registered_at=now().isoformat(),code_sha256=code_hash())
+    record=dict(policy=POLICY,config=config,registered_at=now().isoformat(),code_sha256=code_hash(),dependency_sha256=dependency_hashes(),readiness_blockers=PROSPECTIVE_BLOCKERS)
     exclusive(folder/'registration.json',dict(record,sha256=digest(record)))
     return record
 
@@ -63,7 +78,8 @@ def register(folder, config):
 def registration(folder):
     r=json.loads((Path(folder)/'registration.json').read_text())
     checksum=r.pop('sha256')
-    if checksum!=digest(r) or r['policy']!=POLICY or r['code_sha256']!=code_hash():raise ValueError('Registration changed')
+    if checksum!=digest(r) or r['policy']!=POLICY or r['code_sha256']!=code_hash() or r['dependency_sha256']!=dependency_hashes():raise ValueError('Registration changed')
+    if r['config']['evidence_class']!='engineering_smoke':raise ValueError('Prospective registration disabled')
     return r
 
 
@@ -98,24 +114,27 @@ def census(folder):
 def discover(folder,slot,checks,candidates):
     """Import one original source scan. All candidates and skips are retained."""
     r=registration(folder);at=now();slot=stamp(slot)
-    append(folder,'discovery_attempt',dict(slot=slot.isoformat(),input_sha256=digest([checks,candidates])))
+    append(folder,'discovery_attempt',dict(slot=slot.isoformat(),checks=checks,candidates=candidates,input_sha256=digest([checks,candidates])))
     if slot.minute or slot.second or slot.microsecond or not slot<=at<slot+timedelta(hours=1):raise ValueError('Invalid discovery slot')
     if not stamp(r['registered_at'])<=slot<stamp(POLICY['holdout_end']):raise ValueError('Outside discovery period')
     rows=journal(folder)
-    if any(x['action']=='discovery' and x['payload']['slot']==slot.isoformat() for x in rows):raise ValueError('Duplicate slot')
+    if sum(x['action']=='discovery_attempt' and x['payload']['slot']==slot.isoformat() for x in rows)!=1:raise ValueError('One discovery attempt per slot; failed coverage cannot be retried')
     if set(checks)!=set(POLICY['universe']):raise ValueError('Every issuer must be checked')
     for symbol,check in checks.items():
         for name in ('sec','issuer'):
             c=check[name]
             if c['url']!=r['config']['sources'][symbol][name+'_url'] or c['status'] not in ('OK','FAILED'):raise ValueError('Source check identity')
             if c['status']=='OK' and not c.get('sha256'):raise ValueError('Missing source receipt')
-    seen={e['event_id']:e for row in rows if row['action']=='discovery' for e in row['payload']['events'] if e['status']=='ADMITTED'};items=[]
+    canonical_statuses={'ADMITTED','SKIPPED_PRE_REGISTRATION','SKIPPED_OUTSIDE_WINDOW','SKIPPED_LATE_DISCOVERY'}
+    seen={e['event_id']:e for row in rows if row['action']=='discovery' for e in row['payload']['events'] if e['status'] in canonical_statuses};items=[]
     # First discovery belongs to a source version, not the latest hourly scan.
     first_seen={(e['event_id'],e.get('accession'),e.get('source_sha256')):e.get('first_seen_at')
                 for row in rows if row['action']=='discovery' for e in row['payload']['events']
                 if e.get('first_seen_at') is not None}
     sessions=r['config']['calendar']['sessions']
-    for candidate in candidates:
+    # Earliest original wins even if multiple releases arrive in one scan.
+    ordered=sorted(candidates,key=lambda c:(c['symbol'],c['fiscal_period_end'],stamp(c['release_at']) if c.get('release_at') else at))
+    for candidate in ordered:
         symbol=candidate['symbol'];event_id=symbol+':'+candidate['fiscal_period_end']
         item=dict(candidate,event_id=event_id,observed_at=at.isoformat())
         identity=(event_id,candidate.get('accession'),candidate.get('source_sha256'))
@@ -139,7 +158,7 @@ def discover(folder,slot,checks,candidates):
             if event_id in seen:
                 old=seen[event_id]
                 if candidate['source_sha256']==old['source_sha256']:item['status']='DUPLICATE'
-                elif candidate.get('correction_kind') in ('financial_figures_changed','official_withdrawal'):
+                elif candidate['form']=='8-K/A' and candidate.get('correction_kind') in ('financial_figures_changed','official_withdrawal'):
                     item['status']='INVALIDATED_CORRECTION' if at<stamp(old['cutoff']) else 'POST_CUTOFF_AMENDMENT'
                 else:item['status']='UNRESOLVED_AMENDMENT'
             elif released<stamp(r['registered_at']):item['status']='SKIPPED_PRE_REGISTRATION'
@@ -148,8 +167,9 @@ def discover(folder,slot,checks,candidates):
             elif at>stamp(sessions[i]['open'])-timedelta(seconds=300):item['status']='SKIPPED_LATE_DISCOVERY'
             elif len(item['prior_session_dates'])!=20 or len(item['session_dates'])!=5:raise ValueError('Event calendar coverage')
             else:item['status']='ADMITTED';seen[event_id]=item
+        if item['status'] in canonical_statuses:seen[event_id]=item
         items.append(item)
-    append(folder,'discovery',dict(slot=slot.isoformat(),checks=checks,events=items))
+    append(folder,'discovery',dict(slot=slot.isoformat(),checks=checks,events=items,input_sha256=digest([checks,candidates])))
     return items
 
 
@@ -208,6 +228,8 @@ def evaluate(folder,outcomes):
     if slot<start:slot+=timedelta(hours=1)
     while slot<stamp(POLICY['holdout_end']):
         scan=scans.get(slot.isoformat())
+        attempts=[x['payload'] for x in rows if x['action']=='discovery_attempt' and x['payload']['slot']==slot.isoformat()]
+        if len(attempts)!=1 or not scan or scan.get('input_sha256')!=attempts[0]['input_sha256'] or attempts[0]['input_sha256']!=digest([attempts[0]['checks'],attempts[0]['candidates']]):raise ValueError('Incomplete discovery attempt coverage')
         if not scan or any(c[n]['status']!='OK' for c in scan['checks'].values() for n in ('sec','issuer')):raise ValueError('Incomplete discovery coverage')
         slot+=timedelta(hours=1)
     if any(e['status']=='UNRESOLVED_AMENDMENT' for e in skips):raise ValueError('Unresolved amendment')

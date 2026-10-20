@@ -174,3 +174,69 @@ def test_repeated_source_cannot_rewrite_first_seen(experiment):
     x=experiment;admit(x);x[1][0]+=timedelta(hours=1)
     x[5]['first_seen_at']=x[1][0].isoformat()
     with pytest.raises(ValueError,match='Immutable first_seen'):admit(x)
+
+
+def test_skipped_original_remains_canonical_for_same_period(experiment):
+    x=experiment;x[5]['release_at']='2026-11-01T22:59:59Z'
+    assert admit(x)['status']=='SKIPPED_PRE_REGISTRATION'
+    x[1][0]+=timedelta(hours=1)
+    x[5].update(release_at='2026-11-01T23:30:00Z',first_seen_at=x[1][0].isoformat(),source_sha256='different-original',accession='different-accession')
+    assert admit(x)['status']=='UNRESOLVED_AMENDMENT'
+    assert not ev.census(x[0])[0]
+
+
+def test_failed_scan_cannot_retry_with_candidate_removed(experiment):
+    x=experiment;x[5]['release_url']='https://wrong.example.test/release'
+    with pytest.raises(ValueError,match='Unverified candidate'):admit(x)
+    with pytest.raises(ValueError,match='attempt'):
+        ev.discover(x[0],x[1][0].isoformat(),x[4],[])
+    attempts=[r for r in ev.journal(x[0]) if r['action']=='discovery_attempt']
+    assert attempts[0]['payload']['candidates'][0]['release_url']==x[5]['release_url']
+    assert not any(r['action']=='discovery' for r in ev.journal(x[0]))
+
+
+def test_skipped_duplicate_and_objective_amendment_never_admit(experiment):
+    x=experiment;x[5]['release_at']='2026-11-01T22:59:59Z';admit(x)
+    x[1][0]+=timedelta(hours=1)
+    assert admit(x)['status']=='DUPLICATE'
+    x[1][0]+=timedelta(hours=1)
+    x[5].update(form='8-K/A',source_sha256='corrected',first_seen_at=x[1][0].isoformat(),correction_kind='financial_figures_changed')
+    assert admit(x)['status']=='INVALIDATED_CORRECTION'
+    assert not ev.census(x[0])[0]
+
+
+def test_canonical_order_does_not_depend_on_batch_order(experiment):
+    x=experiment;early=deepcopy(x[5]);early['release_at']='2026-11-01T22:59:59Z'
+    later=dict(x[5],source_sha256='later-original',accession='later-accession')
+    rows=ev.discover(x[0],x[1][0].isoformat(),x[4],[later,early])
+    assert [r['status'] for r in rows]==['SKIPPED_PRE_REGISTRATION','UNRESOLVED_AMENDMENT']
+    assert not ev.census(x[0])[0]
+
+
+def test_failed_attempt_blocks_final_coverage_despite_empty_success_record(experiment):
+    x=experiment;x[5]['release_url']='https://wrong.example.test/release'
+    with pytest.raises(ValueError):admit(x)
+    with pytest.raises(ValueError):ev.discover(x[0],x[1][0].isoformat(),x[4],[])
+    # Simulate an erroneous importer appending a success after those attempts.
+    ev.append(x[0],'discovery',dict(slot=x[1][0].isoformat(),checks=x[4],events=[],input_sha256=ev.digest([x[4],[]])))
+    for hour in range(24):
+        x[1][0]=datetime(2026,11,2,hour,tzinfo=timezone.utc)
+        ev.discover(x[0],x[1][0].isoformat(),x[4],[])
+    x[1][0]=datetime(2026,11,10,tzinfo=timezone.utc)
+    with pytest.raises(ValueError,match='attempt coverage'):ev.evaluate(x[0],[])
+
+
+
+def test_dependency_only_change_invalidates_registration(experiment,monkeypatch,tmp_path):
+    from pathlib import Path
+    dependency=tmp_path/'changed_baseline.py'
+    dependency.write_text(Path(ev.baseline_dependency.__file__).read_text()+'\n# changed formula dependency\n')
+    monkeypatch.setattr(ev.baseline_dependency,'__file__',str(dependency))
+    with pytest.raises(ValueError,match='Registration changed'):ev.registration(experiment[0])
+
+
+def test_real_registration_disabled_even_with_populated_config(experiment,tmp_path):
+    cfg=deepcopy(experiment[3]);cfg['evidence_class']='prospective_source_verified'
+    with pytest.raises(ValueError,match='Prospective registration disabled'):
+        ev.register(tmp_path/'not_ready',cfg)
+    assert not (tmp_path/'not_ready/registration.json').exists()
