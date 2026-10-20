@@ -47,7 +47,7 @@ def _insert_outcome_leg(conn, strategy_id, position_id, pnl, closed_at, archetyp
         cur.execute('SELECT spread_group_id FROM nwt_portfolio_ledger WHERE position_id=%s',(position_id,))
         decision_id=str(cur.fetchone()[0] or position_id)
         cur.execute('INSERT INTO nwt_decision_inputs VALUES(%s) ON CONFLICT DO NOTHING',(decision_id,))
-        cur.execute("INSERT INTO nwt_entry_evidence(position_id,decision_id,eligible,snapshot) VALUES(%s,%s,true,'{}')",(position_id,decision_id))
+        cur.execute('INSERT INTO nwt_entry_evidence(position_id,decision_id,eligible,snapshot) VALUES(%s,%s,true,%s)',(position_id,decision_id,'{"expected_assets":["TESTSYM"]}'))
         cur.execute("UPDATE nwt_trade_outcomes SET evidence_version='entry-evidence-20261020-v1' WHERE position_id=%s",(position_id,))
     conn.commit()
 

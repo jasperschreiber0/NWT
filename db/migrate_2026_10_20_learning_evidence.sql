@@ -22,6 +22,13 @@ CREATE OR REPLACE VIEW nwt_verified_learning_outcomes AS
  JOIN nwt_entry_evidence e ON e.position_id=l.position_id
  WHERE e.eligible AND o.evidence_version='entry-evidence-20261020-v1'
  AND l.status='closed'
+ AND jsonb_array_length(e.snapshot->'expected_assets') > 0
+ AND NOT EXISTS (
+   SELECT 1 FROM jsonb_array_elements_text(e.snapshot->'expected_assets') expected(asset)
+   WHERE NOT EXISTS (SELECT 1 FROM nwt_portfolio_ledger leg
+     WHERE COALESCE(leg.spread_group_id,leg.position_id)=COALESCE(l.spread_group_id,l.position_id)
+       AND leg.asset=expected.asset)
+ )
  AND (SELECT count(*) FROM nwt_trade_outcomes other WHERE other.position_id=o.position_id)=1
  AND NOT EXISTS (
    SELECT 1 FROM nwt_portfolio_ledger leg

@@ -85,13 +85,10 @@ def fetch_unprocessed_closed_positions(conn) -> list:
               AND pl.strategy_id IS DISTINCT FROM 'QA_PAPER_LIFECYCLE'
               AND pl.exit_price IS NOT NULL
               AND pl.alpaca_order_id IS NOT NULL
+              AND EXISTS (SELECT 1 FROM nwt_entry_evidence ee WHERE ee.position_id=pl.position_id)
               AND NOT EXISTS (
                   SELECT 1 FROM nwt_trade_outcomes to_
                   WHERE to_.position_id = pl.position_id
-                     OR (to_.position_id IS NULL
-                         AND to_.entry_time = pl.entry_time
-                         AND to_.symbol = pl.asset
-                         AND to_.direction = pl.direction)
               )
             ORDER BY pl.exit_time ASC
             """
@@ -530,6 +527,12 @@ def main() -> None:
 
             try:
                 with conn.cursor() as cur:
+                    # Serialize concurrent/repeated learning jobs by exact position.
+                    cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', ('learning:'+position_id,))
+                    cur.execute('SELECT 1 FROM nwt_trade_outcomes WHERE position_id=%s', (position_id,))
+                    if cur.fetchone():
+                        conn.rollback()
+                        continue
                     cur.execute(
                         """
                         INSERT INTO nwt_trade_outcomes

@@ -1,5 +1,4 @@
 import sys
-from copy import deepcopy
 from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
@@ -9,8 +8,8 @@ from entry_evidence import snapshot
 
 
 def facts():
-    return ({'ticket_id':'request','entry_time':'2026-10-20T12:00:00Z','strategy_id':'A','qty':2},
-            {'ticket_id':'request','created_at':'2026-10-20T11:00:00Z','payload':{'source_proposal_ticket_id':'proposal'}},
+    return ({'ticket_id':'request','entry_time':'2026-10-20T12:00:00Z','strategy_id':'A','qty':2,'asset':'SPY'},
+            {'ticket_id':'request','created_at':'2026-10-20T11:00:00Z','payload':{'source_proposal_ticket_id':'proposal','symbol':'SPY'}},
             {'ticket_id':'proposal','created_at':'2026-10-20T10:00:00Z'},
             [{'id':'d1','ticket_id':'proposal','created_at':'2026-10-20T10:00:00Z',
               'run_at':'2026-10-20T10:00:00Z','strategy_id':'A','symbol':'SPY',
@@ -28,7 +27,7 @@ def test_exact_origin_ignores_reused_symbol_and_freezes_context():
     assert result['decision_context']['regime']['primary_regime']=='range'
 
 
-@pytest.mark.parametrize('failure', ['missing_ticket','missing_source','two_decisions','late_decision','late_source','late_ticket','wrong_strategy','missing_regime'])
+@pytest.mark.parametrize('failure', ['missing_ticket','missing_source','two_decisions','late_decision','late_source','late_ticket','wrong_strategy','missing_regime','wrong_asset','wrong_decision_symbol'])
 def test_fail_closed(failure):
     p,t,source,ds=facts()
     if failure=='missing_ticket': t=None
@@ -39,6 +38,8 @@ def test_fail_closed(failure):
     if failure=='late_ticket': t['created_at']='2026-10-21T00:00:00Z'
     if failure=='wrong_strategy': ds[0]['strategy_id']='B'
     if failure=='missing_regime': ds[0]['regime']=None
+    if failure=='wrong_asset': p['asset']='QQQ'
+    if failure=='wrong_decision_symbol': ds[0]['symbol']='QQQ'
     result=snapshot(p,t,source,ds)
     assert not result['eligible'] and result['decision_id'] is None
     assert result['iv_at_entry'] is None

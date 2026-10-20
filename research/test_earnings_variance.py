@@ -1,4 +1,3 @@
-import json
 from datetime import datetime, timezone, timedelta
 import pytest
 import earnings_variance as ev

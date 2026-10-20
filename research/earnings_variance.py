@@ -9,8 +9,9 @@ import json
 import math
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-POLICY = dict(version='earnings-variance-20261020-v1',
+POLICY: dict[str, Any] = dict(version='earnings-variance-20261020-v1',
     hypothesis='Unresolved earnings uncertainty increases next-five-session realised variance',
     universe=['AAPL','MSFT','AMZN','GOOGL','META','NVDA','TSLA','AMD','INTC','CRM',
               'ADBE','ORCL','NFLX','JPM','BAC','GS','WMT','COST','HD','KO','PEP','XOM','CVX','UNH','JNJ'],
@@ -48,14 +49,14 @@ def register(folder, input_manifest=None):
     folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
     value=dict(policy=POLICY,policy_sha256=digest(POLICY),registered_at=now.isoformat(),
                input_manifest=input_manifest, input_manifest_sha256=digest(input_manifest),
-               code_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+               code_sha256=hashlib.sha256(Path(__file__).read_text(encoding='utf-8').encode()).hexdigest())
     write_once(folder/'registration.json',value)
     return value
 
 
 def registration(folder):
     r=json.loads((Path(folder)/'registration.json').read_text(encoding='utf-8'))
-    if r['policy_sha256']!=digest(POLICY) or r['code_sha256']!=hashlib.sha256(Path(__file__).read_bytes()).hexdigest():
+    if r['policy_sha256']!=digest(POLICY) or r['code_sha256']!=hashlib.sha256(Path(__file__).read_text(encoding='utf-8').encode()).hexdigest():
         raise ValueError('Frozen policy or harness changed; new experiment required')
     if r['input_manifest_sha256']!=digest(r['input_manifest']):raise ValueError('Input manifest changed')
     return r
@@ -120,6 +121,8 @@ def evaluate(folder, outcomes):
     """Single predeclared final read; missing observations block acceptance."""
     folder=Path(folder);r=registration(folder);now=datetime.now(timezone.utc)
     if now<stamp(POLICY['holdout_end']):raise ValueError('Holdout not complete')
+    if r['input_manifest'] and any(stamp(e['session_dates'][-1])>now for e in r['input_manifest']['events'].values()):
+        raise ValueError('Final five-session outcomes not mature')
     write_once(folder/'evaluation-attempt.json',dict(at=now.isoformat(),outcomes_sha256=digest(outcomes)))
     predictions=[json.loads(p.read_text(encoding='utf-8')) for p in sorted(folder.glob('prediction-*.json'))]
     ids=[x['event_id'] for x in outcomes]

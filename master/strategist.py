@@ -327,7 +327,7 @@ def compute_drawdown(conn: psycopg2.extensions.connection) -> float:
     # Cold start fallback — equity curve not populated yet
     query = """
         SELECT COALESCE(pnl_adjusted, pnl) AS pnl, closed_at
-        FROM nwt_verified_learning_outcomes
+        FROM nwt_trade_outcomes
         WHERE closed_at IS NOT NULL AND COALESCE(pnl_adjusted, pnl) IS NOT NULL
         ORDER BY closed_at ASC
     """

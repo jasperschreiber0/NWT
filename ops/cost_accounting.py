@@ -7,6 +7,7 @@ must come from a reconciled source manifest, not absence of charge rows.
 from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 
 REQUIRED_SERVICES = ('openai', 'alpaca', 'hetzner', 'railway', 'supabase')
 
@@ -27,7 +28,7 @@ def stamp(value):
 
 def unique(rows):
     """Replay idempotency. Conflicting revisions require reconciliation."""
-    found = {}
+    found: dict[str, dict[str, Any]] = {}
     for r in rows:
         key = r.get('source_id')
         if not key:

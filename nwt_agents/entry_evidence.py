@@ -22,6 +22,7 @@ def snapshot(position, ticket, proposal, decisions):
     reasons = []
     context = None
     decision = None
+    expected_assets = []
     try:
         entry = stamp(position.get('entry_time'))
         if not ticket or str(ticket['ticket_id']) != str(position.get('ticket_id')):
@@ -29,6 +30,11 @@ def snapshot(position, ticket, proposal, decisions):
         if stamp(ticket['created_at']) > entry:
             raise ValueError('ticket_after_entry')
         payload = ticket.get('payload') or {}
+        expected_assets = ([leg.get('option_symbol') for leg in payload['legs']] if payload.get('legs')
+                           else [payload.get('option_symbol') or payload.get('symbol')])
+        if (not all(expected_assets) or len(set(expected_assets)) != len(expected_assets) or
+            position.get('asset') not in expected_assets):
+            raise ValueError('instrument_missing_or_mismatch')
         origin = payload.get('source_proposal_ticket_id') or ticket['ticket_id']
         if payload.get('source_proposal_ticket_id'):
             if not proposal or str(proposal['ticket_id']) != str(origin):
@@ -39,6 +45,8 @@ def snapshot(position, ticket, proposal, decisions):
         if len(matches) != 1:
             raise ValueError('decision_missing_or_ambiguous')
         decision = matches[0]
+        if not payload.get('symbol') or decision.get('symbol') != payload['symbol']:
+            raise ValueError('decision_symbol_mismatch')
         if max(stamp(decision['run_at']), stamp(decision['created_at'])) > entry:
             raise ValueError('decision_after_entry')
         if not position.get('strategy_id') or decision.get('strategy_id') != position['strategy_id']:
@@ -54,6 +62,7 @@ def snapshot(position, ticket, proposal, decisions):
     result = dict(version=VERSION, ticket_id=str(position.get('ticket_id') or '') or None,
                   decision_id=str(decision['id']) if decision and not reasons else None,
                   eligible=not reasons, reasons=reasons, decision_context=context,
+                  expected_assets=expected_assets,
                   entry_time=position.get('entry_time'), iv_at_entry=None,
                   regime_at_entry={'status': 'unknown', 'reason': 'No measured fill-time regime snapshot'},
                   unknowns=['fill_time_iv', 'fill_time_regime'])
