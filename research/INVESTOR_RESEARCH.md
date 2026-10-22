@@ -14,8 +14,8 @@ cron entries. Retries, overdue detection and research warnings use existing oper
   independently verified open-market purchases. Two disjoint owner groups totalling
   $100,000 within seven days form a cluster. Single purchases are a control.
 - Structured Schedule 13D: Item 4 changes, resolved to a unique issuer ticker.
-  One bounded AI call per run, at most 20 attempts per UTC day, classifies concrete action
-  versus hypothetical or negated intent. Exact supporting text must occur in the source.
+  One bounded AI call per run, at most 40 attempts per UTC day and four filings per call, classifies concrete action
+  versus hypothetical or negated intent. Numbered passage IDs resolve to exact supporting text in the source.
   AI direction remains a hypothesis. Amendments without Item 4 do not imply a new catalyst.
 - ARKK, ARKQ and ARKW: official daily holdings. Median common-holding share changes
   estimate fund-wide flows. Three distinct dates with relative increases produce a proxy
@@ -121,3 +121,31 @@ classes, secret-bearing exceptions, persisted unresolved work, the last budget a
 midnight cooldown, option recovery and unknown outcomes, v1/v2 preservation, and complete
 cycles whose exit status differs from research-coverage health. Run alongside the
 existing investor/backoff suites and the full Linux/PostgreSQL CI suite.
+
+## Repair boundary: investor-observation-20261023-v4
+
+ARKW was renamed to ARK Next Generation Technology ETF. The former INTERNET filename
+still serves a valid CSV dated 6 October; the official TECHNOLOGY filename was verified
+on 23 October Sydney time with 22 October holdings. The configured URL is now updated.
+Source changes bypass a cached failure for the old URL; errors for the new URL still
+use persistent bounded backoff. Stale dates, future dates and same-date revisions remain
+ineligible. A missing week is not bridged into a fabricated purchase signal.
+Official reference: https://www.ark-funds.com/funds/arkw
+
+The model now selects an integer passage ID instead of reproducing a quotation. All
+source characters and surrounding context are supplied in lossless slices. Stored
+quotations and offsets are reconstructed locally from the immutable filing; unknown IDs,
+invalid types, duplicate/missing response IDs and inconsistent action fields are rejected.
+This verifies provenance, not the semantic correctness of the AI hypothesis.
+
+Each call handles up to four filings and 30,000 source characters, with one call per run,
+40 calls per UTC day and two attempts per filing under this protocol. Existing daily
+spend counters are carried forward. First attempts precede retries; older fresh filings
+are prioritised. A one-hour cooldown still applies. Successful members of a partly bad
+batch are retained. Twice-failed active filings stay visibly quarantined and cannot signal;
+expired filings remain excluded. Classification failures do not trigger whole-job reruns.
+Token usage is recorded once per batch, with classifications referencing that batch.
+
+v4 appends a boundary alongside v1/v2/v3 and preserves existing evidence, forecasts and
+results. It changes collection/classification, not trade execution or entry risk limits.
+The release test database explicitly uses UTF-8 to support the current schema comments.

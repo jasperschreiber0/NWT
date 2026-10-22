@@ -25,7 +25,7 @@ def activist(c,key='event',**overrides):
 
 
 def answer(**overrides):
-    value=dict(action_present=False,action='none',direction='uncertain',evidence_quote=PURPOSE)
+    value=dict(action_present=False,action='none',direction='uncertain',evidence_id=1)
     value.update(overrides);return value
 
 
@@ -33,7 +33,11 @@ def api(monkeypatch,*,value=None,error=None):
     # This module does not call the API at import. Network is also blocked by conftest.
     sys.path.insert(0,str(pipeline.ROOT/'nwt_agents'))
     import openai_client
-    call=Mock(side_effect=error,return_value=(value if value is not None else answer(),10,5))
+    def respond(prompt,*args,**kwargs):
+        if error:raise error
+        sources=json.loads(prompt.split('SOURCES:\n',1)[1])
+        return dict(classifications=[dict(value if value is not None else answer(),event_id=p['event_id']) for p in sources]),10,5
+    call=Mock(side_effect=respond)
     monkeypatch.setattr(openai_client,'call_json',call)
     return call
 
@@ -41,7 +45,7 @@ def api(monkeypatch,*,value=None,error=None):
 @pytest.mark.parametrize('value,reason',[
     (answer(action_present='true'),'CLASSIFICATION_SCHEMA'),
     (answer(action='invented'),'CLASSIFICATION_SCHEMA'),
-    (answer(evidence_quote=SECRET),'CLASSIFICATION_SOURCE_QUOTE'),
+    (answer(evidence_id=SECRET),'CLASSIFICATION_SOURCE_QUOTE'),
     (answer(action_present=True),'CLASSIFICATION_ACTION'),
 ])
 def test_classification_validation_patterns_are_safe_and_stay_failed(monkeypatch,value,reason):
@@ -77,21 +81,22 @@ def test_model_request_errors_never_echo_exception_or_response(monkeypatch,error
 
 def test_budget_exhaustion_keeps_unresolved_coverage_without_spending(monkeypatch):
     c=database();activist(c);call=api(monkeypatch)
-    pipeline.state(c,'model-budget:'+NOW.date().isoformat(),20)
+    pipeline.state(c,'model-budget:'+NOW.date().isoformat(),core.POLICY['maximum_model_attempts_per_day'])
     pipeline.put(c,'model_error','event:old',dict(error='ValueError',attempt=1))
     old=c.execute('SELECT * FROM evidence').fetchall()
     assert pipeline.classify_activists(c,NOW)['status']=='DAILY_BUDGET_REACHED'
     coverage=pipeline.classification_coverage(c,NOW)
     assert coverage['status']=='INCOMPLETE' and coverage['pending']==coverage['budget_blocked']==1
-    assert coverage['unresolved_with_errors']==1 and coverage['attempt_limit']==20
+    assert coverage['unresolved_with_errors']==1 and coverage['attempt_limit']==core.POLICY['maximum_model_attempts_per_day']
     call.assert_not_called();assert c.execute('SELECT * FROM evidence').fetchall()==old
 
 
 def test_final_budget_attempt_and_midnight_do_not_bypass_cooldown(monkeypatch):
+    monkeypatch.setitem(core.POLICY,'classification_batch_size',1)
     c=database();activist(c);activist(c,'second');call=api(monkeypatch,error=ValueError(SECRET))
     late=NOW.replace(hour=23,minute=55)
-    pipeline.state(c,'model-budget:'+late.date().isoformat(),19)
-    assert pipeline.classify_activists(c,late)['attempts_today']==20
+    pipeline.state(c,'model-budget:'+late.date().isoformat(),core.POLICY['maximum_model_attempts_per_day']-1)
+    assert pipeline.classify_activists(c,late)['attempts_today']==core.POLICY['maximum_model_attempts_per_day']
     assert pipeline.classify_activists(c,late)['status']=='DAILY_BUDGET_REACHED'
     assert call.call_count==1
     pipeline.classify_activists(c,late+timedelta(minutes=10))
@@ -179,7 +184,7 @@ def test_option_storage_failure_propagates(option_clock,monkeypatch):
 
 def test_v3_boundary_preserves_v1_v2_and_pending_forecast_lineage():
     c=database()
-    for version in [core.LEGACY_VERSION,core.PREVIOUS_VERSION]:
+    for version in [core.LEGACY_VERSION,core.PREVIOUS_VERSION,core.DIAGNOSTICS_VERSION]:
         pipeline.put(c,'policy',version,dict(version=version,code_sha256=version))
     pipeline.put(c,'forecast','pending',dict(policy_version=core.PREVIOUS_VERSION))
     before=c.execute('SELECT * FROM evidence ORDER BY kind,key').fetchall()
@@ -196,8 +201,10 @@ def test_full_cycle_reports_incomplete_coverage_without_retries_or_false_success
     c.execute('CREATE TABLE evidence(kind TEXT,key TEXT,payload TEXT,PRIMARY KEY(kind,key))')
     c.execute('CREATE TABLE state(key TEXT PRIMARY KEY,value TEXT)')
     activist(c);pipeline.state(c,'tickers',dict(at=NOW.isoformat(),mapping={}))
-    if mode=='partial_success':activist(c,'second')
-    if mode=='budget':pipeline.state(c,'model-budget:'+NOW.date().isoformat(),20)
+    if mode=='partial_success':
+        activist(c,'second')
+        monkeypatch.setitem(core.POLICY,'classification_batch_size',1)
+    if mode=='budget':pipeline.state(c,'model-budget:'+NOW.date().isoformat(),core.POLICY['maximum_model_attempts_per_day'])
     if mode=='cooldown':pipeline.state(c,'classification-attempt:event',NOW.isoformat())
     c.close();call=api(monkeypatch,error=ValueError(SECRET) if mode=='failure' else None)
     monkeypatch.setattr(pipeline.fcntl,'flock',lambda *a:None)
@@ -219,7 +226,7 @@ def test_full_cycle_reports_incomplete_coverage_without_retries_or_false_success
     monkeypatch.setattr(pipeline,'Paper',lambda:paper)
     monkeypatch.setattr(sys,'argv',['investor_pipeline','--output',str(out)])
     if mode=='storage':monkeypatch.setattr(pipeline,'classify_activists',Mock(side_effect=sqlite3.OperationalError(SECRET)))
-    retryable=mode in ['failure','storage','option']
+    retryable=mode in ['storage','option']
     if retryable:
         with pytest.raises(SystemExit) as exc:pipeline.main()
         assert exc.value.code==1

@@ -8,11 +8,14 @@ from investor_diagnostics import ResearchValidationError
 UTC=timezone.utc
 LEGACY_VERSION='investor-observation-20261011-v1'
 PREVIOUS_VERSION='investor-observation-20261013-v2'
-VERSION='investor-observation-20261014-v3'
+DIAGNOSTICS_VERSION='investor-observation-20261014-v3'
+VERSION='investor-observation-20261023-v4'
 POLICY=dict(version=VERSION,minimum_purchase=25000,cluster_total=100000,cluster_owners=2,
     cluster_days=7,hold_sessions=[5,20],cost_per_side=.0015,stress_per_side=.003,
     minimum_stock_price=5,minimum_average_dollar_volume20=5000000,agreement_max_last_session_move=.03,
-    activist_model='gpt-4.1-mini-2025-04-14',maximum_model_attempts_per_day=20,
+    activist_model='gpt-4.1-mini-2025-04-14',maximum_model_attempts_per_day=40,
+    classification_protocol='numbered-source-passages-v1',classification_batch_size=4,
+    classification_source_char_limit=30000,classification_attempts_per_filing=2,
     promotion='RESEARCH_ONLY; no automatic broker qualification',
     limitations=['13F positions are delayed and incomplete portfolios',
         'ARK holdings changes are flow-adjusted proxies, not verified transactions',
@@ -133,6 +136,32 @@ def validate_catalyst(value,purpose):
     if value['action_present'] and value['action']=='none':raise ResearchValidationError('CLASSIFICATION_ACTION')
     return dict(action_present=value['action_present'],action=value['action'],direction=value['direction'],
         evidence_quote=quote,label='GROUNDED_MODEL_HYPOTHESIS_NOT_VERIFIED_OUTCOME')
+
+def source_passages(purpose):
+    """Lossless source slices: the model selects an ID rather than rewriting text."""
+    result=[];start=0
+    while start<len(purpose):
+        end=min(start+1000,len(purpose))
+        if end<len(purpose):
+            boundary=purpose.rfind(' ',start+500,end)
+            if boundary>start:end=boundary+1
+        result.append(dict(id=len(result)+1,start=start,end=end,text=purpose[start:end]))
+        start=end
+    return result
+
+
+def grounded_catalyst(answer,purpose):
+    if not isinstance(answer,dict):raise ResearchValidationError('CLASSIFICATION_SCHEMA')
+    ident=answer.get('evidence_id');passages=source_passages(purpose)
+    if type(ident) is not int or not 1<=ident<=len(passages):
+        raise ResearchValidationError('CLASSIFICATION_SOURCE_QUOTE')
+    passage=passages[ident-1]
+    # Evidence text is constructed exclusively from the immutable filing.
+    result=validate_catalyst(dict(answer,evidence_quote=passage['text']),purpose)
+    if not result['action_present'] and result['action']!='none':
+        raise ResearchValidationError('CLASSIFICATION_ACTION')
+    return dict(result,evidence_id=ident,evidence_start=passage['start'],evidence_end=passage['end'])
+
 
 def ark_csv(blob,fund):
     rows=list(csv.DictReader(io.StringIO(blob.decode('utf-8-sig'))));holdings={};dates=set()
