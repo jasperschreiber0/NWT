@@ -35,7 +35,7 @@ def state(c,key,value=None):
 def register_version(c,policy,now):
     """Append a boundary; never rewrite prior policies, evidence or forecasts."""
     prior=rows(c,'policy')
-    if any(p['version'] not in [core.LEGACY_VERSION,core.PREVIOUS_VERSION,core.DIAGNOSTICS_VERSION,core.VERSION] for p in prior):
+    if any(p['version'] not in [core.LEGACY_VERSION,core.PREVIOUS_VERSION,core.DIAGNOSTICS_VERSION,core.CLASSIFICATION_VERSION,core.VERSION] for p in prior):
         raise ValueError('Unknown investor evidence version')
     previous=one(c,'policy',core.VERSION)
     if previous and previous!=policy:
@@ -75,6 +75,26 @@ class Public:
             dest.parent.mkdir(parents=True,exist_ok=True)
             with gzip.open(dest,'wb') as f:f.write(blob)
         return blob,dict(url=url,sha256=sha,observed_at=datetime.now(timezone.utc).isoformat())
+
+def collect_feed_with_backoff(c,public,form,now):
+    key='feed-health:'+form
+    previous=state(c,key) or {}
+    if previous.get('next_at') and core.stamp(previous['next_at'])>now:
+        return previous
+    try:
+        result=collect_feed(c,public,form,now)
+        result.update(failures=0,last_success_at=now.isoformat())
+    except sqlite3.Error:
+        raise
+    except Exception as exc:
+        failures=previous.get('failures',0)+1
+        minutes=[5,10,20,30][min(failures-1,3)]
+        result=dict(status='DEGRADED',failures=failures,
+            last_success_at=previous.get('last_success_at'),
+            next_at=(now+timedelta(minutes=minutes)).isoformat(),
+            error=diagnostics.failure('market_evaluation',exc)['reason'])
+    return state(c,key,result)
+
 
 def collect_feed(c,public,form,now):
     key='feed:'+form;baseline=state(c,key) is None;previous=state(c,key);found=[];overlap=False;full=False
@@ -477,8 +497,7 @@ def main():
             for r in json.loads(blob).values():mapping.setdefault(str(r['cik_str']),[]).append(r['ticker'])
             tickers=state(c,'tickers',dict(at=now.isoformat(),mapping=mapping,source=source))
         for form in ['4','SCHEDULE 13D']:
-            try:health[form]=collect_feed(c,public,form,now)
-            except Exception as e:health[form]=dict(status='DEGRADED',error=str(e)[:150])
+            health[form]=collect_feed_with_backoff(c,public,form,now)
         parsed=parse_filings(c,public,now,(tickers or {}).get('mapping',{}))
         health.update(collect_managers(c,public,now));health.update(collect_ark(c,public,now))
     except Exception as e:
@@ -495,7 +514,7 @@ def main():
         actual=datetime.now(timezone.utc);context=market_context(c,paper,calendar,actual,allowed)
         actual=datetime.now(timezone.utc);created=propose(c,actual,calendar,allowed,context);scored=evaluate(c,paper,actual)
         option_comparison=investor_options.run(c,paper,datetime.now(timezone.utc),rows,one,put)
-        if option_comparison.get('current_errors'):issues.append('Contemporaneous option comparison awaiting quote retry')
+        # Each forecast owns its retry rotation; never replay the whole collector for quotes.
         if scored.get('unresolved'):issues.append('Completed-session prices missing for '+str(scored['unresolved'])+' forecasts')
     except Exception as e:
         evaluation_diagnostic=diagnostics.failure('market_evaluation',e)
@@ -503,8 +522,9 @@ def main():
     source_issues=[]
     for name,value in health.items():
         if value['status'] not in ['OK','DELAYED_CONTEXT_ONLY']:
-            (source_issues if name in ARK else issues).append(name+': '+value.get('error','Coverage gap'))
-    if parsed['errors']:issues.append('Filing documents awaiting retry: '+str(len(parsed['errors'])))
+            source_issues.append(name+': '+value.get('error','Coverage gap'))
+    if parsed['errors']:source_issues.append('Filing documents awaiting retry: '+str(len(parsed['errors'])))
+    if option_comparison.get('current_errors'):source_issues.append('Contemporaneous option comparison awaiting quote retry')
     retryable=bool(issues)
     issues+=source_issues
     coverage=classification_coverage(c,now)

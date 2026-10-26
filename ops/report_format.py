@@ -65,6 +65,9 @@ def format_report(status, trial, day, activation=False):
         counts=investors.get('counts',{})
         lines.append('Investor research: '+str(counts.get('forecast',0))+' forecasts; '+str(counts.get('outcome',0))+' scored. '+investors.get('status','unknown')+'; observation only.')
         if investors.get('coverage_notes'):lines.append('Investor coverage: '+str(len(investors['coverage_notes']))+' delayed source(s) excluded from new signals.')
+        comparison=investors.get('option_comparison') or {}
+        if comparison.get('missed_entries') or comparison.get('unpriced_exits'):
+            lines.append('Option research gaps to date: '+str(comparison.get('missed_entries',0))+' missed entries; '+str(comparison.get('unpriced_exits',0))+' unpriced exits. Excluded from profit evidence.')
     hub=(status.get('research') or {}).get('hub') or {}
     if hub:
         lab=hub.get('strategy_lab') or {}
@@ -112,12 +115,16 @@ def format_report(status, trial, day, activation=False):
             if row['state']!='UNCHANGED_UNPROVEN':
                 lines.append(f"{row['strategy']}: {row['state']}; recent adjusted {money(row['adjusted_net'])} / {row['completed_groups']} groups.")
         lines.append('Limited experiments: $500/entry, $1,000 open entry cost per strategy. Existing exits continue.')
-        lines.append('$5,000 feasibility remains illustrative; operating costs await confirmed monthly bills.')
+        lines.append('$5,000 feasibility remains illustrative, not live approval.')
     performance=(status.get('research') or {}).get('unified_performance') or {}
     if performance:
         lines += ['', 'Broker equity: '+money(performance.get('equity'))+'; open P&L: '+money(performance.get('unrealized_broker')),
             'Measured trading P&L since '+str(performance.get('measured_since',''))[:10]+': '+money(performance.get('measured_trading_profit')),
             'After operating costs: '+money(performance.get('measured_after_operating_costs'))]
+        costs=performance.get('operating_costs') or {}
+        if costs and not costs.get('complete'):
+            missing=sorted({x.split(':',1)[1] for x in costs.get('missing',[]) if x.startswith('coverage:')})
+            lines.append('Verified running costs recorded: '+money(costs.get('known_accrued_usd'))+'; incomplete'+(' — billing evidence missing: '+', '.join(missing) if missing else '')+'.')
     bridge=(status.get('research') or {}).get('paper_bridge') or {}
     if bridge:lines.append('Research-to-Alpaca paper connection: '+str(bridge.get('qualified',0))+' qualified candidates; operational trial and execution checks apply.')
     lines += ['', 'Recorded outcome rows: ' + str(outcomes.get('n', 'unavailable')),

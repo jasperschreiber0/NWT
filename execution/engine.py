@@ -879,6 +879,10 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
         qty = float(pos.get('qty') or 0)
         order = equity_close_order(pos)
         filled = poll_order_until_filled(order["id"])
+        from close_recovery import pending_close_receipt
+        if pending_close_receipt(pos, filled):
+            logger.info('Equity close pending broker fill: %s order=%s; recovery will reconcile', symbol, order['id'])
+            return
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
 
@@ -957,6 +961,10 @@ def process_close_ticket(conn, ticket: dict) -> None:
             qty = float(pos.get('qty') or 0)
             order = option_close_order(pos)
         filled = poll_order_until_filled(order["id"])
+        from close_recovery import pending_close_receipt
+        if pending_close_receipt(pos, filled):
+            insert_decision(conn, ticket_id, 'SUBMITTED', 'Close awaiting verified broker fill: '+order['id'])
+            return
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
 
@@ -1353,7 +1361,7 @@ def main() -> None:
         from fill_recovery import recover_entries
         recovery = recover_entries(conn, alpaca_get)
         from close_recovery import recover_closes
-        close_recovery = recover_closes(conn, alpaca_get)
+        close_recovery = recover_closes(conn, alpaca_get, datetime.now(timezone.utc))
         if close_recovery.get('blocked'):
             raise RuntimeError('Close recovery needs diagnosis: '+ '; '.join(close_recovery['blocked']))
         if close_recovery['recorded']:

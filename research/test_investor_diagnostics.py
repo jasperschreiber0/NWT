@@ -226,7 +226,7 @@ def test_full_cycle_reports_incomplete_coverage_without_retries_or_false_success
     monkeypatch.setattr(pipeline,'Paper',lambda:paper)
     monkeypatch.setattr(sys,'argv',['investor_pipeline','--output',str(out)])
     if mode=='storage':monkeypatch.setattr(pipeline,'classify_activists',Mock(side_effect=sqlite3.OperationalError(SECRET)))
-    retryable=mode in ['storage','option']
+    retryable=mode=='storage'  # Quote recovery rotates per forecast; no whole-job replay.
     if retryable:
         with pytest.raises(SystemExit) as exc:pipeline.main()
         assert exc.value.code==1

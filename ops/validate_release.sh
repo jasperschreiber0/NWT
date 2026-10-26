@@ -14,3 +14,4 @@ python3 -m pytest -q tests_offline nwt_agents/tests execution/tests ukeu/tests o
 git diff --check
 python3 -m pytest -q research/test_data_atlas.py
 python3 -m pytest -q research/test_investors.py research/test_investor_backoff.py research/test_investor_diagnostics.py research/test_investor_repair.py
+python3 -m pytest -q research/test_recovery_rotation.py ops/test_cost_manifest.py ops/test_cost_accounting.py ops/test_performance_integration.py

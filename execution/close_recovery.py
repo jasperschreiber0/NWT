@@ -1,7 +1,7 @@
 """Record cumulative verified closes and resume canceled residual quantities."""
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 import requests
 from psycopg2.extras import RealDictCursor
@@ -22,7 +22,27 @@ def validate_close_identity(position, order, requested=None):
         raise ValueError('Close receipt does not match ledger identity, direction and quantity')
 
 
-def recover_closes(conn,get):
+def pending_close_receipt(position, order, now=None, requested=None):
+    """Only a validated, recent working receipt is ordinary asynchronous progress."""
+    if order.get('status') not in ('new', 'accepted', 'pending_new', 'partially_filled', 'pending_cancel', 'accepted_for_bidding'):
+        return False
+    validate_close_identity(position, order, requested)
+    qty = Decimal(str(requested if requested is not None else position['qty']))
+    filled = Decimal(str(order.get('filled_qty') or 0))
+    if not qty.is_finite() or not filled.is_finite() or not 0 <= filled < qty:
+        raise ValueError('Invalid pending close quantity')
+    if filled:
+        price = Decimal(str(order.get('filled_avg_price') or 0))
+        if not price.is_finite() or price <= 0:
+            raise ValueError('Invalid partial close price')
+    submitted = datetime.fromisoformat(str(order.get('submitted_at') or order.get('created_at')).replace('Z', '+00:00'))
+    now = now or datetime.now(timezone.utc)
+    if submitted.tzinfo is None or not -60 <= (now-submitted).total_seconds() <= 900:
+        raise ValueError('Pending close missing valid timestamp or older than 15 minutes')
+    return True
+
+
+def recover_closes(conn,get,now=None):
     with conn.cursor(cursor_factory=RealDictCursor) as q:
         q.execute("SELECT * FROM nwt_portfolio_ledger WHERE status='open'")
         positions=q.fetchall()
@@ -91,7 +111,12 @@ def recover_closes(conn,get):
                             q.execute('UPDATE nwt_portfolio_ledger SET close_generation=close_generation+1,close_requested=true WHERE position_id=%s',(pid,))
                             result['residual_retries'].append(pid)
                     elif order.get('status')=='rejected':result['blocked'].append(pid+': broker rejected close')
-                    else:q.execute('UPDATE nwt_portfolio_ledger SET close_requested=true WHERE position_id=%s',(pid,))
+                    elif now is not None:
+                        try:
+                            if not pending_close_receipt(position,order,now,requested):
+                                raise ValueError('Unexpected unresolved close status')
+                        except (ValueError, ArithmeticError) as exc:
+                            result['blocked'].append(pid+': '+str(exc))
             conn.commit()
         except Exception:
             conn.rollback();raise

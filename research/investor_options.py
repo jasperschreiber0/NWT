@@ -50,7 +50,9 @@ def close_book(book,chain,quote,observed):
 
 def run(c,paper,now,rows,one,put):
     forecasts=rows(c,'forecast');processed=0;errors=[]
-    for pred in sorted(forecasts,key=lambda p:(p['entry'],p['key'])):
+    c.execute('CREATE TABLE IF NOT EXISTS option_attempts(key TEXT PRIMARY KEY, attempted_at TEXT NOT NULL)')
+    attempts=dict(c.execute('SELECT key,attempted_at FROM option_attempts'))
+    for pred in sorted(forecasts,key=lambda p:(attempts.get(p['key'],''),p['entry'],p['key'])):
         key=pred['key'];book=one(c,'option_book',key);ending=one(c,'option_result',key)
         if ending:continue
         at=stamp(pred['exit_at'] if book else pred['entry_at'])
@@ -59,8 +61,9 @@ def run(c,paper,now,rows,one,put):
             put(c,'option_result',key,dict(state='UNPRICED_EXIT' if book else 'MISSED_ENTRY',
                 reason='No contemporaneous comparison within the frozen 20-minute observation window',observed_at=now.isoformat()))
             continue
-        if processed>=3:break
+        if processed>=3:continue  # Still expire all elapsed windows honestly.
         processed+=1
+        c.execute('INSERT OR REPLACE INTO option_attempts VALUES (?,?)',(key,now.isoformat()));c.commit()
         stage='option_equity_quote'
         try:
             q=paper.get('/v2/stocks/'+pred['symbol']+'/quotes/latest',dict(feed='sip'),data=True)['quote']
@@ -90,6 +93,7 @@ def run(c,paper,now,rows,one,put):
             if book:
                 stage='option_valuation'
                 closed=close_book(book,chain,q,observed)
+                if closed is None:raise ResearchValidationError('OPTION_EXIT_UNPRICEABLE')
                 if closed:
                     stage='option_storage'
                     put(c,'option_exit_quote_evidence',key,dict(chain=chain,quote=q,observed_at=observed.isoformat()))
@@ -109,4 +113,5 @@ def run(c,paper,now,rows,one,put):
     return dict(version=VERSION,books=len(books),books_with_options=sum(bool(b['spreads']) for b in books),
         no_eligible_spread=sum(not b['spreads'] for b in books),completed=sum(r['state']=='COMPLETE' for r in result),
         missed_entries=sum(r['state']=='MISSED_ENTRY' for r in result),unpriced_exits=sum(r['state']=='UNPRICED_EXIT' for r in result),
+        coverage_status='INCOMPLETE' if any(r['state']!='COMPLETE' for r in result) else 'NO_RECORDED_GAPS',
         current_errors=errors,execution_enabled=False)

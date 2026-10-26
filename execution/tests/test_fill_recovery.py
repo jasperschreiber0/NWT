@@ -2,7 +2,7 @@ import json
 import os
 from copy import deepcopy
 from decimal import Decimal
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 import psycopg2
 import pytest
 from fill_recovery import recover_entries, fill_data
@@ -113,6 +113,21 @@ def close_receipt(pid, **changes):
                      filled_at='2026-09-17T15:00:00Z'),**changes)
 
 
+def test_stuck_partial_close_records_verified_fill_before_alerting(close_db):
+    from close_recovery import recover_closes
+    conn,pid=close_db
+    now=datetime.now(timezone.utc)
+    receipt=close_receipt(pid,status='partially_filled',filled_qty='12',submitted_at=(now-timedelta(minutes=16)).isoformat())
+    result=recover_closes(conn,lambda _:receipt,now)
+    assert result['recorded']==[pid] and result['pending']==[pid]
+    assert 'older than 15 minutes' in result['blocked'][0]
+    again=recover_closes(conn,lambda _:receipt,now)
+    assert again['recorded']==[] and again['blocked']
+    with conn.cursor() as q:
+        q.execute('SELECT qty FROM nwt_portfolio_ledger WHERE position_id=%s',(pid,))
+        assert q.fetchone()[0]==20
+
+
 def test_pending_close_blocks_entries_then_recovers_exactly_once(close_db, monkeypatch):
     import engine
     import fill_recovery
@@ -135,7 +150,7 @@ def test_pending_close_blocks_entries_then_recovers_exactly_once(close_db, monke
     monkeypatch.setattr(engine,'fetch_force_close_tickets',lambda _:[])
     entries=Mock(return_value=[]);post=Mock()
     monkeypatch.setattr(engine,'fetch_pending_tickets',entries);monkeypatch.setattr(engine,'alpaca_post',post)
-    receipt=close_receipt(pid,status='new',filled_qty='0',filled_avg_price=None,filled_at=None)
+    receipt=close_receipt(pid,status='new',filled_qty='0',filled_avg_price=None,filled_at=None,submitted_at=datetime.now(timezone.utc).isoformat())
     def broker(path):
         if path=='/clock':return {'is_open':True}
         if path=='/orders?status=open&limit=1':return []

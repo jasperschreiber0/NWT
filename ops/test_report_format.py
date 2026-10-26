@@ -18,6 +18,14 @@ def test_missing_or_nonfinite_results_are_not_reported_as_zero():
     assert money('0') == '$0.00'
 
 
+def test_unknown_billing_stays_explicit_in_daily_report():
+    text=format_report(dict(issues=[],research=dict(unified_performance=dict(
+        equity=1000,measured_after_operating_costs=None,
+        operating_costs=dict(complete=False,known_accrued_usd=0,missing=['coverage:alpaca','coverage:openai'])))),{},'2026-10-27')
+    assert 'After operating costs: unavailable' in text
+    assert 'billing evidence missing: alpaca, openai' in text
+
+
 
 def test_research_cost_results_and_overlap_are_disclosed():
     text=format_report({'issues':[], 'session_incidents':1, 'research':{'discovery':{'patterns':{
