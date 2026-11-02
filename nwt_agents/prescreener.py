@@ -17,7 +17,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from openai_client import call_json
+from openai_client import call_json, OpenAIRequestError
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -126,7 +126,7 @@ Rules:
 
 
 def call_prescreener(prompt: str, conn=None) -> tuple[list, int, int]:
-    return call_json(prompt, PRESCREENER_MODEL, list, conn=conn, component="prescreener")
+    return call_json(prompt, PRESCREENER_MODEL, list, conn=conn, component="prescreener", retry_rate_limit=True)
 
 
 # ---------------------------------------------------------------------------
@@ -195,10 +195,13 @@ def main() -> None:
         except Exception as exc:
             # A failed provider call must not leave yesterday's candidates active.
             (AGENTS_DIR / "prescreened_symbols.json").write_text("[]", encoding="utf-8")
-            logger.error("OpenAI call failed: %s", exc)
-            log_system_event(conn, "ERROR", "prescreener", f"OpenAI API call failed: {exc}")
-            conn.close()
-            sys.exit(1)
+            reason = str(exc) if isinstance(exc, OpenAIRequestError) else 'unclassified_client_failure'
+            logger.error("OpenAI call failed: %s", reason)
+            try:
+                log_system_event(conn, "ERROR", "prescreener", f"OpenAI API call failed: {reason}")
+            except Exception:
+                logger.error("Prescreener failure audit unavailable")
+            raise SystemExit(1) from None
 
         # 3. Filter to score >= 5
         passed = [item for item in scored if item.get("score", 0) >= 5]

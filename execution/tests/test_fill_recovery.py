@@ -1,9 +1,12 @@
 import json
 import os
+import uuid
 from copy import deepcopy
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 import psycopg2
+from psycopg2 import sql
 import pytest
 from fill_recovery import recover_entries, fill_data
 
@@ -14,24 +17,38 @@ ORDER=dict(id=OID,client_order_id='nwt-entry-'+TID,symbol='VGK',side='buy',qty='
 
 
 @pytest.fixture
-def recovery_db():
+def recovery_db(request):
     conn=psycopg2.connect(os.environ['NWT_TEST_DB_DSN'])
+    test_schema='recovery_'+uuid.uuid4().hex
+    def cleanup():
+        try:
+            conn.rollback()
+            with conn.cursor() as q:
+                q.execute(sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(sql.Identifier(test_schema)))
+            conn.commit()
+        finally:
+            conn.close()
+    request.addfinalizer(cleanup)
     with conn.cursor() as q:
+        # Permanent migration objects cannot reference temporary tables. A unique
+        # schema also prevents earlier tests' public tables from masking this bug.
+        q.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(test_schema)))
+        q.execute(sql.SQL('SET search_path TO {}').format(sql.Identifier(test_schema)))
         q.execute('''
-        CREATE TEMP TABLE nwt_tickets(ticket_id uuid PRIMARY KEY,type text,payload jsonb,created_at timestamptz DEFAULT now());
-        CREATE TEMP TABLE nwt_entry_evidence(position_id uuid PRIMARY KEY,decision_id uuid,eligible boolean,snapshot jsonb,parent_position_id uuid);
-        CREATE TEMP TABLE nwt_entry_intents(ticket_id uuid);
-        CREATE TEMP TABLE nwt_ticket_decisions(ticket_id uuid,decision text,reasoning text,decided_by text,created_at timestamptz DEFAULT now());
+        CREATE TABLE nwt_tickets(ticket_id uuid PRIMARY KEY,type text,payload jsonb,created_at timestamptz DEFAULT now());
+        CREATE TABLE nwt_entry_evidence(position_id uuid PRIMARY KEY,decision_id uuid,eligible boolean,snapshot jsonb,parent_position_id uuid);
+        CREATE TABLE nwt_entry_intents(ticket_id uuid);
+        CREATE TABLE nwt_ticket_decisions(ticket_id uuid,decision text,reasoning text,decided_by text,created_at timestamptz DEFAULT now());
         CREATE UNIQUE INDEX recovery_partial_decision ON nwt_ticket_decisions(ticket_id,decided_by)
           WHERE created_at >= TIMESTAMPTZ '2026-07-24 00:00:00+00';
-        CREATE TEMP TABLE nwt_decision_inputs(ticket_id uuid,outcome_reason text,stage_reached text);
-        CREATE TEMP TABLE nwt_system_log(level text,component text,message text,payload jsonb);
-        CREATE TEMP TABLE nwt_portfolio_ledger(position_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),bot_source text,strategy_id text,
+        CREATE TABLE nwt_decision_inputs(ticket_id uuid,outcome_reason text,stage_reached text);
+        CREATE TABLE nwt_system_log(level text,component text,message text,payload jsonb);
+        CREATE TABLE nwt_portfolio_ledger(position_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),bot_source text,strategy_id text,
           asset text,asset_type text,direction text,delta_exposure numeric,notional_risk numeric,qty numeric,entry_price numeric,
           entry_time timestamptz,entry_bid numeric,entry_ask numeric,alpaca_order_id uuid,stop_pct numeric,target_pct numeric,
           spread_group_id uuid,ticket_id uuid,status text,lifecycle_state text,exit_price numeric,exit_time timestamptz,realized_slippage numeric,exit_reason text,exit_bid numeric,exit_ask numeric,close_generation integer DEFAULT 0,close_requested boolean DEFAULT false,outcome_accounting_version text);
         CREATE UNIQUE INDEX recovery_order_asset ON nwt_portfolio_ledger(alpaca_order_id,asset) WHERE alpaca_order_id IS NOT NULL;
-        CREATE TEMP TABLE nwt_close_progress(position_id uuid,generation integer,order_id uuid,requested_qty numeric,recorded_qty numeric,recorded_value numeric,PRIMARY KEY(position_id,generation));
+        CREATE TABLE nwt_close_progress(position_id uuid,generation integer,order_id uuid,requested_qty numeric,recorded_qty numeric,recorded_value numeric,PRIMARY KEY(position_id,generation));
         ''')
         q.execute('INSERT INTO nwt_tickets(ticket_id,payload) VALUES(%s,%s)',(TID,json.dumps(PAYLOAD)))
         q.execute('INSERT INTO nwt_entry_intents VALUES(%s)',(TID,))
@@ -39,13 +56,14 @@ def recovery_db():
     from pathlib import Path
     schema=(Path(__file__).resolve().parents[2]/'db/schema.sql').read_text()
     outcome=schema[schema.index('CREATE TABLE IF NOT EXISTS nwt_trade_outcomes ('):]
-    outcome=outcome[:outcome.index(');')+2].replace('CREATE TABLE IF NOT EXISTS','CREATE TEMP TABLE')
+    outcome=outcome[:outcome.index(');')+2]
     with conn.cursor() as q:
         q.execute(outcome)
         q.execute('ALTER TABLE nwt_trade_outcomes ADD position_id uuid, ADD evidence_version text')
+    with conn.cursor() as q:
+        q.execute((Path(__file__).resolve().parents[2]/'db/migrate_2026_10_27_close_receipt_bounds.sql').read_text())
     conn.commit()
     yield conn
-    conn.close()
 
 
 def test_late_fill_recovers_once_with_exact_broker_evidence(recovery_db):
@@ -116,7 +134,7 @@ def close_receipt(pid, **changes):
 def test_stuck_partial_close_records_verified_fill_before_alerting(close_db):
     from close_recovery import recover_closes
     conn,pid=close_db
-    now=datetime.now(timezone.utc)
+    now=datetime(2026,9,17,15,1,tzinfo=timezone.utc)
     receipt=close_receipt(pid,status='partially_filled',filled_qty='12',submitted_at=(now-timedelta(minutes=16)).isoformat())
     result=recover_closes(conn,lambda _:receipt,now)
     assert result['recorded']==[pid] and result['pending']==[pid]
@@ -150,7 +168,13 @@ def test_pending_close_blocks_entries_then_recovers_exactly_once(close_db, monke
     monkeypatch.setattr(engine,'fetch_force_close_tickets',lambda _:[])
     entries=Mock(return_value=[]);post=Mock()
     monkeypatch.setattr(engine,'fetch_pending_tickets',entries);monkeypatch.setattr(engine,'alpaca_post',post)
-    receipt=close_receipt(pid,status='new',filled_qty='0',filled_avg_price=None,filled_at=None,submitted_at=datetime.now(timezone.utc).isoformat())
+    # Both observations belong to this synthetic fill day; wall-clock now must
+    # not place submission after the historical terminal fill retained below.
+    class FixtureClock(datetime):
+        @classmethod
+        def now(cls,tz=None):return cls(2026,9,17,15,1,tzinfo=timezone.utc)
+    monkeypatch.setattr(engine,'datetime',FixtureClock)
+    receipt=close_receipt(pid,status='new',filled_qty='0',filled_avg_price=None,filled_at=None,submitted_at='2026-09-17T14:59:00Z')
     def broker(path):
         if path=='/clock':return {'is_open':True}
         if path=='/orders?status=open&limit=1':return []
@@ -261,6 +285,39 @@ def test_partial_close_restart_records_only_incremental_fills(close_db):
         q.execute('SELECT COUNT(DISTINCT spread_group_id) FROM nwt_portfolio_ledger');assert q.fetchone()[0]==1
 
 
+def test_migration_repeat_preserves_populated_partial_close_progress(close_db):
+    from pathlib import Path
+    from close_recovery import recover_closes
+    conn,pid=close_db
+    first=close_receipt(pid,status='partially_filled',filled_qty='12',filled_avg_price='90')
+    recover_closes(conn,lambda _:first)
+    def snapshot():
+        with conn.cursor() as q:
+            q.execute('SELECT position_id,generation,order_id,requested_qty,recorded_qty,recorded_value FROM nwt_close_progress')
+            progress=q.fetchall()
+            q.execute('SELECT position_id,status,qty,entry_price,exit_price,exit_time,spread_group_id,close_generation,close_requested FROM nwt_portfolio_ledger ORDER BY position_id')
+            ledger=q.fetchall()
+            q.execute('SELECT * FROM nwt_trade_outcomes ORDER BY position_id')
+            return progress,ledger,q.fetchall()
+    before=snapshot()
+    assert len(before[0])==1
+    assert before[0][0][1]==0 and str(before[0][0][2])==OID
+    assert before[0][0][3:]==(Decimal(32),Decimal(12),Decimal(1080))
+    migration=(Path(__file__).resolve().parents[2]/'db/migrate_2026_09_24_close_progress.sql').read_text()
+    for _ in range(2):
+        with conn.cursor() as q:q.execute(migration)
+        conn.commit()
+        assert snapshot()==before
+    recover_closes(conn,lambda _:first)
+    assert snapshot()==before  # Replayed cumulative receipt adds nothing after migration.
+    recover_closes(conn,lambda _:close_receipt(pid,filled_avg_price='91'))
+    with conn.cursor() as q:
+        q.execute('SELECT requested_qty,recorded_qty,recorded_value FROM nwt_close_progress')
+        assert q.fetchall()==[(Decimal(32),Decimal(32),Decimal(2912))]
+        q.execute("SELECT SUM(qty),SUM(qty*exit_price),COUNT(*) FROM nwt_portfolio_ledger WHERE status='closed'")
+        assert q.fetchone()==(Decimal(32),Decimal(2912),2)
+
+
 def test_canceled_residual_uses_new_deterministic_identity(close_db):
     from close_recovery import recover_closes,close_client_id
     conn,pid=close_db
@@ -293,6 +350,73 @@ def test_partial_close_retry_limit_preserves_verified_fill(close_db):
     assert result['blocked'] and not result['residual_retries']
     with conn.cursor() as q:
         q.execute("SELECT qty FROM nwt_portfolio_ledger WHERE status='open'");assert q.fetchone()[0]==20
+
+
+def test_retained_submission_survives_new_connection_and_repeated_migration(close_db):
+    from pathlib import Path
+    from close_bounds import retain_close_bounds
+    from close_recovery import recover_closes
+    conn,pid=close_db
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as q:
+        q.execute('SELECT * FROM nwt_portfolio_ledger WHERE position_id=%s',(pid,));pos=q.fetchone()
+        q.execute('SELECT current_schema() AS name');schema=q.fetchone()['name']
+    now=datetime(2026,10,27,0,5,tzinfo=timezone.utc)
+    retain_close_bounds(conn,pos,close_receipt(pid,status='new',filled_qty='0',filled_at=None,
+                                              submitted_at='2026-10-27T00:00:00Z'),now)
+    # Fresh connection, no process-local cache or original response available.
+    other=psycopg2.connect(os.environ['NWT_TEST_DB_DSN'])
+    try:
+        with other.cursor() as q:q.execute(sql.SQL('SET search_path TO {}').format(sql.Identifier(schema)))
+        other.commit()
+        migration=(Path(__file__).resolve().parents[2]/'db/migrate_2026_10_27_close_receipt_bounds.sql').read_text()
+        for _ in range(2):
+            with other.cursor() as q:q.execute(migration)
+            other.commit()
+        receipt=close_receipt(pid,filled_at='2026-10-26T23:00:00Z')
+        with pytest.raises(ValueError,match='precedes submission'):
+            recover_closes(other,lambda _:receipt,now)
+        with other.cursor() as q:
+            q.execute('SELECT bounds FROM nwt_close_receipt_bounds');assert q.fetchone()[0]=={'submitted_at':'2026-10-27T00:00:00Z'}
+            q.execute('SELECT count(*) FROM nwt_close_progress');assert q.fetchone()[0]==0
+            q.execute('SELECT status,qty FROM nwt_portfolio_ledger');assert q.fetchone()==('open',Decimal(32))
+        result=recover_closes(other,lambda _:dict(receipt,filled_at='2026-10-27T00:01:00Z'),now)
+        assert result['recorded']==[pid]
+        assert recover_closes(other,lambda _:pytest.fail('closed position must not replay'),now)['recorded']==[]
+    finally:
+        other.close()
+
+
+def test_bound_migration_preserves_partial_progress_and_retry_generations(close_db):
+    from pathlib import Path
+    from close_recovery import recover_closes,close_client_id
+    conn,pid=close_db
+    first=close_receipt(pid,status='canceled',filled_qty='12',filled_avg_price='90',submitted_at='2026-09-17T14:59:00Z')
+    assert recover_closes(conn,lambda _:first)['residual_retries']==[pid]
+    with conn.cursor() as q:
+        q.execute('SELECT * FROM nwt_close_progress');before=q.fetchall()
+    migration=(Path(__file__).resolve().parents[2]/'db/migrate_2026_10_27_close_receipt_bounds.sql').read_text()
+    for _ in range(2):
+        with conn.cursor() as q:q.execute(migration)
+        conn.commit()
+    with conn.cursor() as q:
+        q.execute('SELECT * FROM nwt_close_progress');assert q.fetchall()==before
+    retry=close_receipt(pid,id='33333333-3333-3333-3333-333333333333',qty='20',filled_qty='20',
+        client_order_id=close_client_id(dict(position_id=pid,close_generation=1)),
+        submitted_at='2026-09-17T15:01:00Z',filled_at='2026-09-17T15:02:00Z')
+    assert recover_closes(conn,lambda _:retry)['recorded']==[pid]
+    with conn.cursor() as q:
+        q.execute('SELECT generation,bounds FROM nwt_close_receipt_bounds ORDER BY generation')
+        assert q.fetchall()==[(0,{'submitted_at':'2026-09-17T14:59:00Z'}),(1,{'submitted_at':'2026-09-17T15:01:00Z'})]
+
+
+def test_missing_bound_migration_blocks_without_accounting(close_db):
+    from close_recovery import recover_closes
+    conn,pid=close_db
+    with conn.cursor() as q:q.execute('DROP TABLE nwt_close_receipt_bounds')
+    conn.commit()
+    with pytest.raises(psycopg2.errors.UndefinedTable):recover_closes(conn,lambda _:close_receipt(pid))
+    with conn.cursor() as q:
+        q.execute('SELECT status,qty FROM nwt_portfolio_ledger');assert q.fetchone()==('open',Decimal(32))
 
 
 @pytest.fixture
@@ -336,13 +460,20 @@ def test_actual_option_close_then_learning_uses_filled_quantity(learning_close_d
     engine.process_close_ticket(conn,dict(ticket_id=OID,payload=dict(position_id=pid,asset_type='option',symbol='VGK')))
     with conn.cursor() as q:
         q.execute('SELECT count(*) FROM nwt_trade_outcomes');assert q.fetchone()==(1,)
-    from risk_agent import get_intraday_pnl
-    assert get_intraday_pnl(conn)<=-2124  # visible before nightly learning
+    import risk_agent
+    # Query the fixture's fill day; never substitute today's time for broker evidence.
+    with monkeypatch.context() as clock:
+        clock.setattr(risk_agent,'datetime',SimpleNamespace(now=lambda tz:datetime(2026,9,17,16,tzinfo=tz)))
+        assert risk_agent.get_intraday_pnl(conn)<=-2124  # visible before nightly learning
+        clock.setattr(risk_agent,'datetime',SimpleNamespace(now=lambda tz:datetime(2026,9,18,16,tzinfo=tz)))
+        assert risk_agent.get_intraday_pnl(conn)==0  # historical fills are not today's P&L
     learning.main();learning.main()
     with conn.cursor() as q:
         q.execute('SELECT count(*),sum(pnl) FROM nwt_verified_learning_outcomes')
         assert q.fetchone()==(1,Decimal('-2124.0000'))
         q.execute('SELECT count(*) FROM nwt_trade_outcomes');assert q.fetchone()==(1,)
+        q.execute('SELECT min(closed_at),max(closed_at) FROM nwt_trade_outcomes')
+        assert q.fetchone()==(datetime(2026,9,17,15,tzinfo=timezone.utc),)*2
 
 
 def test_partial_close_inherits_entry_and_counts_one_trade(learning_close_db):
@@ -397,11 +528,12 @@ def test_legacy_open_close_records_raw_loss_without_learning(learning_close_db,m
         monkeypatch.setattr(engine,'poll_order_until_filled',lambda _:receipt)
         engine.process_close_ticket(conn,dict(ticket_id=OID,payload=dict(position_id=pid,asset_type='option',symbol='VGK')))
     import risk_agent
-    if partial:
-        from datetime import datetime
-        from types import SimpleNamespace
-        monkeypatch.setattr(risk_agent,'datetime',SimpleNamespace(now=lambda tz:datetime(2026,9,17,16,tzinfo=timezone.utc)))
-    assert risk_agent.get_intraday_pnl(conn)<=-3200
+    # Both synchronous and partial recovery paths retain the fixture's exact fill time.
+    with monkeypatch.context() as clock:
+        clock.setattr(risk_agent,'datetime',SimpleNamespace(now=lambda tz:datetime(2026,9,17,16,tzinfo=tz)))
+        assert risk_agent.get_intraday_pnl(conn)<=-3200
+        clock.setattr(risk_agent,'datetime',SimpleNamespace(now=lambda tz:datetime(2026,9,18,16,tzinfo=tz)))
+        assert risk_agent.get_intraday_pnl(conn)==0
     # Raw risk loss is visible before nightly catch-up, including partial fills.
     assert get_distinct_trade_pnls(conn,verified_only=False)[0][0]<=-3200
     learning.main();learning.main()
@@ -410,6 +542,8 @@ def test_legacy_open_close_records_raw_loss_without_learning(learning_close_db,m
         assert q.fetchone()==(2 if partial else 1,Decimal('-3200'),'raw-fill-unverified-20261020-v1')
         q.execute('SELECT count(*) FROM nwt_verified_learning_outcomes');assert q.fetchone()==(0,)
         q.execute('SELECT count(*) FROM nwt_entry_evidence');assert q.fetchone()==(0,)
+        q.execute('SELECT min(closed_at),max(closed_at) FROM nwt_trade_outcomes')
+        assert q.fetchone()==(datetime(2026,9,17,15,tzinfo=timezone.utc),)*2
     risk=get_distinct_trade_pnls(conn,verified_only=False)
     assert len(risk)==1 and risk[0][0]<=-3200
     assert get_distinct_trade_pnls(conn)==[]

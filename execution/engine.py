@@ -310,6 +310,82 @@ def insert_decision(conn, ticket_id: str, decision: str, reasoning: str) -> None
     conn.commit()
 
 
+from contextvars import ContextVar
+
+_close_pending = ContextVar("close_pending", default=False)
+
+
+class CloseReceiptError(ValueError):
+    """Unresolved close evidence must stop this engine cycle's new entries."""
+
+
+def block_close_cycle(conn, message, context, cause, ticket_id=None):
+    """Audit best effort, but never let audit failure remove the entry barrier."""
+    error = CloseReceiptError(message + '; new entries blocked')
+    try:
+        logger.error('%s: %s', message, context)
+        if ticket_id is not None:
+            insert_decision(conn, ticket_id, 'FAILED', message)
+        log_system_event(conn, 'ERROR', 'close_poll', message, context)
+    except Exception as audit_error:
+        error.add_note('Close audit also failed: ' + type(audit_error).__name__)
+    raise error from cause
+
+
+def poll_close_receipt(conn, position, order):
+    """Validate full receipts or recent asynchronous progress; both retain entry barriers."""
+    context = {}
+    try:
+        context.update(position_id=str(position['position_id']),
+                       close_generation=int(position.get('close_generation') or 0),
+                       poll_max=POLL_MAX, poll_interval_seconds=POLL_INTERVAL)
+        if not isinstance(order, dict) or not isinstance(order.get('id'), str) or not order['id'].strip():
+            raise ValueError('Submitted close response lacks order identity')
+        context['order_id'] = order['id']
+        from close_bounds import retain_close_bounds
+        retained = retain_close_bounds(conn, position, order, datetime.now(timezone.utc))
+        filled = poll_order_until_filled(order['id'])
+        observed_at = datetime.now(timezone.utc)
+        context['observed_at'] = observed_at.isoformat()
+        if not isinstance(filled, dict) or filled.get('id') != order['id']:
+            raise ValueError('Polled close order changed identity')
+        retained = retain_close_bounds(conn, position, filled, observed_at)
+        context.update(status=filled.get('status'), filled_qty=filled.get('filled_qty'),
+                       filled_at=filled.get('filled_at'), client_order_id=filled.get('client_order_id'),
+                       symbol=filled.get('symbol'), side=filled.get('side'),
+                       requested_qty=filled.get('qty'), filled_avg_price=filled.get('filled_avg_price'))
+        from close_recovery import pending_close_receipt
+        if pending_close_receipt(position, filled, observed_at, retained_bounds=retained):
+            # Valid asynchronous progress still blocks entries even when a later
+            # open-order snapshot is empty; recovery must persist the fill first.
+            if filled.get('filled_qty') and float(filled['filled_qty']) > 0:
+                from fill_evidence import with_fill_timestamp
+                with_fill_timestamp(filled, alpaca_get, observed_at=observed_at,
+                                    additional_bounds=retained + (order,),entry_time=position.get('entry_time'))
+            _close_pending.set(True)
+            return filled
+        if filled.get('status') != 'filled':
+            context['outcome'] = 'terminal_unfilled' if filled.get('status') in (
+                'canceled', 'expired', 'rejected') else 'poll_window_exhausted_pending'
+            raise ValueError('Close remains unresolved until recovery verifies persistence')
+        from close_recovery import verified_close_time
+        from fill_evidence import with_fill_timestamp, verified_fill_time
+        filled = with_fill_timestamp(filled, alpaca_get, observed_at=observed_at,
+                                     additional_bounds=retained + (order,),entry_time=position.get('entry_time'))
+        verified_close_time(position, filled, observed_at=observed_at)
+        # The submission response may retain a timestamp omitted by the poll.
+        # Validate both identified broker sources without modifying either.
+        verified_fill_time(order, filled['filled_at'], observed_at)
+        context.update(outcome='verified_fill', filled_at=filled['filled_at'])
+        log_system_event(conn, 'INFO', 'close_poll', 'Close polling observation', context)
+        return filled
+    except Exception as exc:
+        context.setdefault('outcome', 'poll_or_evidence_error')
+        context['error_type'] = type(exc).__name__
+        block_close_cycle(conn, 'Close poll/evidence unresolved', context, exc)
+
+
+
 def mark_decision_outcome(conn, ticket_id: str, outcome_reason: str) -> None:
     """
     Set the terminal outcome_reason on the nwt_decision_inputs row this
@@ -878,10 +954,8 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
             return
         qty = float(pos.get('qty') or 0)
         order = equity_close_order(pos)
-        filled = poll_order_until_filled(order["id"])
-        from close_recovery import pending_close_receipt
-        if pending_close_receipt(pos, filled):
-            logger.info('Equity close pending broker fill: %s order=%s; recovery will reconcile', symbol, order['id'])
+        filled = poll_close_receipt(conn, pos, order)
+        if filled.get("status") != "filled":
             return
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
@@ -897,7 +971,8 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
             return
 
         slippage = abs(fill_price - current_price) / current_price if current_price > 0 else 0.0
-        close_position(conn, position_id, fill_price, slippage, exit_reason)
+        close_position(conn, position_id, fill_price, slippage, exit_reason,
+                           exit_time=datetime.fromisoformat(filled["filled_at"].replace("Z", "+00:00")))
         log_system_event(conn, "INFO", "execution_engine",
                          f"Closed equity {symbol} reason={exit_reason} fill={fill_price:.4f}",
                          {"position_id": position_id, "exit_reason": exit_reason,
@@ -905,10 +980,8 @@ def _close_equity_position(conn, pos, current_price, position_id, symbol,
                           "order_id": order.get("id")})
         logger.info("Closed equity %s at %.4f reason=%s side=%s", symbol, fill_price, exit_reason, close_side)
     except Exception as exc:
-        logger.error("Failed to close equity position %s: %s", position_id, exc)
-        log_system_event(conn, "ERROR", "execution_engine",
-                         f"Equity close failed for {symbol}: {exc}",
-                         {"position_id": position_id})
+        block_close_cycle(conn, 'Equity close or ledger persistence unresolved',
+                          {'position_id': str(position_id)}, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -960,10 +1033,9 @@ def process_close_ticket(conn, ticket: dict) -> None:
                 return
             qty = float(pos.get('qty') or 0)
             order = option_close_order(pos)
-        filled = poll_order_until_filled(order["id"])
-        from close_recovery import pending_close_receipt
-        if pending_close_receipt(pos, filled):
-            insert_decision(conn, ticket_id, 'SUBMITTED', 'Close awaiting verified broker fill: '+order['id'])
+        filled = poll_close_receipt(conn, pos, order)
+        if filled.get("status") != "filled":
+            insert_decision(conn, ticket_id, "SUBMITTED", "Close awaiting verified broker fill: " + filled["id"])
             return
         fill_price = float(filled.get("filled_avg_price") or 0)
         fill_status = filled.get("status", "")
@@ -980,9 +1052,12 @@ def process_close_ticket(conn, ticket: dict) -> None:
                 cur.execute("SELECT * FROM nwt_portfolio_ledger WHERE position_id = %s",
                             (position_id,))
                 pos = cur.fetchone()
+            if not pos:
+                raise CloseReceiptError('Ledger position disappeared before close persistence')
             if pos:
                 pos = dict(pos)
-                close_position(conn, position_id, fill_price, slippage, exit_reason)
+                close_position(conn, position_id, fill_price, slippage, exit_reason,
+                           exit_time=datetime.fromisoformat(filled["filled_at"].replace("Z", "+00:00")))
                 # The learning worker is the sole outcome writer. It uses actual
                 # filled quantities and immutable entry evidence for all assets.
 
@@ -993,10 +1068,8 @@ def process_close_ticket(conn, ticket: dict) -> None:
                          {"ticket_id": ticket_id, "exit_reason": exit_reason,
                           "position_id": position_id})
     except Exception as exc:
-        reason = f"Close failed: {exc}"
-        logger.error("Ticket %s: %s", ticket_id, reason)
-        insert_decision(conn, ticket_id, "FAILED", reason)
-        log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
+        block_close_cycle(conn, 'Close ticket or ledger persistence unresolved',
+                          {'ticket_id': ticket_id}, exc, ticket_id=ticket_id)
 
 
 def process_force_close(conn, ticket: dict) -> None:
@@ -1034,21 +1107,17 @@ def process_force_close(conn, ticket: dict) -> None:
         order = (equity_close_order(position) if asset_type == 'equity'
                  else option_close_order(position))
     except Exception as exc:
-        reason = f"FORCE_CLOSE: liquidation order failed for {asset}: {exc}"
-        logger.error("Ticket %s: %s", ticket_id, reason)
-        insert_decision(conn, ticket_id, "FAILED", reason)
-        log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
-        return
+        block_close_cycle(conn, 'Close submission unresolved', {'ticket_id': ticket_id}, exc,
+                          ticket_id=ticket_id)
 
-    alpaca_order_id = order.get("id", "")
     try:
-        filled_order = poll_order_until_filled(alpaca_order_id) if alpaca_order_id else order
+        filled_order = poll_close_receipt(conn, position, order)
+        if filled_order.get("status") != "filled":
+            return
+        alpaca_order_id = filled_order['id']
     except Exception as exc:
-        reason = f"FORCE_CLOSE: order poll failed: {exc}"
-        logger.error("Ticket %s: %s", ticket_id, reason)
-        insert_decision(conn, ticket_id, "FAILED", reason)
-        log_system_event(conn, "ERROR", "execution_engine", reason, {"ticket_id": ticket_id})
-        return
+        block_close_cycle(conn, 'Force-close poll unresolved', {'ticket_id': ticket_id}, exc,
+                          ticket_id=ticket_id)
 
     fill_price_str = filled_order.get("filled_avg_price")
     fill_price = float(fill_price_str) if fill_price_str else None
@@ -1064,7 +1133,8 @@ def process_force_close(conn, ticket: dict) -> None:
 
     slippage = abs(fill_price - expected_price) / expected_price if expected_price and expected_price > 0 else 0.0
     close_position(conn, position_id, fill_price, slippage, "hard_close",
-                   exit_bid=exit_bid, exit_ask=exit_ask)
+                   exit_bid=exit_bid, exit_ask=exit_ask,
+                   exit_time=datetime.fromisoformat(filled_order["filled_at"].replace("Z", "+00:00")))
     reasoning = (
         f"FORCE_CLOSE filled at {fill_price:.4f}, slippage={slippage:.4f}, "
         f"position_id={position_id}, alpaca_order_id={alpaca_order_id}"
@@ -1353,6 +1423,7 @@ def process_ticket(conn, ticket: dict, directives: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    _close_pending.set(False)
     logger.info("Execution Engine starting")
 
     conn = get_db()
@@ -1406,15 +1477,15 @@ def main() -> None:
                 current_receipt=q.fetchone()
             if current_receipt:
                 continue
-            if pos['asset_type']=='equity':equity_close_order(pos)
-            else:option_close_order(pos)
+            order = equity_close_order(pos) if pos['asset_type']=='equity' else option_close_order(pos)
+            from close_bounds import retain_close_bounds
+            retain_close_bounds(conn, pos, order, datetime.now(timezone.utc))
+            _close_pending.set(True)
 
         try:
             run_equity_position_monitor(conn)
         except Exception as exc:
-            logger.error("Position monitor error: %s", exc)
-            log_system_event(conn, "ERROR", "execution_engine",
-                             f"Position monitor failed: {exc}")
+            block_close_cycle(conn, 'Position monitor unresolved', {}, exc)
 
         close_tickets = fetch_force_close_tickets(conn)
         if close_tickets:
@@ -1426,10 +1497,10 @@ def main() -> None:
                     else:
                         process_close_ticket(conn, ticket)
                 except Exception as exc:
-                    logger.error("Unhandled error in close ticket %s: %s",
-                                 ticket.get("ticket_id"), exc)
+                    block_close_cycle(conn, 'Close ticket processing unresolved',
+                                      {'ticket_id': str(ticket.get('ticket_id'))}, exc)
 
-        if recovery['pending'] or close_recovery['pending']:
+        if _close_pending.get() or recovery['pending'] or close_recovery['pending']:
             logger.info('Prior orders still settling; new entries deferred')
             return
         # Recovery above predates the close phase. Newly submitted closes may

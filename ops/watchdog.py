@@ -14,7 +14,7 @@ import requests
 from dotenv import load_dotenv
 from run_job import ROOT, STATE, db
 from report_format import format_report
-from trial_evidence import update_sessions, unresolved_job_failure
+from trial_evidence import update_sessions, unresolved_job_failure, inspection_failure_status
 from research_health import policy_active, observation_job, persistent_warnings
 from health_checks import HealthCheckError, health_operation
 sys.path.insert(0, str(ROOT / 'execution'))
@@ -209,11 +209,7 @@ def main():
     try:
         status = inspect()
     except Exception as exc:
-        status = dict(observed_at=datetime.now(timezone.utc).isoformat(), ready_for_entries=False,
-                      issues=['Health inspection failed: ' +
-                              (str(exc) if isinstance(exc, HealthCheckError) else type(exc).__name__)])
-        if isinstance(exc, HealthCheckError):
-            status['health_failure'] = exc.details()
+        status = inspection_failure_status(exc, STATE / 'research-policy.json', datetime.now(timezone.utc))
     # A bootstrapping grace only suppresses historical job deadlines, never broker checks.
     trial_path = STATE / 'trial.json'
     trial = json.loads(trial_path.read_text()) if trial_path.exists() else {'start_date': '2026-09-15', 'required_sessions': 20}
@@ -254,7 +250,7 @@ def main():
         status['report_delivery_confirmed'] = notify(c, ('activation:' if args.activation_report else 'daily:') + day, text)
         if not status['report_delivery_confirmed']:
             status['issues'].append('Daily report delivery failed'); status['ready_for_entries'] = False
-            c.execute('UPDATE sessions SET passed=0 WHERE day=?', (day,)); c.commit()
+            status['session_incidents'] = update_sessions(c, status, trial, day)
             trial['consecutive_passes'] = trial_streak(c.execute('SELECT day,passed FROM sessions ORDER BY day').fetchall())
             trial['status'] = 'RUNNING'
     atomic(trial_path, trial); atomic(previous_path, status)

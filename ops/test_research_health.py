@@ -31,10 +31,12 @@ def test_trial_preserves_old_failures_but_isolates_new_event_failures(monkeypatc
     c.execute("INSERT INTO runs(job,started,status) VALUES ('global-events',?,'failed')",(cutoff.timestamp()-86400,))
     c.execute("INSERT INTO runs(job,started,status) VALUES ('global-events',?,'failed')",(cutoff.timestamp()+86400,))
     status={'issues':[],'trading_day':True,'research_policy':policy,'research_warnings':['Event sources degraded']}
+    c.commit()
     update_sessions(c,status,{'start_date':'2026-09-15'},'2026-09-28',report=True)
     assert c.execute("SELECT passed FROM sessions WHERE day='2026-09-28'").fetchone()[0]==1
-    assert c.execute("SELECT COUNT(*) FROM session_incidents WHERE day='2026-09-26'").fetchone()[0]==1
+    assert c.execute("SELECT COUNT(*) FROM session_incidents WHERE day='2026-09-26'").fetchone()[0]==0
     c.execute("INSERT INTO runs(job,started,status) VALUES ('engine',?,'failed')",(cutoff.timestamp()+86400,))
+    c.commit()
     update_sessions(c,status,{'start_date':'2026-09-15'},'2026-09-28',report=True)
     assert c.execute("SELECT passed FROM sessions WHERE day='2026-09-28'").fetchone()[0]==0
 

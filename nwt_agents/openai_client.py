@@ -5,10 +5,71 @@ provider fallback or configurable proxy endpoint can silently change providers.
 """
 import json
 import os
+import math
+import random
+import time
+from email.utils import parsedate_to_datetime
 
 import requests
 
 API_URL = "https://api.openai.com/v1/responses"
+QUOTA_CODES = frozenset({'insufficient_quota', 'credit_balance_exhausted',
+    'organization_spend_limit_exceeded', 'project_spend_limit_exceeded',
+    'organization_usage_limit_exceeded', 'billing_hard_limit_reached'})
+
+
+class OpenAIRequestError(RuntimeError):
+    """Only application-owned classifications, never response bodies/headers."""
+    def __init__(self, status, category, attempts):
+        self.details = dict(http_status=status, category=category, attempts=attempts)
+        super().__init__(f'OpenAI Responses API HTTP {status}: {category}; attempts={attempts}')
+
+
+def error_category(response):
+    code = None
+    try:
+        body = response.json()
+        error = body.get('error', {}) if isinstance(body, dict) else {}
+        fields = [error.get('code'), error.get('type')] if isinstance(error, dict) else []
+        code = error.get('code') if isinstance(error, dict) else None
+        fields = {v for v in fields if isinstance(v, str)}
+    except (ValueError, TypeError):
+        fields = set()
+    if fields & QUOTA_CODES:
+        return 'quota_exhausted'
+    if response.status_code == 429:
+        known = {'rate_limit_exceeded', 'slow_down'}
+        return 'rate_limited' if (isinstance(code, str) and code in known) or (code is None and fields & known) else 'unknown_429'
+    return {401:'authentication_failed',403:'permission_denied'}.get(response.status_code,'http_error')
+
+
+def retry_delay(headers):
+    """Respect Retry-After, or stop if it cannot fit a ten-second wait budget."""
+    if headers.get('x-should-retry') == 'false':return None
+    value = headers.get('Retry-After')
+    if value is None:
+        return 1 + random.random()
+    if not isinstance(value, str) or len(value) > 128:
+        return None
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            stamp = parsedate_to_datetime(value)
+            if stamp.tzinfo is None:return None
+            delay = max(0, stamp.timestamp() - time.time())
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return max(1, delay) if math.isfinite(delay) and 0 <= delay <= 10 else None
+
+
+def error_event(conn, component, details):
+    if conn is not None:
+        try:
+            from shared_context import log_system_event
+            log_system_event(conn, 'WARNING', component, 'OpenAI request failure', details)
+        except Exception:
+            pass  # Audit failure cannot turn an unsuccessful request into success.
 # USD per million tokens: input, cached input, output. Verified 2026-09-09.
 MODEL_RATES = {
     "gpt-4.1-mini": (0.40, 0.10, 1.60),
@@ -18,23 +79,32 @@ MODEL_RATES = {
 }
 
 
-def call_json(prompt, model, expected_type, *, conn=None, component="openai_client"):
+def call_json(prompt, model, expected_type, *, conn=None, component="openai_client", retry_rate_limit=False):
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
         raise RuntimeError("OPENAI_API_KEY is required")
     if model not in MODEL_RATES:
         raise ValueError("OpenAI model has no verified cost rate; configure a supported model")
-    response = requests.post(
-        API_URL,
-        headers={"Authorization": f"Bearer {key}"},
-        json={"model": model, "input": prompt, "max_output_tokens": 2048,
-              "store": False},
-        timeout=(10, 90),
-        allow_redirects=False,
-    )
-    if response.status_code != 200:
-        # Do not put provider response bodies or credentials into operational logs.
-        raise RuntimeError(f"OpenAI Responses API HTTP {response.status_code}")
+    for attempt in range(1, 3 if retry_rate_limit else 2):
+        try:
+            response = requests.post(
+                API_URL, headers={"Authorization": f"Bearer {key}"},
+                json={"model": model, "input": prompt, "max_output_tokens": 2048,"store": False},
+                timeout=(10, 90), allow_redirects=False)
+        except requests.RequestException:
+            # An ambiguous transport failure is not a safe inference retry.
+            error = OpenAIRequestError(None, 'transport_failure', attempt)
+            error_event(conn, component, error.details)
+            raise error from None
+        if response.status_code == 200:break
+        category = error_category(response)
+        delay = retry_delay(response.headers) if retry_rate_limit and attempt == 1 and category == 'rate_limited' else None
+        error = OpenAIRequestError(response.status_code, category, attempt)
+        error_event(conn, component, dict(error.details, retry_scheduled=delay is not None,
+                                         retry_delay_seconds=delay))
+        response.close()
+        if delay is None:raise error from None
+        time.sleep(delay)
     body = response.json()
     usage = body.get("usage") or {}
     tokens_in = int(usage.get("input_tokens", 0))

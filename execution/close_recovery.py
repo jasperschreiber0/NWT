@@ -16,13 +16,29 @@ def close_client_id(position):
 
 
 def validate_close_identity(position, order, requested=None):
+    if not isinstance(order, dict) or not isinstance(order.get('id'), str) or not order['id'].strip():
+        raise ValueError('Close receipt lacks order identity')
     side='buy' if position['direction']=='short' else 'sell'
     if (order.get('client_order_id')!=close_client_id(position) or order.get('symbol')!=position['asset']
             or order.get('side')!=side or Decimal(str(order.get('qty') or 0))!=Decimal(str(requested if requested is not None else position['qty']))):
         raise ValueError('Close receipt does not match ledger identity, direction and quantity')
 
 
-def pending_close_receipt(position, order, now=None, requested=None):
+def verified_close_time(position, order, *, observed_at=None):
+    """Synchronous closes need the same exact receipt evidence as recovery."""
+    validate_close_identity(position, order)
+    qty=Decimal(str(order.get('filled_qty') or 0))
+    price=Decimal(str(order.get('filled_avg_price') or 0))
+    if (not order.get('id') or order.get('status')!='filled' or not qty.is_finite()
+            or qty<=0 or qty!=Decimal(str(position['qty']))
+            or not price.is_finite() or price<=0):
+        raise ValueError('Incomplete close fill evidence')
+    from fill_evidence import verified_fill_time
+    return verified_fill_time(order,order['filled_at'],observed_at or datetime.now(timezone.utc),
+                              entry_time=position['entry_time'])
+
+
+def pending_close_receipt(position, order, now=None, requested=None, retained_bounds=()):
     """Only a validated, recent working receipt is ordinary asynchronous progress."""
     if order.get('status') not in ('new', 'accepted', 'pending_new', 'partially_filled', 'pending_cancel', 'accepted_for_bidding'):
         return False
@@ -35,7 +51,11 @@ def pending_close_receipt(position, order, now=None, requested=None):
         price = Decimal(str(order.get('filled_avg_price') or 0))
         if not price.is_finite() or price <= 0:
             raise ValueError('Invalid partial close price')
-    submitted = datetime.fromisoformat(str(order.get('submitted_at') or order.get('created_at')).replace('Z', '+00:00'))
+    value = order.get('submitted_at') or order.get('created_at')
+    if not value and retained_bounds:
+        from close_bounds import aware
+        value = max((source['submitted_at'] for source in retained_bounds), key=aware)
+    submitted = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
     now = now or datetime.now(timezone.utc)
     if submitted.tzinfo is None or not -60 <= (now-submitted).total_seconds() <= 900:
         raise ValueError('Pending close missing valid timestamp or older than 15 minutes')
@@ -55,8 +75,10 @@ def recover_closes(conn,get,now=None):
                 if position.get('close_requested'):result['pending'].append(pid)
                 continue
             raise
-        from fill_evidence import with_fill_timestamp
-        order=with_fill_timestamp(order,get)
+        from fill_evidence import with_fill_timestamp, verified_fill_time
+        observed_at=now or datetime.now(timezone.utc)
+        from close_bounds import retain_close_bounds, load_bounds, merge_bounds, bound_sources
+        retain_close_bounds(conn,position,order,observed_at)
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as q:
                 q.execute('SELECT pg_advisory_xact_lock(hashtext(%s))',(pid,))
@@ -69,6 +91,10 @@ def recover_closes(conn,get,now=None):
                 requested=Decimal(str(progress['requested_qty'] if progress else position['qty']))
                 validate_close_identity(position,order,requested)
                 if progress and str(progress['order_id'])!=order['id']:raise ValueError('Close order changed identity')
+                bounds=merge_bounds(load_bounds(q,position,order),order,observed_at)
+                order=with_fill_timestamp(order,get,observed_at=observed_at,
+                                          additional_bounds=bound_sources(order['id'],bounds),
+                                          entry_time=position['entry_time'])
                 total=Decimal(str(order.get('filled_qty') or 0));seen=Decimal(str(progress['recorded_qty'])) if progress else Decimal(0)
                 seen_value=Decimal(str(progress['recorded_value'])) if progress else Decimal(0)
                 if not total.is_finite() or not seen<=total<=requested:raise ValueError('Invalid cumulative close quantity')
@@ -81,8 +107,8 @@ def recover_closes(conn,get,now=None):
                     if not price.is_finite() or price<=0:raise ValueError('Invalid close price')
                     value=price*total;increment_price=(value-seen_value)/delta
                     if increment_price<=0:raise ValueError('Invalid incremental close price')
-                    stamp=datetime.fromisoformat(order['filled_at'].replace('Z','+00:00'))
-                    if stamp.tzinfo is None or stamp<position['entry_time']:raise ValueError('Invalid broker close timestamp')
+                    stamp=verified_fill_time(order,order['filled_at'],observed_at,
+                                             entry_time=position['entry_time'])
                     if delta==remaining:
                         close_position(conn,pid,increment_price,0,'verified_delayed_close',exit_time=stamp,commit=False)
                         q.execute("SELECT ticket_id FROM nwt_tickets WHERE type IN ('CLOSE_REQUEST','FORCE_CLOSE') AND payload->>'position_id'=%s",(pid,))
@@ -113,7 +139,7 @@ def recover_closes(conn,get,now=None):
                     elif order.get('status')=='rejected':result['blocked'].append(pid+': broker rejected close')
                     elif now is not None:
                         try:
-                            if not pending_close_receipt(position,order,now,requested):
+                            if not pending_close_receipt(position,order,now,requested,bound_sources(order['id'],bounds)):
                                 raise ValueError('Unexpected unresolved close status')
                         except (ValueError, ArithmeticError) as exc:
                             result['blocked'].append(pid+': '+str(exc))

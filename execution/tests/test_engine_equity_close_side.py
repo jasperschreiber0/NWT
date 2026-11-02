@@ -1,5 +1,6 @@
 """Regression coverage for delayed fills and duplicate equity exits."""
 from unittest.mock import MagicMock
+from datetime import datetime, timezone
 import pytest
 import requests
 import engine
@@ -7,7 +8,8 @@ import engine
 
 def position(direction='short'):
     return dict(position_id='5d8ecdde-7a46-493c-adad-08320fd28745',
-                asset='VGK', direction=direction, qty=196, status='open')
+                asset='VGK', direction=direction, qty=196, status='open',
+                entry_time=datetime(2026,10,1,tzinfo=timezone.utc))
 
 
 def missing():
@@ -61,12 +63,21 @@ def test_mismatched_broker_exposure_blocks_close(monkeypatch, broker):
 def test_only_complete_fill_closes_ledger(monkeypatch, status, qty, price, closed):
     pos = position()
     monkeypatch.setattr(engine, 'get_ledger_position', lambda *a: pos)
-    monkeypatch.setattr(engine, 'equity_close_order', lambda *a: {'id': 'original'})
-    monkeypatch.setattr(engine, 'poll_order_until_filled', lambda *a: dict(status=status, filled_qty=qty, filled_avg_price=price))
+    monkeypatch.setattr(engine, 'equity_close_order', lambda *a: dict(id='original',client_order_id='nwt-close-'+pos['position_id'],symbol='VGK',side='buy',qty='196'))
+    monkeypatch.setattr(engine, 'poll_order_until_filled', lambda *a: dict(
+        id='original',client_order_id='nwt-close-'+pos['position_id'],symbol='VGK',
+        side='buy',qty='196',status=status,filled_qty=qty,filled_avg_price=price,
+        filled_at='2026-10-23T13:35:00Z'))
     close = MagicMock(); monkeypatch.setattr(engine, 'close_position', close)
     monkeypatch.setattr(engine, 'log_system_event', MagicMock())
-    engine._close_equity_position(MagicMock(), pos, 89.82, pos['position_id'], 'VGK', 18074, 92.21, 'target')
+    if not closed:
+        with pytest.raises(engine.CloseReceiptError):
+            engine._close_equity_position(MagicMock(), pos, 89.82, pos['position_id'], 'VGK', 18074, 92.21, 'target')
+    else:
+        engine._close_equity_position(MagicMock(), pos, 89.82, pos['position_id'], 'VGK', 18074, 92.21, 'target')
     assert close.called is closed
+    if closed:
+        assert close.call_args.kwargs['exit_time']==datetime(2026,10,23,13,35,tzinfo=timezone.utc)
 
 
 def test_missing_direction_is_rejected(monkeypatch):
