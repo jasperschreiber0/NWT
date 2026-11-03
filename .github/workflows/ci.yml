@@ -54,6 +54,9 @@ jobs:
           execution/tests/test_experiment_budget.py
           execution/tests/test_paper_workflow.py
 
+      - name: Verify fill recovery tests on a fresh database
+        run: python -m pytest -q execution/tests/test_fill_recovery.py
+
       - name: Run offline and unit tests
         run: python -m pytest -q tests_offline nwt_agents/tests execution/tests master/tests ukeu/tests ops research
 
