@@ -20,27 +20,39 @@ QUOTA_CODES = frozenset({'insufficient_quota', 'credit_balance_exhausted',
 
 class OpenAIRequestError(RuntimeError):
     """Only application-owned classifications, never response bodies/headers."""
-    def __init__(self, status, category, attempts):
+    def __init__(self, status, category, attempts, quota_code=None, quota_type=None):
         self.details = dict(http_status=status, category=category, attempts=attempts)
+        # Only exact enumerated constants are retained; never arbitrary provider text.
+        for name, value in [('quota_code', quota_code), ('quota_type', quota_type)]:
+            if isinstance(value, str) and value in QUOTA_CODES:
+                self.details[name] = value
         super().__init__(f'OpenAI Responses API HTTP {status}: {category}; attempts={attempts}')
 
 
-def error_category(response):
+def error_metadata(response):
     code = None
+    kind = None
     try:
         body = response.json()
         error = body.get('error', {}) if isinstance(body, dict) else {}
         fields = [error.get('code'), error.get('type')] if isinstance(error, dict) else []
         code = error.get('code') if isinstance(error, dict) else None
+        kind = error.get('type') if isinstance(error, dict) else None
         fields = {v for v in fields if isinstance(v, str)}
     except (ValueError, TypeError):
         fields = set()
     if fields & QUOTA_CODES:
-        return 'quota_exhausted'
+        return dict(category='quota_exhausted',
+                    quota_code=code if isinstance(code,str) and code in QUOTA_CODES else None,
+                    quota_type=kind if isinstance(kind,str) and kind in QUOTA_CODES else None)
     if response.status_code == 429:
         known = {'rate_limit_exceeded', 'slow_down'}
-        return 'rate_limited' if (isinstance(code, str) and code in known) or (code is None and fields & known) else 'unknown_429'
-    return {401:'authentication_failed',403:'permission_denied'}.get(response.status_code,'http_error')
+        return dict(category='rate_limited' if (isinstance(code, str) and code in known) or (code is None and fields & known) else 'unknown_429')
+    return dict(category={401:'authentication_failed',403:'permission_denied'}.get(response.status_code,'http_error'))
+
+
+def error_category(response):
+    return error_metadata(response)['category']
 
 
 def retry_delay(headers):
@@ -97,9 +109,11 @@ def call_json(prompt, model, expected_type, *, conn=None, component="openai_clie
             error_event(conn, component, error.details)
             raise error from None
         if response.status_code == 200:break
-        category = error_category(response)
+        metadata = error_metadata(response)
+        category = metadata["category"]
         delay = retry_delay(response.headers) if retry_rate_limit and attempt == 1 and category == 'rate_limited' else None
-        error = OpenAIRequestError(response.status_code, category, attempt)
+        error = OpenAIRequestError(response.status_code, category, attempt,
+                                   metadata.get("quota_code"), metadata.get("quota_type"))
         error_event(conn, component, dict(error.details, retry_scheduled=delay is not None,
                                          retry_delay_seconds=delay))
         response.close()
