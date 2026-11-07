@@ -55,7 +55,23 @@ jobs:
           execution/tests/test_paper_workflow.py
 
       - name: Run offline and unit tests
-        run: python -m pytest -q tests_offline nwt_agents/tests execution/tests master/tests ukeu/tests ops research
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          # /tmp is intentionally rejected by the receipt store: its ancestors
+          # are writable by other users. Create only an owned private fixture
+          # directory beneath this disposable checkout; never relax the store.
+          with tempfile.TemporaryDirectory(prefix='.calendar-tests-', dir=os.getcwd()) as private:
+              env = dict(os.environ, CALENDAR_TEST_PRIVATE_ROOT=private)
+              result = subprocess.run([
+                  sys.executable, '-m', 'pytest', '-q', 'tests_offline',
+                  'nwt_agents/tests', 'execution/tests', 'master/tests',
+                  'ukeu/tests', 'ops', 'research'], env=env)
+              raise SystemExit(result.returncode)
+          PY
 
       - name: Validate migrations are present
         run: |
