@@ -19,8 +19,8 @@ def test_inspection_failure_identifies_read_without_exposing_request(monkeypatch
     def get(url, **kwargs):
         if stage == 'broker.calendar' or url.startswith('http://127.0.0.1:'):
             raise requests.ReadTimeout('private URL and token must not escape')
-        return SimpleNamespace(raise_for_status=lambda: None,
-                               json=lambda: [] if 'calendar?' in url else {'is_open': False})
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                               json=lambda: [] if '/calendar' in url else {'is_open': False})
 
     monkeypatch.setattr(watchdog.requests, 'get', get)
     with pytest.raises(HealthCheckError) as failure:

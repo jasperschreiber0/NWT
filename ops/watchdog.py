@@ -17,6 +17,7 @@ from report_format import format_report
 from trial_evidence import update_sessions, unresolved_job_failure, inspection_failure_status
 from research_health import policy_active, observation_job, persistent_warnings
 from health_checks import HealthCheckError, health_operation
+from calendar_evidence import observed_calendar_read
 sys.path.insert(0, str(ROOT / 'execution'))
 from reliability import reconcile_quantities, separate_legacy_expiries
 
@@ -65,7 +66,25 @@ def inspect(now=None):
     isolated = policy_active(policy, now)
     if subprocess.run(['systemctl','is-active','--quiet','cron']).returncode:
         subprocess.run(['systemctl','start','cron'],check=True,timeout=20)
-    calendar = get('calendar?start=' + now.date().isoformat() + '&end=' + now.date().isoformat())
+    def fetch_calendar(timeout):
+        r = requests.get(base + '/v2/calendar', headers=h,
+                         params={'start': now.date().isoformat(), 'end': now.date().isoformat()},
+                         timeout=timeout, allow_redirects=False)
+        r.raise_for_status()
+        if r.status_code != 200:
+            raise ValueError('Calendar response status invalid')
+        data = r.json()
+        if not isinstance(data, list) or len(data) > 1:
+            raise ValueError('Calendar response shape invalid')
+        for session in data:
+            if not isinstance(session, dict) or session.get('date') != now.date().isoformat():
+                raise ValueError('Calendar response date invalid')
+            opened = datetime.strptime(session['open'], '%H:%M')
+            closed = datetime.strptime(session['close'], '%H:%M')
+            if closed <= opened:
+                raise ValueError('Calendar response hours invalid')
+        return data
+    calendar, calendar_receipt = observed_calendar_read(fetch_calendar, STATE)
     trading_day = bool(calendar)
     clock = get('clock')
     # PM2 already restarts the web process; independently verify authenticated health.
@@ -190,6 +209,7 @@ def inspect(now=None):
                 findings.append(name + ' heartbeat overdue')
     c.close()
     return dict(observed_at=now.isoformat(), trading_day=trading_day, market_open=clock.get('is_open'),
+                calendar_receipt=calendar_receipt,
                 issues=sorted(set(issues)), ready_for_entries=not issues, broker_positions=len(broker),
                 open_orders=len(orders), mismatches=mismatch, flags=flags, tickets=tickets,
                 broker_equity=account.get('equity'), broker_cash=account.get('cash'),
